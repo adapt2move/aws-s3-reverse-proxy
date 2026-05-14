@@ -28,6 +28,8 @@ type Options struct {
 	Region                string
 	UpstreamInsecure      bool
 	UpstreamEndpoint      string
+	KeyPrefix             string
+	UpstreamCredentials   string
 	CertFile              string
 	KeyFile               string
 }
@@ -45,6 +47,8 @@ func NewOptions() Options {
 	kingpin.Flag("aws-region", "send requests to this AWS S3 region (env - AWS_REGION)").Envar("AWS_REGION").Default("eu-central-1").StringVar(&opts.Region)
 	kingpin.Flag("upstream-insecure", "use insecure HTTP for upstream connections (env - UPSTREAM_INSECURE)").Envar("UPSTREAM_INSECURE").BoolVar(&opts.UpstreamInsecure)
 	kingpin.Flag("upstream-endpoint", "use this S3 endpoint for upstream connections, instead of public AWS S3 (env - UPSTREAM_ENDPOINT)").Envar("UPSTREAM_ENDPOINT").StringVar(&opts.UpstreamEndpoint)
+	kingpin.Flag("key-prefix", "optional key prefix prepended to every upstream object key and listing prefix (env - KEY_PREFIX)").Envar("KEY_PREFIX").Default("").StringVar(&opts.KeyPrefix)
+	kingpin.Flag("upstream-credentials", "optional \"AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY\" used to re-sign upstream requests instead of the client's credentials (env - UPSTREAM_CREDENTIALS)").Envar("UPSTREAM_CREDENTIALS").Default("").PlaceHolder("\"AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY\"").StringVar(&opts.UpstreamCredentials)
 	kingpin.Flag("cert-file", "path to the certificate file (env - CERT_FILE)").Envar("CERT_FILE").Default("").StringVar(&opts.CertFile)
 	kingpin.Flag("key-file", "path to the private key file (env - KEY_FILE)").Envar("KEY_FILE").Default("").StringVar(&opts.KeyFile)
 	kingpin.Parse()
@@ -89,6 +93,20 @@ func NewAwsS3ReverseProxy(opts Options) (*Handler, error) {
 		}))
 	}
 
+	// Optional: a dedicated credential set for re-signing upstream
+	// requests. When set, the client never needs the real credentials.
+	var upstreamSigner *v4.Signer
+	if len(opts.UpstreamCredentials) > 0 {
+		d := strings.Split(opts.UpstreamCredentials, ",")
+		if len(d) != 2 || len(d[0]) < 1 || len(d[1]) < 1 {
+			return nil, fmt.Errorf("Invalid upstream credentials. Did you separate them with a ','?")
+		}
+		upstreamSigner = v4.NewSigner(credentials.NewStaticCredentialsFromCreds(credentials.Value{
+			AccessKeyID:     d[0],
+			SecretAccessKey: d[1],
+		}))
+	}
+
 	handler := &Handler{
 		Debug:                 opts.Debug,
 		UpstreamScheme:        scheme,
@@ -97,6 +115,8 @@ func NewAwsS3ReverseProxy(opts Options) (*Handler, error) {
 		AllowedSourceSubnet:   parsedAllowedSourceSubnet,
 		AWSCredentials:        parsedAwsCredentials,
 		Signers:               signers,
+		KeyPrefix:             opts.KeyPrefix,
+		UpstreamSigner:        upstreamSigner,
 	}
 	return handler, nil
 }
@@ -119,6 +139,12 @@ func main() {
 	}
 	log.Infof("Accepting incoming requests for this endpoint: %v", handler.AllowedSourceEndpoint)
 	log.Infof("Parsed %d AWS credential sets.", len(handler.AWSCredentials))
+	if len(handler.KeyPrefix) > 0 {
+		log.Infof("Prepending key prefix to all upstream requests: %q", handler.KeyPrefix)
+	}
+	if handler.UpstreamSigner != nil {
+		log.Infof("Re-signing upstream requests with dedicated upstream credentials.")
+	}
 
 	if len(opts.PprofListenAddr) > 0 && len(strings.Split(opts.PprofListenAddr, ":")) == 2 {
 		// avoid leaking pprof to the main application http servers

@@ -30,6 +30,23 @@ change specific HTTP headers. This means every deployment of
 `aws-s3-reverse-proxy` needs to be aware of the expected AWS security
 credentials to re-sign each request.
 
+## Key Prefix and Separate Upstream Credentials
+
+Two optional flags extend the basic re-signing behaviour:
+
+  * `--key-prefix` (env `KEY_PREFIX`): a string prepended to every object
+    key sent upstream. `GET /bucket/key` becomes `GET /bucket/<prefix>key`.
+    For bucket-level listings the prefix is prepended to the request's
+    `prefix` query parameter instead, so a client cannot enumerate keys
+    outside the configured prefix.
+  * `--upstream-credentials` (env `UPSTREAM_CREDENTIALS`): an
+    `"AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY"` pair used to re-sign
+    upstream requests instead of the client's credentials. When set, the
+    client only needs a credential the proxy recognises for the incoming
+    signature check — it never needs the real upstream secret.
+
+Both default to off; without them the proxy behaves exactly as before.
+
 ## Releases
 
 Get the latest Docker image from [from

@@ -46,8 +46,52 @@ type Handler struct {
 	// AWS Signature v4
 	Signers map[string]*v4.Signer
 
+	// Optional: prepend this prefix to every object key (and to the
+	// `prefix` query parameter of bucket-level listings) before the
+	// request is sent upstream. Empty disables the feature.
+	KeyPrefix string
+
+	// Optional: when set, upstream requests are re-signed with these
+	// credentials instead of the client's. This lets the proxy hold
+	// credentials the client never needs to know.
+	UpstreamSigner *v4.Signer
+
 	// Reverse Proxy
 	Proxy *httputil.ReverseProxy
+}
+
+// isBucketLevelPath reports whether a path-style S3 request path addresses
+// a bucket itself (e.g. "/my-bucket" or "/") rather than an object within
+// it ("/my-bucket/some/key").
+func isBucketLevelPath(p string) bool {
+	return strings.IndexByte(strings.TrimPrefix(p, "/"), '/') < 0
+}
+
+// injectKeyPrefix prepends h.KeyPrefix to the object-key portion of a
+// path-style request path: "/bucket/key" becomes "/bucket/<prefix>key".
+// Bucket-level paths are returned unchanged (see scopeListPrefix). It is a
+// no-op when KeyPrefix is empty.
+func (h *Handler) injectKeyPrefix(p string) string {
+	if h.KeyPrefix == "" || isBucketLevelPath(p) {
+		return p
+	}
+	trimmed := strings.TrimPrefix(p, "/")
+	idx := strings.IndexByte(trimmed, '/')
+	bucket := trimmed[:idx]
+	key := trimmed[idx+1:]
+	return "/" + bucket + "/" + h.KeyPrefix + key
+}
+
+// scopeListPrefix confines a bucket-level listing to h.KeyPrefix by
+// prepending it to the request's `prefix` query parameter, so a client
+// cannot enumerate keys outside the configured prefix.
+func (h *Handler) scopeListPrefix(u *url.URL) {
+	if h.KeyPrefix == "" {
+		return
+	}
+	q := u.Query()
+	q.Set("prefix", h.KeyPrefix+q.Get("prefix"))
+	u.RawQuery = q.Encode()
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -182,7 +226,15 @@ func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, regi
 	proxyURL := *req.URL
 	proxyURL.Scheme = h.UpstreamScheme
 	proxyURL.Host = upstreamEndpoint
-	proxyURL.RawPath = req.URL.Path
+	// Optionally confine the request to a fixed key prefix: prepend it to
+	// the object key, or — for a bucket-level listing — to the `prefix`
+	// query parameter. Both are no-ops when KeyPrefix is empty.
+	prefixedPath := h.injectKeyPrefix(req.URL.Path)
+	proxyURL.Path = prefixedPath
+	proxyURL.RawPath = prefixedPath
+	if isBucketLevelPath(req.URL.Path) {
+		h.scopeListPrefix(&proxyURL)
+	}
 	proxyReq, err := http.NewRequest(req.Method, proxyURL.String(), req.Body)
 	if err != nil {
 		return nil, err
@@ -194,8 +246,13 @@ func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, regi
 		proxyReq.Header["Content-Md5"] = val
 	}
 
-	// Sign the upstream request
-	if err := h.sign(signer, proxyReq, region); err != nil {
+	// Sign the upstream request — with the dedicated upstream credentials
+	// when configured, otherwise with the client's (the default).
+	upstreamSigner := signer
+	if h.UpstreamSigner != nil {
+		upstreamSigner = h.UpstreamSigner
+	}
+	if err := h.sign(upstreamSigner, proxyReq, region); err != nil {
 		return nil, err
 	}
 
