@@ -30,9 +30,9 @@ change specific HTTP headers. This means every deployment of
 `aws-s3-reverse-proxy` needs to be aware of the expected AWS security
 credentials to re-sign each request.
 
-## Key Prefix and Separate Upstream Credentials
+## Key Prefix, Separate Upstream Credentials and Region
 
-Two optional flags extend the basic re-signing behaviour:
+Three optional flags extend the basic re-signing behaviour:
 
   * `--key-prefix` (env `KEY_PREFIX`): a string prepended to every object
     key sent upstream. `GET /bucket/key` becomes `GET /bucket/<prefix>key`.
@@ -44,8 +44,13 @@ Two optional flags extend the basic re-signing behaviour:
     upstream requests instead of the client's credentials. When set, the
     client only needs a credential the proxy recognises for the incoming
     signature check — it never needs the real upstream secret.
+  * `--upstream-region` (env `UPSTREAM_REGION`): the region to sign
+    upstream requests for, instead of the region from the client's
+    request. Useful when the client signs with a placeholder (or empty)
+    region but the real backend expects a specific one.
 
-Both default to off; without them the proxy behaves exactly as before.
+All three default to off; without them the proxy behaves exactly as
+before.
 
 ## Releases
 

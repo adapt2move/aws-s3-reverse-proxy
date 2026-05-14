@@ -30,6 +30,7 @@ type Options struct {
 	UpstreamEndpoint      string
 	KeyPrefix             string
 	UpstreamCredentials   string
+	UpstreamRegion        string
 	CertFile              string
 	KeyFile               string
 }
@@ -49,6 +50,7 @@ func NewOptions() Options {
 	kingpin.Flag("upstream-endpoint", "use this S3 endpoint for upstream connections, instead of public AWS S3 (env - UPSTREAM_ENDPOINT)").Envar("UPSTREAM_ENDPOINT").StringVar(&opts.UpstreamEndpoint)
 	kingpin.Flag("key-prefix", "optional key prefix prepended to every upstream object key and listing prefix (env - KEY_PREFIX)").Envar("KEY_PREFIX").Default("").StringVar(&opts.KeyPrefix)
 	kingpin.Flag("upstream-credentials", "optional \"AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY\" used to re-sign upstream requests instead of the client's credentials (env - UPSTREAM_CREDENTIALS)").Envar("UPSTREAM_CREDENTIALS").Default("").PlaceHolder("\"AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY\"").StringVar(&opts.UpstreamCredentials)
+	kingpin.Flag("upstream-region", "optional region to sign upstream requests for, instead of the region from the client's request (env - UPSTREAM_REGION)").Envar("UPSTREAM_REGION").Default("").StringVar(&opts.UpstreamRegion)
 	kingpin.Flag("cert-file", "path to the certificate file (env - CERT_FILE)").Envar("CERT_FILE").Default("").StringVar(&opts.CertFile)
 	kingpin.Flag("key-file", "path to the private key file (env - KEY_FILE)").Envar("KEY_FILE").Default("").StringVar(&opts.KeyFile)
 	kingpin.Parse()
@@ -117,6 +119,7 @@ func NewAwsS3ReverseProxy(opts Options) (*Handler, error) {
 		Signers:               signers,
 		KeyPrefix:             opts.KeyPrefix,
 		UpstreamSigner:        upstreamSigner,
+		UpstreamRegion:        opts.UpstreamRegion,
 	}
 	return handler, nil
 }
@@ -144,6 +147,9 @@ func main() {
 	}
 	if handler.UpstreamSigner != nil {
 		log.Infof("Re-signing upstream requests with dedicated upstream credentials.")
+	}
+	if len(handler.UpstreamRegion) > 0 {
+		log.Infof("Signing upstream requests for region: %q", handler.UpstreamRegion)
 	}
 
 	if len(opts.PprofListenAddr) > 0 && len(strings.Split(opts.PprofListenAddr, ":")) == 2 {

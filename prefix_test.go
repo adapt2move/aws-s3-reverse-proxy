@@ -57,3 +57,19 @@ func TestScopeListPrefixDisabled(t *testing.T) {
 	h.scopeListPrefix(u)
 	assert.Equal(t, "data/", u.Query().Get("prefix"))
 }
+
+func TestCredentialRegexpAcceptsEmptyRegion(t *testing.T) {
+	// Some S3 clients (e.g. DuckDB's httpfs with no region configured)
+	// leave the region segment empty: ".../<date>//s3/aws4_request".
+	cases := map[string][2]string{
+		"Credential=KEY/20260514/eu-central-1/s3/aws4_request": {"KEY", "eu-central-1"},
+		"Credential=KEY/20260514/gra/s3/aws4_request":          {"KEY", "gra"},
+		"Credential=KEY/20260514//s3/aws4_request":             {"KEY", ""},
+	}
+	for header, want := range cases {
+		m := awsAuthorizationCredentialRegexp.FindStringSubmatch(header)
+		assert.Len(t, m, 3, header)
+		assert.Equal(t, want[0], m[1], header)
+		assert.Equal(t, want[1], m[2], header)
+	}
+}

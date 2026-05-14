@@ -20,7 +20,10 @@ import (
 // - new less strict regexp in order to allow different region naming (compatibility with other providers)
 // - east-eu-1 => pass (aws style)
 // - gra => pass (ceph style)
-var awsAuthorizationCredentialRegexp = regexp.MustCompile("Credential=([a-zA-Z0-9]+)/[0-9]+/([a-zA-Z-0-9]+)/s3/aws4_request")
+// - "" => pass (some S3 clients, e.g. DuckDB's httpfs, leave the region
+//   segment empty when no region is configured; the signature is still
+//   valid, it just has an empty region scope)
+var awsAuthorizationCredentialRegexp = regexp.MustCompile("Credential=([a-zA-Z0-9]+)/[0-9]+/([a-zA-Z-0-9]*)/s3/aws4_request")
 var awsAuthorizationSignedHeadersRegexp = regexp.MustCompile("SignedHeaders=([a-zA-Z0-9;-]+)")
 
 // Handler is a special handler that re-signs any AWS S3 request and sends it upstream
@@ -55,6 +58,12 @@ type Handler struct {
 	// credentials instead of the client's. This lets the proxy hold
 	// credentials the client never needs to know.
 	UpstreamSigner *v4.Signer
+
+	// Optional: when set, upstream requests are signed for this region
+	// instead of the region from the client's request. Useful when the
+	// client signs with a placeholder (or empty) region but the real
+	// backend expects a specific one.
+	UpstreamRegion string
 
 	// Reverse Proxy
 	Proxy *httputil.ReverseProxy
@@ -247,12 +256,17 @@ func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, regi
 	}
 
 	// Sign the upstream request — with the dedicated upstream credentials
-	// when configured, otherwise with the client's (the default).
+	// when configured, otherwise with the client's (the default). The
+	// region is the client's unless an upstream region is configured.
 	upstreamSigner := signer
 	if h.UpstreamSigner != nil {
 		upstreamSigner = h.UpstreamSigner
 	}
-	if err := h.sign(upstreamSigner, proxyReq, region); err != nil {
+	upstreamRegion := region
+	if h.UpstreamRegion != "" {
+		upstreamRegion = h.UpstreamRegion
+	}
+	if err := h.sign(upstreamSigner, proxyReq, upstreamRegion); err != nil {
 		return nil, err
 	}
 
