@@ -75,6 +75,98 @@ func TestStripKeyPrefixFromListBody_LeavesNonMatchingValuesUntouched(t *testing.
 	assert.Equal(t, body, stripKeyPrefixFromListBody(body, "tenants/acme/"))
 }
 
+// CompleteMultipartUploadResult — <Location> embeds the prefixed key
+// inside a fully-qualified URL ("https://bucket.s3.../tenants/acme/x.csv").
+// Bare HasPrefix wouldn't strip; the URL-embedded path branch in
+// stripPrefixFromValue handles it.
+
+func TestStripKeyPrefixFromListBody_CompleteMultipartUploadResult(t *testing.T) {
+	body := []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUploadResult>
+  <Location>https://bucket.s3.eu-central-1.amazonaws.com/tenants/acme/uploads/file.csv</Location>
+  <Bucket>bucket</Bucket>
+  <Key>tenants/acme/uploads/file.csv</Key>
+  <ETag>"abc-1"</ETag>
+</CompleteMultipartUploadResult>`)
+	got := string(stripKeyPrefixFromListBody(body, "tenants/acme/"))
+	// URL-embedded key in <Location> stripped, bare key in <Key>
+	// stripped, <Bucket>/<ETag> untouched.
+	assert.Contains(t, got,
+		`<Location>https://bucket.s3.eu-central-1.amazonaws.com/uploads/file.csv</Location>`)
+	assert.Contains(t, got, `<Key>uploads/file.csv</Key>`)
+	assert.Contains(t, got, `<Bucket>bucket</Bucket>`)
+	assert.Contains(t, got, `<ETag>"abc-1"</ETag>`)
+	assert.NotContains(t, got, "tenants/acme/")
+}
+
+// Error responses — <Resource> embeds the prefixed key after the
+// bucket path (`/<bucket>/<prefixed-key>`). Path-form stripping.
+
+func TestStripKeyPrefixFromListBody_ErrorResponseResource(t *testing.T) {
+	body := []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>NoSuchKey</Code>
+  <Message>The specified key does not exist.</Message>
+  <Key>tenants/acme/uploads/missing.csv</Key>
+  <Resource>/bucket/tenants/acme/uploads/missing.csv</Resource>
+  <RequestId>req-1</RequestId>
+</Error>`)
+	got := string(stripKeyPrefixFromListBody(body, "tenants/acme/"))
+	assert.Contains(t, got, `<Key>uploads/missing.csv</Key>`)
+	assert.Contains(t, got, `<Resource>/bucket/uploads/missing.csv</Resource>`)
+	// Non-key elements untouched.
+	assert.Contains(t, got, "<Code>NoSuchKey</Code>")
+	assert.Contains(t, got, "<RequestId>req-1</RequestId>")
+	assert.NotContains(t, got, "tenants/acme/")
+}
+
+func TestStripKeyPrefixFromListBody_ResourceBareKeyForm(t *testing.T) {
+	// Some S3-compatible stores emit <Resource> as a bare key (no
+	// `/bucket/` prefix). Bare-key branch handles it.
+	body := []byte(`<Error><Resource>tenants/acme/uploads/x.csv</Resource></Error>`)
+	got := string(stripKeyPrefixFromListBody(body, "tenants/acme/"))
+	assert.Contains(t, got, `<Resource>uploads/x.csv</Resource>`)
+}
+
+// stripPrefixFromValue unit tests — the helper that handles both
+// bare-key and URL-embedded forms.
+
+func TestStripPrefixFromValue_BareKey(t *testing.T) {
+	out := stripPrefixFromValue([]byte("tenants/acme/uploads/x.csv"), []byte("tenants/acme/"))
+	assert.Equal(t, "uploads/x.csv", string(out))
+}
+
+func TestStripPrefixFromValue_UrlEmbeddedKey(t *testing.T) {
+	out := stripPrefixFromValue(
+		[]byte("https://bucket.s3.region.amazonaws.com/tenants/acme/uploads/x.csv"),
+		[]byte("tenants/acme/"),
+	)
+	assert.Equal(t,
+		"https://bucket.s3.region.amazonaws.com/uploads/x.csv",
+		string(out))
+}
+
+func TestStripPrefixFromValue_AbsolutePathEmbeddedKey(t *testing.T) {
+	out := stripPrefixFromValue(
+		[]byte("/bucket/tenants/acme/uploads/x.csv"),
+		[]byte("tenants/acme/"),
+	)
+	assert.Equal(t, "/bucket/uploads/x.csv", string(out))
+}
+
+func TestStripPrefixFromValue_NoMatch(t *testing.T) {
+	// A value that neither starts with the prefix nor contains
+	// `/<prefix>` is returned unchanged.
+	out := stripPrefixFromValue([]byte("other-tenant/x.csv"), []byte("tenants/acme/"))
+	assert.Equal(t, "other-tenant/x.csv", string(out))
+}
+
+func TestStripPrefixFromValue_EmptyInputs(t *testing.T) {
+	assert.Equal(t, "", string(stripPrefixFromValue(nil, []byte("tenants/acme/"))))
+	assert.Equal(t, "x", string(stripPrefixFromValue([]byte("x"), nil)))
+	assert.Equal(t, "x", string(stripPrefixFromValue([]byte("x"), []byte(""))))
+}
+
 func TestStripKeyPrefixFromListBody_FullListBucketResultV2(t *testing.T) {
 	body := []byte(`<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -149,17 +241,14 @@ func TestModifyListResponse_EndToEnd(t *testing.T) {
 
 	h := &Handler{KeyPrefix: "tenants/acme/"}
 
-	// Hit modifyListResponse directly with a synthesised *http.Response
-	// (the wiring inside ServeHTTP is the standard ReverseProxy pattern
-	// and is exercised by the existing handler_test.go suite).
+	// Hit stripKeyPrefixFromResponse directly with a synthesised
+	// *http.Response (the wiring inside ServeHTTP is the standard
+	// ReverseProxy pattern and is exercised by the existing
+	// handler_test.go suite).
 	upstreamResp, err := http.Get(upstream.URL + "/bucket/?list-type=2&prefix=uploads/")
 	require.NoError(t, err)
-	// Inject a request URL that matches what the proxy would have sent
-	// upstream after scopeListPrefix — handler reads URL.Path off
-	// resp.Request to decide if this is a LIST.
-	upstreamResp.Request.URL.Path = "/bucket/"
 
-	err = h.modifyListResponse(upstreamResp)
+	err = h.stripKeyPrefixFromResponse(upstreamResp)
 	require.NoError(t, err)
 
 	body, err := io.ReadAll(upstreamResp.Body)
@@ -184,19 +273,62 @@ func TestModifyListResponse_EndToEnd(t *testing.T) {
 		"resp.ContentLength must match rewritten body")
 }
 
-func TestModifyListResponse_SkipsObjectPaths(t *testing.T) {
+func TestStripKeyPrefixFromResponse_SkipsNonXmlObjectPayloads(t *testing.T) {
 	// GET / HEAD / PUT on an object — response body is the object payload
-	// and must NEVER be rewritten.
+	// and is identified as non-XML by Content-Type. Must NEVER be rewritten
+	// even when it contains the prefix as text.
 	h := &Handler{KeyPrefix: "tenants/acme/"}
 	resp := &http.Response{
-		Header: http.Header{"Content-Type": []string{"text/csv"}},
-		Body:   io.NopCloser(strings.NewReader("tenants/acme/uploads/x,1\n")),
+		Header:  http.Header{"Content-Type": []string{"text/csv"}},
+		Body:    io.NopCloser(strings.NewReader("tenants/acme/uploads/x,1\n")),
 		Request: &http.Request{URL: &url.URL{Path: "/bucket/uploads/x.csv"}},
 	}
-	require.NoError(t, h.modifyListResponse(resp))
+	require.NoError(t, h.stripKeyPrefixFromResponse(resp))
 	body, _ := io.ReadAll(resp.Body)
-	assert.Equal(t, "tenants/acme/uploads/x,1\n", string(body),
-		"object payload must pass through unchanged even when it contains the prefix as text")
+	assert.Equal(t, "tenants/acme/uploads/x,1\n", string(body))
+}
+
+func TestStripKeyPrefixFromResponse_RunsOnObjectLevelXmlResponses(t *testing.T) {
+	// CompleteMultipartUpload is POST /bucket/key?uploadId=... — object
+	// path, but the response is XML with prefixed <Location> / <Key>.
+	// The previous bucket-level-only gating skipped these. Now: XML
+	// content-type alone qualifies.
+	h := &Handler{KeyPrefix: "tenants/acme/"}
+	body := `<CompleteMultipartUploadResult>
+  <Location>https://bucket.s3.region.amazonaws.com/tenants/acme/uploads/x.csv</Location>
+  <Key>tenants/acme/uploads/x.csv</Key>
+</CompleteMultipartUploadResult>`
+	resp := &http.Response{
+		Header:  http.Header{"Content-Type": []string{"application/xml"}},
+		Body:    io.NopCloser(strings.NewReader(body)),
+		Request: &http.Request{URL: &url.URL{Path: "/bucket/uploads/x.csv"}},
+	}
+	require.NoError(t, h.stripKeyPrefixFromResponse(resp))
+	got, _ := io.ReadAll(resp.Body)
+	assert.Contains(t, string(got),
+		`<Location>https://bucket.s3.region.amazonaws.com/uploads/x.csv</Location>`)
+	assert.Contains(t, string(got), `<Key>uploads/x.csv</Key>`)
+	assert.NotContains(t, string(got), "tenants/acme/")
+}
+
+func TestStripKeyPrefixFromResponse_RunsOnErrorResponses(t *testing.T) {
+	// 404 NoSuchKey on a GetObject — object path, XML body with
+	// <Resource> embedding the prefixed path.
+	h := &Handler{KeyPrefix: "tenants/acme/"}
+	body := `<Error>
+  <Code>NoSuchKey</Code>
+  <Resource>/bucket/tenants/acme/uploads/missing.csv</Resource>
+</Error>`
+	resp := &http.Response{
+		StatusCode: 404,
+		Header:     http.Header{"Content-Type": []string{"application/xml"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    &http.Request{URL: &url.URL{Path: "/bucket/uploads/missing.csv"}},
+	}
+	require.NoError(t, h.stripKeyPrefixFromResponse(resp))
+	got, _ := io.ReadAll(resp.Body)
+	assert.Contains(t, string(got), `<Resource>/bucket/uploads/missing.csv</Resource>`)
+	assert.NotContains(t, string(got), "tenants/acme/")
 }
 
 func TestModifyListResponse_SkipsWhenKeyPrefixEmpty(t *testing.T) {
@@ -207,7 +339,7 @@ func TestModifyListResponse_SkipsWhenKeyPrefixEmpty(t *testing.T) {
 		Body:    io.NopCloser(strings.NewReader(body)),
 		Request: &http.Request{URL: &url.URL{Path: "/bucket/"}},
 	}
-	require.NoError(t, h.modifyListResponse(resp))
+	require.NoError(t, h.stripKeyPrefixFromResponse(resp))
 	got, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, body, string(got))
 }
@@ -226,7 +358,7 @@ func TestModifyListResponse_SkipsContentEncoded(t *testing.T) {
 		Body:    io.NopCloser(strings.NewReader(body)),
 		Request: &http.Request{URL: &url.URL{Path: "/bucket/"}},
 	}
-	require.NoError(t, h.modifyListResponse(resp))
+	require.NoError(t, h.stripKeyPrefixFromResponse(resp))
 	got, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, body, string(got))
 }
