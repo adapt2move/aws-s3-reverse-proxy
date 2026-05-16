@@ -170,7 +170,7 @@ func TestStripPrefixFromValue_EmptyInputs(t *testing.T) {
 func TestStripKeyPrefixFromListBody_FullListBucketResultV2(t *testing.T) {
 	body := []byte(`<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Name>fleet-insights</Name>
+  <Name>example-bucket</Name>
   <Prefix>tenants/acme/uploads/</Prefix>
   <KeyCount>2</KeyCount>
   <MaxKeys>1000</MaxKeys>
@@ -199,7 +199,7 @@ func TestStripKeyPrefixFromListBody_FullListBucketResultV2(t *testing.T) {
 	// Pagination token left as-is — opaque to the proxy.
 	assert.Contains(t, got, "<ContinuationToken>tenants/acme/opaque==</ContinuationToken>")
 	// Other elements untouched.
-	assert.Contains(t, got, "<Name>fleet-insights</Name>")
+	assert.Contains(t, got, "<Name>example-bucket</Name>")
 	assert.Contains(t, got, "<Size>281</Size>")
 }
 
