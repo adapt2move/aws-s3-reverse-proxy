@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestIsBucketLevelPath(t *testing.T) {
@@ -12,8 +13,18 @@ func TestIsBucketLevelPath(t *testing.T) {
 	assert.True(t, isBucketLevelPath("my-bucket"))
 	assert.True(t, isBucketLevelPath("/"))
 	assert.True(t, isBucketLevelPath(""))
+	// AWS SDK clients with forcePathStyle: true address the bucket as
+	// `/<bucket>/` (trailing slash) for list operations — must count
+	// as bucket-level so scopeListPrefix runs and the `prefix=` query
+	// is rewritten instead of mangling the request path.
+	assert.True(t, isBucketLevelPath("/my-bucket/"))
+	assert.True(t, isBucketLevelPath("my-bucket/"))
 	assert.False(t, isBucketLevelPath("/my-bucket/key"))
 	assert.False(t, isBucketLevelPath("/my-bucket/some/nested/key"))
+	// A real object whose key happens to end with `/` is still
+	// object-level — only paths with NO intermediate separator are
+	// bucket-level.
+	assert.False(t, isBucketLevelPath("/my-bucket/sub/"))
 }
 
 func TestInjectKeyPrefixDisabled(t *testing.T) {
@@ -34,6 +45,23 @@ func TestInjectKeyPrefixLeavesBucketLevelUntouched(t *testing.T) {
 	// Bucket-level paths carry no key to prefix; scopeListPrefix handles them.
 	assert.Equal(t, "/my-bucket", h.injectKeyPrefix("/my-bucket"))
 	assert.Equal(t, "/", h.injectKeyPrefix("/"))
+	// Trailing-slash bucket addressing — same behaviour as without it.
+	assert.Equal(t, "/my-bucket/", h.injectKeyPrefix("/my-bucket/"))
+}
+
+func TestScopeListPrefixOnTrailingSlashBucket(t *testing.T) {
+	// Regression: AWS SDK with forcePathStyle:true sends LIST as
+	// `GET /my-bucket/?list-type=2&prefix=uploads/`. The trailing
+	// slash used to flip the path into the object-level branch,
+	// skipping scopeListPrefix and producing an upstream URL like
+	// `/my-bucket/tenants/acme/` with NO `?prefix=` rewrite. The
+	// upstream store then returned 404 NoSuchKey because the
+	// request looked like a GET for an empty key under that path.
+	h := &Handler{KeyPrefix: "tenants/acme/"}
+	u, _ := url.Parse("http://host/my-bucket/?list-type=2&prefix=uploads/")
+	require.True(t, isBucketLevelPath(u.Path))
+	h.scopeListPrefix(u)
+	assert.Equal(t, "tenants/acme/uploads/", u.Query().Get("prefix"))
 }
 
 func TestScopeListPrefix(t *testing.T) {

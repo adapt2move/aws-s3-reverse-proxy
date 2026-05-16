@@ -72,8 +72,22 @@ type Handler struct {
 // isBucketLevelPath reports whether a path-style S3 request path addresses
 // a bucket itself (e.g. "/my-bucket" or "/") rather than an object within
 // it ("/my-bucket/some/key").
+// isBucketLevelPath returns true for a path that addresses the bucket
+// itself (no object key) — used to choose between injectKeyPrefix
+// (object operations: GET, HEAD, PUT, DELETE) and scopeListPrefix
+// (bucket-level operations: GET ?list-type=2, ?versions, ?location, …).
+//
+// Both `/my-bucket` and `/my-bucket/` count as bucket-level. The AWS
+// SDK with `forcePathStyle: true` emits ListObjectsV2 as
+// `GET /<bucket>/?list-type=2&prefix=<...>`, where the trailing slash
+// is purely cosmetic — without TrimSuffix the slash would look like a
+// separator into an empty object key and the request would be misrouted
+// through injectKeyPrefix, producing an upstream path like
+// `/<bucket>/<KeyPrefix>` (no `?prefix=` rewrite) and a confusing 404
+// from the upstream store.
 func isBucketLevelPath(p string) bool {
-	return strings.IndexByte(strings.TrimPrefix(p, "/"), '/') < 0
+	s := strings.TrimSuffix(strings.TrimPrefix(p, "/"), "/")
+	return strings.IndexByte(s, '/') < 0
 }
 
 // injectKeyPrefix prepends h.KeyPrefix to the object-key portion of a
