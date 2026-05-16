@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -117,6 +119,155 @@ func (h *Handler) scopeListPrefix(u *url.URL) {
 	u.RawQuery = q.Encode()
 }
 
+// XML elements whose text content references an object key path and
+// therefore carries the upstream-prefixed form when KeyPrefix is set.
+// Tokens that are opaque (ContinuationToken, NextContinuationToken,
+// UploadIdMarker, …) are NOT in this set — stripping them would
+// corrupt random tokens that happen to start with the prefix bytes.
+//
+// Element families:
+//
+//   - <Key> / <Prefix>                  ListObjects / ListObjectsV2
+//   - <Marker> / <NextMarker>           ListObjects v1 pagination
+//   - <StartAfter>                       ListObjectsV2 pagination
+//   - <KeyMarker> / <NextKeyMarker>      ListObjectVersions / ListMultipartUploads
+//   - <Location>                         CompleteMultipartUpload response
+//                                        (a URL whose path holds the key)
+//   - <Resource>                         Error response — the request path
+//                                        S3 was acting on; also a URL/path
+var listKeyElementRegexp = regexp.MustCompile(
+	`<(Key|Prefix|Marker|NextMarker|StartAfter|KeyMarker|NextKeyMarker|Location|Resource)>([^<]*)</(Key|Prefix|Marker|NextMarker|StartAfter|KeyMarker|NextKeyMarker|Location|Resource)>`,
+)
+
+// stripPrefixFromValue removes the KeyPrefix from an element text
+// value. Two shapes are supported:
+//
+//  1. Bare key: the value IS the prefixed key — e.g. <Key>tenants/acme/uploads/x.csv</Key>.
+//     We chop the prefix off the front.
+//
+//  2. URL or absolute path: the value embeds the prefixed key after a
+//     path separator — e.g.
+//        <Location>https://bucket.s3.region.amazonaws.com/tenants/acme/uploads/x.csv</Location>
+//        <Resource>/bucket/tenants/acme/uploads/x.csv</Resource>
+//     We splice the prefix out at its `/<KeyPrefix>` occurrence.
+//
+// Returns the value unchanged when no occurrence is found — never
+// removes "the wrong" bytes silently.
+func stripPrefixFromValue(val, prefix []byte) []byte {
+	if len(val) == 0 || len(prefix) == 0 {
+		return val
+	}
+	// 1. Bare key form.
+	if bytes.HasPrefix(val, prefix) {
+		out := make([]byte, len(val)-len(prefix))
+		copy(out, val[len(prefix):])
+		return out
+	}
+	// 2. URL / absolute path form: look for `/<prefix>` and splice.
+	needle := append(append(make([]byte, 0, len(prefix)+1), '/'), prefix...)
+	idx := bytes.Index(val, needle)
+	if idx < 0 {
+		return val
+	}
+	out := make([]byte, 0, len(val)-len(prefix))
+	out = append(out, val[:idx+1]...) // keep the leading slash
+	out = append(out, val[idx+len(needle):]...)
+	return out
+}
+
+// stripKeyPrefixFromListBody undoes scopeListPrefix on the upstream
+// response body so the client sees a fully-transparent view. Without
+// this rewrite a client that pipes a Contents.Key (or a Location URL)
+// straight into a follow-up GetObject would hit a double-prepended
+// path upstream (the proxy adds KeyPrefix again on GET) and 404.
+//
+// Targets the specific XML elements that hold object key paths; leaves
+// opaque pagination tokens (ContinuationToken, …) untouched. Pure
+// byte-level rewrite — preserves the upstream XML formatting,
+// namespaces, comments and any unknown elements.
+func stripKeyPrefixFromListBody(body []byte, keyPrefix string) []byte {
+	if keyPrefix == "" {
+		return body
+	}
+	prefixBytes := []byte(keyPrefix)
+	return listKeyElementRegexp.ReplaceAllFunc(body, func(match []byte) []byte {
+		sm := listKeyElementRegexp.FindSubmatch(match)
+		// sm = [whole, openTag, value, closeTag]
+		if len(sm) != 4 || !bytes.Equal(sm[1], sm[3]) {
+			return match
+		}
+		stripped := stripPrefixFromValue(sm[2], prefixBytes)
+		if bytes.Equal(stripped, sm[2]) {
+			// No occurrence found — leave the element verbatim so we
+			// never silently corrupt a value that just happened to
+			// share the bytes.
+			return match
+		}
+		// Reassemble: <Tag>stripped</Tag>
+		out := make([]byte, 0, len(match)-(len(sm[2])-len(stripped)))
+		out = append(out, '<')
+		out = append(out, sm[1]...)
+		out = append(out, '>')
+		out = append(out, stripped...)
+		out = append(out, '<', '/')
+		out = append(out, sm[3]...)
+		out = append(out, '>')
+		return out
+	})
+}
+
+// stripKeyPrefixFromResponse is wired into httputil.ReverseProxy's
+// ModifyResponse hook. It walks the upstream XML body and strips
+// h.KeyPrefix from elements that carry an object key path, so the
+// client sees a fully-transparent view of the proxy.
+//
+// XML response families this covers:
+//   - LIST / ListObjects / ListObjectsV2 / ListObjectVersions /
+//     ListMultipartUploads (bucket-level paths)
+//   - CompleteMultipartUploadResult (object-level path; <Location>
+//     and <Key> both carry the prefixed path)
+//   - InitiateMultipartUploadResult (object-level; <Key>)
+//   - Error responses on any path (<Resource> holds the request path)
+//
+// The element allow-list in `listKeyElementRegexp` plus the
+// `HasPrefix`/`/<prefix>` guard inside `stripPrefixFromValue` keep
+// the rewrite safe even when the body is a user-uploaded XML
+// document that happens to be Content-Type: application/xml — we
+// only touch values that ALSO start with the configured KeyPrefix.
+//
+// Skipped when:
+//   - KeyPrefix is empty (proxy is fully transparent anyway)
+//   - response is not XML (Content-Type check — opaque object
+//     payloads are never touched)
+//   - response is content-encoded (gzip etc.) — too risky to decode
+//     and re-encode here; upstream S3 doesn't compress these
+//     responses by default
+func (h *Handler) stripKeyPrefixFromResponse(resp *http.Response) error {
+	if h.KeyPrefix == "" || resp == nil {
+		return nil
+	}
+	if resp.Header.Get("Content-Encoding") != "" {
+		return nil
+	}
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "xml") {
+		return nil
+	}
+	if resp.Body == nil {
+		return nil
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	rewritten := stripKeyPrefixFromListBody(body, h.KeyPrefix)
+	resp.Body = io.NopCloser(bytes.NewReader(rewritten))
+	resp.ContentLength = int64(len(rewritten))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(rewritten)))
+	return nil
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	proxyReq, err := h.buildUpstreamRequest(r)
 	if err != nil {
@@ -133,6 +284,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	url := url.URL{Scheme: proxyReq.URL.Scheme, Host: proxyReq.Host}
 	proxy := httputil.NewSingleHostReverseProxy(&url)
 	proxy.FlushInterval = 1
+	// Strip h.KeyPrefix from XML response bodies so the client view is
+	// fully transparent — see stripKeyPrefixFromResponse for the
+	// criteria.
+	proxy.ModifyResponse = h.stripKeyPrefixFromResponse
 	proxy.ServeHTTP(w, proxyReq)
 }
 
