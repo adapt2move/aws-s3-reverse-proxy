@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -117,6 +119,98 @@ func (h *Handler) scopeListPrefix(u *url.URL) {
 	u.RawQuery = q.Encode()
 }
 
+// XML elements in a ListBucket / ListObjectsV2 / ListObjectVersions
+// response that contain a key (and therefore carry the upstream-prefixed
+// form). Tokens that are opaque (ContinuationToken, NextContinuationToken,
+// UploadIdMarker, …) are NOT in this set — those must not be touched.
+var listKeyElementRegexp = regexp.MustCompile(
+	`<(Key|Prefix|Marker|NextMarker|StartAfter|KeyMarker|NextKeyMarker)>([^<]*)</(Key|Prefix|Marker|NextMarker|StartAfter|KeyMarker|NextKeyMarker)>`,
+)
+
+// stripKeyPrefixFromListBody undoes scopeListPrefix on the upstream
+// response body so the client sees a fully-transparent view: a LIST
+// for `prefix=foo/` returns Contents.Key values starting with `foo/`,
+// not with `<KeyPrefix>foo/`. Without this rewrite a client that
+// pipes a Contents.Key straight into a follow-up GetObject would
+// hit a double-prepended path upstream (the proxy adds KeyPrefix
+// again on GET) and 404.
+//
+// Targets the specific XML elements that hold object keys; leaves
+// opaque pagination tokens (ContinuationToken, …) untouched. Pure
+// byte-level rewrite — preserves the upstream XML formatting,
+// namespaces, comments and any unknown elements.
+func stripKeyPrefixFromListBody(body []byte, keyPrefix string) []byte {
+	if keyPrefix == "" {
+		return body
+	}
+	prefixBytes := []byte(keyPrefix)
+	return listKeyElementRegexp.ReplaceAllFunc(body, func(match []byte) []byte {
+		sm := listKeyElementRegexp.FindSubmatch(match)
+		// sm = [whole, openTag, value, closeTag]
+		if len(sm) != 4 || !bytes.Equal(sm[1], sm[3]) {
+			return match
+		}
+		val := sm[2]
+		if !bytes.HasPrefix(val, prefixBytes) {
+			return match
+		}
+		stripped := val[len(prefixBytes):]
+		// Reassemble: <Tag>stripped</Tag>
+		out := make([]byte, 0, len(match)-len(prefixBytes))
+		out = append(out, '<')
+		out = append(out, sm[1]...)
+		out = append(out, '>')
+		out = append(out, stripped...)
+		out = append(out, '<', '/')
+		out = append(out, sm[3]...)
+		out = append(out, '>')
+		return out
+	})
+}
+
+// modifyListResponse is wired into httputil.ReverseProxy's
+// ModifyResponse hook. For bucket-level requests (LIST / ListObjects
+// / etc.) it strips the proxy's KeyPrefix from the response body so
+// the client sees a transparent view. Non-LIST responses are passed
+// through unchanged.
+//
+// Skipped when:
+//   - KeyPrefix is empty (proxy is fully transparent anyway)
+//   - request was not bucket-level (object GET/HEAD/PUT — body is
+//     opaque payload, never XML-listing)
+//   - response is not XML (some error responses are plain text)
+//   - response is content-encoded (gzip etc.) — too risky to decode
+//     and re-encode here; upstream S3 doesn't compress LIST responses
+//     by default, so this is rarely hit
+func (h *Handler) modifyListResponse(resp *http.Response) error {
+	if h.KeyPrefix == "" || resp == nil || resp.Request == nil {
+		return nil
+	}
+	if !isBucketLevelPath(resp.Request.URL.Path) {
+		return nil
+	}
+	if resp.Header.Get("Content-Encoding") != "" {
+		return nil
+	}
+	ct := resp.Header.Get("Content-Type")
+	if ct != "" && !strings.Contains(ct, "xml") {
+		return nil
+	}
+	if resp.Body == nil {
+		return nil
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	rewritten := stripKeyPrefixFromListBody(body, h.KeyPrefix)
+	resp.Body = io.NopCloser(bytes.NewReader(rewritten))
+	resp.ContentLength = int64(len(rewritten))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(rewritten)))
+	return nil
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	proxyReq, err := h.buildUpstreamRequest(r)
 	if err != nil {
@@ -133,6 +227,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	url := url.URL{Scheme: proxyReq.URL.Scheme, Host: proxyReq.Host}
 	proxy := httputil.NewSingleHostReverseProxy(&url)
 	proxy.FlushInterval = 1
+	// Strip h.KeyPrefix from LIST response bodies so the client view is
+	// fully transparent — see modifyListResponse for the criteria.
+	proxy.ModifyResponse = h.modifyListResponse
 	proxy.ServeHTTP(w, proxyReq)
 }
 
