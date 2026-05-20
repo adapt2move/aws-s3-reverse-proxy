@@ -26,6 +26,37 @@ func TestStripKeyPrefixFromListBody_StripsContentsKey(t *testing.T) {
 	assert.Equal(t, `<Contents><Key>uploads/demo.csv</Key></Contents>`, string(got))
 }
 
+// S3 URL-encodes object keys in the LIST response whenever the request
+// carries `EncodingType=url`. boto3 + DuckDB's httpfs (and most AWS
+// SDKs) send that flag by default. Without matching the encoded form,
+// the prefix stayed in the response and downstream globs like
+// `data/*.parquet` returned empty against keys shaped
+// `<Key>tenants%2Facme%2Fdata%2Fx.parquet</Key>`.
+func TestStripKeyPrefixFromListBody_StripsContentsKeyUrlEncoded(t *testing.T) {
+	body := []byte(`<Contents><Key>tenants%2Facme%2Fuploads%2Fdemo.csv</Key></Contents>`)
+	got := stripKeyPrefixFromListBody(body, "tenants/acme/")
+	assert.Equal(t, `<Contents><Key>uploads%2Fdemo.csv</Key></Contents>`, string(got))
+}
+
+func TestStripKeyPrefixFromListBody_StripsTopLevelPrefixUrlEncoded(t *testing.T) {
+	body := []byte(`<Prefix>tenants%2Facme%2Fuploads%2F</Prefix>`)
+	got := stripKeyPrefixFromListBody(body, "tenants/acme/")
+	assert.Equal(t, `<Prefix>uploads%2F</Prefix>`, string(got))
+}
+
+func TestStripKeyPrefixFromListBody_MixedLiteralAndEncoded(t *testing.T) {
+	// EncodingType=url only affects <Key>/<Prefix>-style values; pagination
+	// markers can stay literal in some S3 implementations. Strip both.
+	body := []byte(
+		`<Contents><Key>tenants%2Facme%2Fa.parquet</Key></Contents>` +
+			`<NextMarker>tenants/acme/b.parquet</NextMarker>`,
+	)
+	got := stripKeyPrefixFromListBody(body, "tenants/acme/")
+	assert.Equal(t,
+		`<Contents><Key>a.parquet</Key></Contents><NextMarker>b.parquet</NextMarker>`,
+		string(got))
+}
+
 func TestStripKeyPrefixFromListBody_StripsTopLevelPrefix(t *testing.T) {
 	body := []byte(`<Prefix>tenants/acme/uploads/</Prefix>`)
 	got := stripKeyPrefixFromListBody(body, "tenants/acme/")
