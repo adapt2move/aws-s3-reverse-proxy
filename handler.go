@@ -139,17 +139,45 @@ var listKeyElementRegexp = regexp.MustCompile(
 	`<(Key|Prefix|Marker|NextMarker|StartAfter|KeyMarker|NextKeyMarker|Location|Resource)>([^<]*)</(Key|Prefix|Marker|NextMarker|StartAfter|KeyMarker|NextKeyMarker|Location|Resource)>`,
 )
 
+// urlEncodedPrefix returns the same prefix with every `/` replaced by
+// `%2F` (uppercase). S3 responses URL-encode object keys whenever the
+// client request carries `EncodingType=url` — boto3, DuckDB's httpfs
+// and the standard AWS SDKs all set that by default. Without matching
+// the encoded form, the prefix would stay in the response and the
+// client would see upstream-shaped keys (e.g.
+// `<Key>tenants%2Facme%2Fuploads%2Fx.csv</Key>`) — defeating the whole
+// point of the strip.
+//
+// We deliberately encode ONLY the slash, not the rest of the prefix,
+// because:
+//   - S3's encoding-type=url percent-encodes `/` and unsafe bytes;
+//     ASCII letters/digits stay literal.
+//   - Encoding more aggressively (e.g. `.`) would create needles that
+//     never appear in the response and silently miss real matches.
+func urlEncodedPrefix(prefix []byte) []byte {
+	if !bytes.ContainsRune(prefix, '/') {
+		return prefix
+	}
+	return bytes.ReplaceAll(prefix, []byte("/"), []byte("%2F"))
+}
+
 // stripPrefixFromValue removes the KeyPrefix from an element text
-// value. Two shapes are supported:
+// value. Three shapes are supported:
 //
-//  1. Bare key: the value IS the prefixed key — e.g. <Key>tenants/acme/uploads/x.csv</Key>.
-//     We chop the prefix off the front.
+//  1. Bare key (literal): the value IS the prefixed key — e.g.
+//     <Key>tenants/acme/uploads/x.csv</Key>. Chop the prefix off the front.
 //
-//  2. URL or absolute path: the value embeds the prefixed key after a
+//  2. Bare key (URL-encoded): the value is the same key but with slashes
+//     percent-encoded — e.g.
+//     <Key>tenants%2Facme%2Fuploads%2Fx.csv</Key>. This is what S3
+//     returns whenever the request carries `EncodingType=url` (boto3 and
+//     DuckDB do that by default). Chop the encoded prefix off the front.
+//
+//  3. URL or absolute path: the value embeds the prefixed key after a
 //     path separator — e.g.
 //        <Location>https://bucket.s3.region.amazonaws.com/tenants/acme/uploads/x.csv</Location>
 //        <Resource>/bucket/tenants/acme/uploads/x.csv</Resource>
-//     We splice the prefix out at its `/<KeyPrefix>` occurrence.
+//     Splice the prefix out at its `/<KeyPrefix>` occurrence.
 //
 // Returns the value unchanged when no occurrence is found — never
 // removes "the wrong" bytes silently.
@@ -157,13 +185,22 @@ func stripPrefixFromValue(val, prefix []byte) []byte {
 	if len(val) == 0 || len(prefix) == 0 {
 		return val
 	}
-	// 1. Bare key form.
+	// 1. Bare key form (literal).
 	if bytes.HasPrefix(val, prefix) {
 		out := make([]byte, len(val)-len(prefix))
 		copy(out, val[len(prefix):])
 		return out
 	}
-	// 2. URL / absolute path form: look for `/<prefix>` and splice.
+	// 2. Bare key form (URL-encoded). Only consider when the prefix
+	//    actually contains a slash — otherwise the encoded form equals
+	//    the literal form and the path-1 branch already handled it.
+	encPrefix := urlEncodedPrefix(prefix)
+	if !bytes.Equal(encPrefix, prefix) && bytes.HasPrefix(val, encPrefix) {
+		out := make([]byte, len(val)-len(encPrefix))
+		copy(out, val[len(encPrefix):])
+		return out
+	}
+	// 3. URL / absolute path form: look for `/<prefix>` and splice.
 	needle := append(append(make([]byte, 0, len(prefix)+1), '/'), prefix...)
 	idx := bytes.Index(val, needle)
 	if idx < 0 {
