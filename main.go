@@ -33,6 +33,7 @@ type Options struct {
 	UpstreamRegion        string
 	CertFile              string
 	KeyFile               string
+	ReadOnly              bool
 }
 
 // NewOptions defines and parses the raw command line arguments
@@ -53,6 +54,7 @@ func NewOptions() Options {
 	kingpin.Flag("upstream-region", "optional region to sign upstream requests for, instead of the region from the client's request (env - UPSTREAM_REGION)").Envar("UPSTREAM_REGION").Default("").StringVar(&opts.UpstreamRegion)
 	kingpin.Flag("cert-file", "path to the certificate file (env - CERT_FILE)").Envar("CERT_FILE").Default("").StringVar(&opts.CertFile)
 	kingpin.Flag("key-file", "path to the private key file (env - KEY_FILE)").Envar("KEY_FILE").Default("").StringVar(&opts.KeyFile)
+	kingpin.Flag("read-only", "reject every mutating request (only GET/HEAD are proxied) (env - READ_ONLY)").Envar("READ_ONLY").Default("false").BoolVar(&opts.ReadOnly)
 	kingpin.Parse()
 	return opts
 }
@@ -120,6 +122,7 @@ func NewAwsS3ReverseProxy(opts Options) (*Handler, error) {
 		KeyPrefix:             opts.KeyPrefix,
 		UpstreamSigner:        upstreamSigner,
 		UpstreamRegion:        opts.UpstreamRegion,
+		ReadOnly:              opts.ReadOnly,
 	}
 	return handler, nil
 }
@@ -150,6 +153,9 @@ func main() {
 	}
 	if len(handler.UpstreamRegion) > 0 {
 		log.Infof("Signing upstream requests for region: %q", handler.UpstreamRegion)
+	}
+	if handler.ReadOnly {
+		log.Infof("Read-only mode: only GET/HEAD are proxied; mutating requests are rejected with 403.")
 	}
 
 	if len(opts.PprofListenAddr) > 0 && len(strings.Split(opts.PprofListenAddr, ":")) == 2 {
