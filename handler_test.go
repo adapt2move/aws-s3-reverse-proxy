@@ -149,6 +149,42 @@ func TestHandlerValidSignature(t *testing.T) {
 	assert.Equal(t, 200, resp.Code)
 	assert.Contains(t, resp.Body.String(), "Hello, client")
 }
+func TestHandlerReadOnlyRejectsWrites(t *testing.T) {
+	h := newTestProxy(t)
+	h.ReadOnly = true
+
+	for _, method := range []string{http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodPatch} {
+		req := httptest.NewRequest(method, "http://foobar.example.com/bucket/key", nil)
+		signRequest(req) // a fully valid, signed write request
+		resp := httptest.NewRecorder()
+		h.ServeHTTP(resp, req)
+		assert.Equal(t, http.StatusForbidden, resp.Code, "method %s must be rejected", method)
+	}
+}
+
+func TestHandlerReadOnlyAllowsReads(t *testing.T) {
+	h := newTestProxy(t)
+	h.ReadOnly = true
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		req := httptest.NewRequest(method, "http://foobar.example.com/bucket/key", nil)
+		signRequest(req)
+		resp := httptest.NewRecorder()
+		h.ServeHTTP(resp, req)
+		assert.Equal(t, 200, resp.Code, "method %s must be allowed", method)
+	}
+}
+
+func TestHandlerWritesAllowedWhenNotReadOnly(t *testing.T) {
+	h := newTestProxy(t) // ReadOnly defaults to false
+	req := httptest.NewRequest(http.MethodPut, "http://foobar.example.com/bucket/key", nil)
+	signRequest(req)
+	resp := httptest.NewRecorder()
+	h.ServeHTTP(resp, req)
+	// Not a 403 — the write is proxied (the test upstream answers 200).
+	assert.NotEqual(t, http.StatusForbidden, resp.Code)
+}
+
 func TestHandlerValidSignatureS3cmd(t *testing.T) {
 	h := newTestProxy(t)
 

@@ -33,6 +33,12 @@ type Handler struct {
 	// Print debug information
 	Debug bool
 
+	// When true, only read methods (GET, HEAD) are proxied; every mutating
+	// method (PUT, POST, DELETE, PATCH) is rejected with 403 before the request
+	// is signed or forwarded. This is an upstream-credential-independent
+	// safety boundary: even a fully valid write request never reaches S3.
+	ReadOnly bool
+
 	// http or https
 	UpstreamScheme string
 
@@ -305,7 +311,26 @@ func (h *Handler) stripKeyPrefixFromResponse(resp *http.Response) error {
 	return nil
 }
 
+// isReadMethod reports whether an HTTP method is a non-mutating S3 read:
+// GET (object download, ListObjects/V2, ListObjectVersions, location, …) and
+// HEAD (object existence/metadata). Every other method mutates state.
+func isReadMethod(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Read-only enforcement, before anything else: a mutating method is
+	// rejected up front and never signed or forwarded, regardless of the
+	// credentials it carries (fail closed).
+	if h.ReadOnly && !isReadMethod(r.Method) {
+		log.Warnf("read-only proxy: rejecting %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusForbidden)
+		if h.Debug {
+			w.Write([]byte("read-only proxy: method not allowed"))
+		}
+		return
+	}
+
 	proxyReq, err := h.buildUpstreamRequest(r)
 	if err != nil {
 		log.WithError(err).Error("unable to proxy request")
