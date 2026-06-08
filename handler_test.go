@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // func TestMain(m *testing.M) {
@@ -149,6 +151,89 @@ func TestHandlerValidSignature(t *testing.T) {
 	assert.Equal(t, 200, resp.Code)
 	assert.Contains(t, resp.Body.String(), "Hello, client")
 }
+func TestDecodeAwsChunkedUnsigned(t *testing.T) {
+	// STREAMING-UNSIGNED-PAYLOAD-TRAILER: plain `<hex>\r\n<data>\r\n` per chunk,
+	// terminated by `0\r\n\r\n` — exactly the framing seen baked into the corrupt
+	// parquet objects (`165D\r\nPAR1…\r\n\r\n`).
+	payload := bytes.Repeat([]byte("PAR1-payload-bytes-"), 500) // ~9.5 KB, multi-read
+	var body bytes.Buffer
+	fmt.Fprintf(&body, "%x\r\n", len(payload))
+	body.Write(payload)
+	body.WriteString("\r\n0\r\n\r\n")
+
+	got, err := decodeAwsChunked(bytes.NewReader(body.Bytes()))
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+}
+
+func TestDecodeAwsChunkedSignedMultiChunk(t *testing.T) {
+	// STREAMING-AWS4-HMAC-SHA256-PAYLOAD: each size line carries a
+	// `;chunk-signature=…` extension we must ignore. Two data chunks.
+	c1 := bytes.Repeat([]byte("A"), 17)
+	c2 := bytes.Repeat([]byte("B"), 9)
+	var body bytes.Buffer
+	fmt.Fprintf(&body, "%x;chunk-signature=%064x\r\n", len(c1), 1)
+	body.Write(c1)
+	body.WriteString("\r\n")
+	fmt.Fprintf(&body, "%x;chunk-signature=%064x\r\n", len(c2), 2)
+	body.Write(c2)
+	body.WriteString("\r\n")
+	body.WriteString("0;chunk-signature=" + strings.Repeat("0", 64) + "\r\n\r\n")
+
+	got, err := decodeAwsChunked(bytes.NewReader(body.Bytes()))
+	require.NoError(t, err)
+	require.Equal(t, append(append([]byte{}, c1...), c2...), got)
+}
+
+// The wiring: assembleUpstreamReq must hand the UPSTREAM request a DECODED body
+// (and drop the streaming markers) when the incoming PUT is aws-chunked — so the
+// object stored upstream is the real content, not the framed bytes.
+func TestAssembleUpstreamReqDecodesChunkedBody(t *testing.T) {
+	h := newTestProxy(t)
+	payload := []byte("PAR1-the-real-object-content-PAR1")
+	var framed bytes.Buffer
+	fmt.Fprintf(&framed, "%x\r\n", len(payload))
+	framed.Write(payload)
+	framed.WriteString("\r\n0\r\n\r\n")
+
+	req := httptest.NewRequest(http.MethodPut, "http://foobar.example.com/bucket/key", bytes.NewReader(framed.Bytes()))
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Decoded-Content-Length", "33")
+
+	var signer *v4.Signer
+	for _, s := range h.Signers {
+		signer = s
+	}
+	up, err := h.assembleUpstreamReq(signer, req, "eu-test-1")
+	require.NoError(t, err)
+
+	gotBody, _ := io.ReadAll(up.Body)
+	require.Equal(t, payload, gotBody, "upstream must receive the decoded object, not the chunk-framed body")
+	require.Equal(t, int64(len(payload)), up.ContentLength)
+	require.Empty(t, up.Header.Get("Content-Encoding"), "aws-chunked marker must not be forwarded")
+	require.Empty(t, up.Header.Get("X-Amz-Decoded-Content-Length"))
+}
+
+func TestIsAwsChunkedUpload(t *testing.T) {
+	mk := func(sha, enc string) *http.Request {
+		r := httptest.NewRequest(http.MethodPut, "http://h/bucket/key", nil)
+		if sha != "" {
+			r.Header.Set("X-Amz-Content-Sha256", sha)
+		}
+		if enc != "" {
+			r.Header.Set("Content-Encoding", enc)
+		}
+		return r
+	}
+	require.True(t, isAwsChunkedUpload(mk("STREAMING-UNSIGNED-PAYLOAD-TRAILER", "")))
+	require.True(t, isAwsChunkedUpload(mk("STREAMING-AWS4-HMAC-SHA256-PAYLOAD", "")))
+	require.True(t, isAwsChunkedUpload(mk("", "aws-chunked")))
+	require.False(t, isAwsChunkedUpload(mk("e3b0c442…", "")))
+	require.False(t, isAwsChunkedUpload(mk("", "gzip")))
+	require.False(t, isAwsChunkedUpload(mk("", "")))
+}
+
 func TestHandlerReadOnlyRejectsWrites(t *testing.T) {
 	h := newTestProxy(t)
 	h.ReadOnly = true

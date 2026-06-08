@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/subtle"
 	"fmt"
@@ -456,6 +457,50 @@ func (h *Handler) generateFakeIncomingRequest(signer *v4.Signer, req *http.Reque
 	return fakeReq, nil
 }
 
+// isAwsChunkedUpload reports whether the incoming request carries an
+// aws-chunked (streaming) request body, identified by an x-amz-content-sha256
+// of STREAMING-… (the AWS SigV4 streaming-upload markers). DuckDB's httpfs and
+// the AWS SDKs use this for PUT / UploadPart bodies.
+func isAwsChunkedUpload(req *http.Request) bool {
+	if strings.HasPrefix(req.Header.Get("X-Amz-Content-Sha256"), "STREAMING-") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(req.Header.Get("Content-Encoding")), "aws-chunked")
+}
+
+// decodeAwsChunked decodes an aws-chunked body into the raw object content. Each
+// chunk is `<hex-size>[;chunk-signature=…]\r\n<size bytes>\r\n`; a zero-size
+// chunk ends the stream (any trailer that follows is ignored). Per-chunk
+// signatures (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) are accepted and ignored — we
+// only need the payload bytes.
+func decodeAwsChunked(r io.Reader) ([]byte, error) {
+	br := bufio.NewReader(r)
+	var out bytes.Buffer
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("reading chunk size: %w", err)
+		}
+		sizeField := strings.TrimRight(line, "\r\n")
+		if i := strings.IndexByte(sizeField, ';'); i >= 0 {
+			sizeField = sizeField[:i] // drop chunk extensions (e.g. chunk-signature)
+		}
+		size, err := strconv.ParseInt(strings.TrimSpace(sizeField), 16, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid chunk size %q: %w", sizeField, err)
+		}
+		if size == 0 {
+			return out.Bytes(), nil // final chunk; trailers (if any) ignored
+		}
+		if _, err := io.CopyN(&out, br, size); err != nil {
+			return nil, fmt.Errorf("reading chunk data: %w", err)
+		}
+		if _, err := br.Discard(2); err != nil { // consume the CRLF after chunk data
+			return nil, fmt.Errorf("reading chunk terminator: %w", err)
+		}
+	}
+}
+
 func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, region string) (*http.Request, error) {
 	upstreamEndpoint := h.UpstreamEndpoint
 	if len(upstreamEndpoint) == 0 {
@@ -475,10 +520,36 @@ func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, regi
 	if isBucketLevelPath(req.URL.Path) {
 		h.scopeListPrefix(&proxyURL)
 	}
-	proxyReq, err := http.NewRequest(req.Method, proxyURL.String(), req.Body)
+	// A client streaming an upload (e.g. DuckDB httpfs, the AWS SDKs) sends the
+	// body in `aws-chunked` form — `<hex-size>[;chunk-signature=…]\r\n<data>\r\n`
+	// repeated, ending `0\r\n…\r\n` — signalled by an `x-amz-content-sha256` of
+	// `STREAMING-…`. We re-sign the request with a plain payload hash, which
+	// drops the streaming semantics, so the upstream would store the *framed*
+	// bytes verbatim (corrupting the object: a parquet becomes
+	// `165D\r\nPAR1…\r\n\r\n`). Decode the framing here so the upstream receives
+	// the real content. Validation of the incoming signature already happened
+	// above against the original headers and is unaffected (the body is not part
+	// of a STREAMING canonical request).
+	body := req.Body
+	if isAwsChunkedUpload(req) {
+		decoded, derr := decodeAwsChunked(req.Body)
+		if derr != nil {
+			return nil, fmt.Errorf("aws-chunked decode: %w", derr)
+		}
+		body = io.NopCloser(bytes.NewReader(decoded))
+		req.ContentLength = int64(len(decoded))
+		// Strip the streaming markers so they are not copied upstream and the
+		// signer computes a normal payload hash over the decoded body.
+		req.Header.Del("Content-Encoding")
+		req.Header.Del("X-Amz-Decoded-Content-Length")
+		req.Header.Del("X-Amz-Content-Sha256")
+	}
+
+	proxyReq, err := http.NewRequest(req.Method, proxyURL.String(), body)
 	if err != nil {
 		return nil, err
 	}
+	proxyReq.ContentLength = req.ContentLength
 	if val, ok := req.Header["Content-Type"]; ok {
 		proxyReq.Header["Content-Type"] = val
 	}
