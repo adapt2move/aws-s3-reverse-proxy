@@ -30,9 +30,9 @@ change specific HTTP headers. This means every deployment of
 `aws-s3-reverse-proxy` needs to be aware of the expected AWS security
 credentials to re-sign each request.
 
-## Key Prefix, Separate Upstream Credentials and Region
+## Key Prefix, Separate Upstream Credentials, Region, and Read-Only Mode
 
-Three optional flags extend the basic re-signing behaviour:
+Four optional flags extend the basic re-signing behaviour:
 
   * `--key-prefix` (env `KEY_PREFIX`): a string prepended to every object
     key sent upstream. `GET /bucket/key` becomes `GET /bucket/<prefix>key`.
@@ -48,8 +48,14 @@ Three optional flags extend the basic re-signing behaviour:
     upstream requests for, instead of the region from the client's
     request. Useful when the client signs with a placeholder (or empty)
     region but the real backend expects a specific one.
+  * `--read-only` (env `READ_ONLY`): when set to `true`, only GET and HEAD
+    requests are proxied. Every mutating method (PUT, POST, DELETE, PATCH)
+    is rejected immediately with HTTP 403 — before the request is signed or
+    forwarded — regardless of the credentials it carries. This is an
+    upstream-credential-independent safety boundary: even a fully valid
+    write request never reaches S3.
 
-All three default to off; without them the proxy behaves exactly as
+All four default to off; without them the proxy behaves exactly as
 before.
 
 ## Releases
@@ -69,6 +75,7 @@ GitHub](https://github.com/Kriechi/aws-s3-reverse-proxy/releases).
   * uses secure HTTPS for upstream connections by default
   * run as single binary or Docker container
   * configuration via CLI, or using the same options in a config file
+  * read-only mode to block all mutating requests before they reach S3
 
 ## Getting Started
 
