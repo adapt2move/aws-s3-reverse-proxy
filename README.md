@@ -59,12 +59,32 @@ Five optional flags extend the basic re-signing behaviour:
     the whole bucket. A mutating request (PUT, POST, DELETE, PATCH) whose
     object key starts with one of the listed prefixes is rejected with HTTP
     403 — before it is signed or forwarded — while reads and writes to
-    other keys are proxied as usual. The flag is repeatable to protect
-    several prefixes; via the environment variable, separate multiple
-    prefixes with newlines. Prefixes are matched against the client-facing
-    object key, i.e. before
-    any `--key-prefix` is prepended. Bucket-level requests carry no object
-    key and are not affected.
+    other keys are proxied as usual. Prefixes are matched against the
+    client-facing object key, i.e. before any `--key-prefix` is prepended.
+    Bucket-level requests carry no object key and are not affected.
+
+    To protect **several** prefixes, repeat the flag, or — when using the
+    environment variable — separate them with newlines (the env var holds a
+    newline-separated list, the same convention as `ALLOWED_SOURCE_SUBNET`
+    and `AWS_CREDENTIALS`):
+
+    ```sh
+    # CLI: repeat the flag
+    aws-s3-reverse-proxy \
+      --read-only-key-prefix protected/ \
+      --read-only-key-prefix locked/
+
+    # Env (shell): newline-separated
+    export READ_ONLY_KEY_PREFIX=$'protected/\nlocked/'
+    ```
+
+    ```yaml
+    # Env (docker-compose): a YAML block scalar keeps it readable
+    environment:
+      READ_ONLY_KEY_PREFIX: |-
+        protected/
+        locked/
+    ```
 
 All five default to off; without them the proxy behaves exactly as
 before.

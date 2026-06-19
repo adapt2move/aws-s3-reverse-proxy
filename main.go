@@ -56,7 +56,7 @@ func NewOptions() Options {
 	kingpin.Flag("cert-file", "path to the certificate file (env - CERT_FILE)").Envar("CERT_FILE").Default("").StringVar(&opts.CertFile)
 	kingpin.Flag("key-file", "path to the private key file (env - KEY_FILE)").Envar("KEY_FILE").Default("").StringVar(&opts.KeyFile)
 	kingpin.Flag("read-only", "reject every mutating request (only GET/HEAD are proxied) (env - READ_ONLY)").Envar("READ_ONLY").Default("false").BoolVar(&opts.ReadOnly)
-	kingpin.Flag("read-only-key-prefix", "reject mutating requests for object keys under this prefix (repeatable) (env - READ_ONLY_KEY_PREFIX)").Envar("READ_ONLY_KEY_PREFIX").PlaceHolder("protected/").StringsVar(&opts.ReadOnlyKeyPrefixes)
+	kingpin.Flag("read-only-key-prefix", "reject mutating requests for object keys under this prefix; repeat the flag for multiple prefixes (via env, separate them with newlines) (env - READ_ONLY_KEY_PREFIX)").Envar("READ_ONLY_KEY_PREFIX").PlaceHolder("protected/").StringsVar(&opts.ReadOnlyKeyPrefixes)
 	kingpin.Parse()
 	return opts
 }
