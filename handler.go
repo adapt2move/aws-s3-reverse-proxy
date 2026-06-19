@@ -40,6 +40,15 @@ type Handler struct {
 	// safety boundary: even a fully valid write request never reaches S3.
 	ReadOnly bool
 
+	// Optional: a set of object-key prefixes that are protected from
+	// mutation. A mutating request (PUT, POST, DELETE, PATCH) whose object
+	// key starts with any of these prefixes is rejected with 403 before the
+	// request is signed or forwarded — exactly like ReadOnly, but scoped to
+	// the listed prefixes instead of the whole bucket. Reads are always
+	// allowed. The prefixes are matched against the client-facing object key
+	// (i.e. before any KeyPrefix is prepended). Empty disables the feature.
+	ReadOnlyKeyPrefixes []string
+
 	// http or https
 	UpstreamScheme string
 
@@ -319,6 +328,38 @@ func isReadMethod(method string) bool {
 	return method == http.MethodGet || method == http.MethodHead
 }
 
+// objectKey returns the object-key portion of a path-style request path
+// ("/bucket/key" -> "key", true). A bucket-level path ("/bucket" or
+// "/bucket/") addresses no object key and returns ("", false).
+func objectKey(p string) (string, bool) {
+	if isBucketLevelPath(p) {
+		return "", false
+	}
+	trimmed := strings.TrimPrefix(p, "/")
+	idx := strings.IndexByte(trimmed, '/')
+	return trimmed[idx+1:], true
+}
+
+// isProtectedKeyPath reports whether the object key in a path-style request
+// path falls under one of the configured ReadOnlyKeyPrefixes. Bucket-level
+// paths (no object key) are never protected. Returns false when no prefixes
+// are configured.
+func (h *Handler) isProtectedKeyPath(p string) bool {
+	if len(h.ReadOnlyKeyPrefixes) == 0 {
+		return false
+	}
+	key, ok := objectKey(p)
+	if !ok {
+		return false
+	}
+	for _, prefix := range h.ReadOnlyKeyPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Read-only enforcement, before anything else: a mutating method is
 	// rejected up front and never signed or forwarded, regardless of the
@@ -328,6 +369,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		if h.Debug {
 			w.Write([]byte("read-only proxy: method not allowed"))
+		}
+		return
+	}
+
+	// Per-prefix read-only enforcement: a mutating request whose object key
+	// falls under one of the protected prefixes is rejected up front, before
+	// it is signed or forwarded — independent of the credentials it carries
+	// (fail closed).
+	if !isReadMethod(r.Method) && h.isProtectedKeyPath(r.URL.Path) {
+		log.Warnf("read-only key prefix: rejecting %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusForbidden)
+		if h.Debug {
+			w.Write([]byte("read-only key prefix: write not allowed"))
 		}
 		return
 	}

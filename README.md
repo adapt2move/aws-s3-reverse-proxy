@@ -32,7 +32,7 @@ credentials to re-sign each request.
 
 ## Key Prefix, Separate Upstream Credentials, Region, and Read-Only Mode
 
-Four optional flags extend the basic re-signing behaviour:
+Five optional flags extend the basic re-signing behaviour:
 
   * `--key-prefix` (env `KEY_PREFIX`): a string prepended to every object
     key sent upstream. `GET /bucket/key` becomes `GET /bucket/<prefix>key`.
@@ -54,8 +54,39 @@ Four optional flags extend the basic re-signing behaviour:
     forwarded — regardless of the credentials it carries. This is an
     upstream-credential-independent safety boundary: even a fully valid
     write request never reaches S3.
+  * `--read-only-key-prefix` (env `READ_ONLY_KEY_PREFIX`): like
+    `--read-only`, but scoped to one or more object-key prefixes instead of
+    the whole bucket. A mutating request (PUT, POST, DELETE, PATCH) whose
+    object key starts with one of the listed prefixes is rejected with HTTP
+    403 — before it is signed or forwarded — while reads and writes to
+    other keys are proxied as usual. Prefixes are matched against the
+    client-facing object key, i.e. before any `--key-prefix` is prepended.
+    Bucket-level requests carry no object key and are not affected.
 
-All four default to off; without them the proxy behaves exactly as
+    To protect **several** prefixes, repeat the flag, or — when using the
+    environment variable — separate them with newlines (the env var holds a
+    newline-separated list, the same convention as `ALLOWED_SOURCE_SUBNET`
+    and `AWS_CREDENTIALS`):
+
+    ```sh
+    # CLI: repeat the flag
+    aws-s3-reverse-proxy \
+      --read-only-key-prefix protected/ \
+      --read-only-key-prefix locked/
+
+    # Env (shell): newline-separated
+    export READ_ONLY_KEY_PREFIX=$'protected/\nlocked/'
+    ```
+
+    ```yaml
+    # Env (docker-compose): a YAML block scalar keeps it readable
+    environment:
+      READ_ONLY_KEY_PREFIX: |-
+        protected/
+        locked/
+    ```
+
+All five default to off; without them the proxy behaves exactly as
 before.
 
 ## Releases
@@ -76,6 +107,7 @@ GitHub](https://github.com/Kriechi/aws-s3-reverse-proxy/releases).
   * run as single binary or Docker container
   * configuration via CLI, or using the same options in a config file
   * read-only mode to block all mutating requests before they reach S3
+  * per-prefix read-only mode to protect selected object-key prefixes from writes
 
 ## Getting Started
 

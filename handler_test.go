@@ -270,6 +270,59 @@ func TestHandlerWritesAllowedWhenNotReadOnly(t *testing.T) {
 	assert.NotEqual(t, http.StatusForbidden, resp.Code)
 }
 
+func TestHandlerReadOnlyKeyPrefixRejectsProtectedWrites(t *testing.T) {
+	h := newTestProxy(t)
+	h.ReadOnlyKeyPrefixes = []string{"protected/", "locked/"}
+
+	paths := []string{
+		"http://foobar.example.com/bucket/protected/file.txt",
+		"http://foobar.example.com/bucket/protected/nested/deep.txt",
+		"http://foobar.example.com/bucket/locked/file.txt",
+	}
+	for _, path := range paths {
+		for _, method := range []string{http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodPatch} {
+			req := httptest.NewRequest(method, path, nil)
+			signRequest(req) // a fully valid, signed write request
+			resp := httptest.NewRecorder()
+			h.ServeHTTP(resp, req)
+			assert.Equal(t, http.StatusForbidden, resp.Code, "%s %s must be rejected", method, path)
+		}
+	}
+}
+
+func TestHandlerReadOnlyKeyPrefixAllowsUnprotectedWrites(t *testing.T) {
+	h := newTestProxy(t)
+	h.ReadOnlyKeyPrefixes = []string{"protected/"}
+
+	// Object keys outside the protected prefix, and bucket-level paths, are
+	// proxied (the test upstream answers 200) — never a 403.
+	paths := []string{
+		"http://foobar.example.com/bucket/public/file.txt",
+		"http://foobar.example.com/bucket/unprotectedfile.txt",
+		"http://foobar.example.com/bucket", // bucket-level: no object key
+	}
+	for _, path := range paths {
+		req := httptest.NewRequest(http.MethodPut, path, nil)
+		signRequest(req)
+		resp := httptest.NewRecorder()
+		h.ServeHTTP(resp, req)
+		assert.NotEqual(t, http.StatusForbidden, resp.Code, "PUT %s must be allowed", path)
+	}
+}
+
+func TestHandlerReadOnlyKeyPrefixAllowsReadsOnProtectedKeys(t *testing.T) {
+	h := newTestProxy(t)
+	h.ReadOnlyKeyPrefixes = []string{"protected/"}
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		req := httptest.NewRequest(method, "http://foobar.example.com/bucket/protected/file.txt", nil)
+		signRequest(req)
+		resp := httptest.NewRecorder()
+		h.ServeHTTP(resp, req)
+		assert.Equal(t, 200, resp.Code, "%s on a protected key must be allowed", method)
+	}
+}
+
 func TestHandlerValidSignatureS3cmd(t *testing.T) {
 	h := newTestProxy(t)
 

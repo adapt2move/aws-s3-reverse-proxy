@@ -34,6 +34,7 @@ type Options struct {
 	CertFile              string
 	KeyFile               string
 	ReadOnly              bool
+	ReadOnlyKeyPrefixes   []string
 }
 
 // NewOptions defines and parses the raw command line arguments
@@ -55,6 +56,7 @@ func NewOptions() Options {
 	kingpin.Flag("cert-file", "path to the certificate file (env - CERT_FILE)").Envar("CERT_FILE").Default("").StringVar(&opts.CertFile)
 	kingpin.Flag("key-file", "path to the private key file (env - KEY_FILE)").Envar("KEY_FILE").Default("").StringVar(&opts.KeyFile)
 	kingpin.Flag("read-only", "reject every mutating request (only GET/HEAD are proxied) (env - READ_ONLY)").Envar("READ_ONLY").Default("false").BoolVar(&opts.ReadOnly)
+	kingpin.Flag("read-only-key-prefix", "reject mutating requests for object keys under this prefix; repeat the flag for multiple prefixes (via env, separate them with newlines) (env - READ_ONLY_KEY_PREFIX)").Envar("READ_ONLY_KEY_PREFIX").PlaceHolder("protected/").StringsVar(&opts.ReadOnlyKeyPrefixes)
 	kingpin.Parse()
 	return opts
 }
@@ -111,6 +113,15 @@ func NewAwsS3ReverseProxy(opts Options) (*Handler, error) {
 		}))
 	}
 
+	// Drop empty prefixes: an empty string matches every key and would
+	// silently turn the per-prefix protection into a full read-only mode.
+	var readOnlyKeyPrefixes []string
+	for _, prefix := range opts.ReadOnlyKeyPrefixes {
+		if len(prefix) > 0 {
+			readOnlyKeyPrefixes = append(readOnlyKeyPrefixes, prefix)
+		}
+	}
+
 	handler := &Handler{
 		Debug:                 opts.Debug,
 		UpstreamScheme:        scheme,
@@ -123,6 +134,7 @@ func NewAwsS3ReverseProxy(opts Options) (*Handler, error) {
 		UpstreamSigner:        upstreamSigner,
 		UpstreamRegion:        opts.UpstreamRegion,
 		ReadOnly:              opts.ReadOnly,
+		ReadOnlyKeyPrefixes:   readOnlyKeyPrefixes,
 	}
 	return handler, nil
 }
@@ -156,6 +168,9 @@ func main() {
 	}
 	if handler.ReadOnly {
 		log.Infof("Read-only mode: only GET/HEAD are proxied; mutating requests are rejected with 403.")
+	}
+	for _, prefix := range handler.ReadOnlyKeyPrefixes {
+		log.Infof("Read-only key prefix: mutating requests for object keys under %q are rejected with 403.", prefix)
 	}
 
 	if len(opts.PprofListenAddr) > 0 && len(strings.Split(opts.PprofListenAddr, ":")) == 2 {
