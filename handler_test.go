@@ -323,6 +323,57 @@ func TestHandlerReadOnlyKeyPrefixAllowsReadsOnProtectedKeys(t *testing.T) {
 	}
 }
 
+// TestHandlerKeyPrefixAndReadOnlyKeyPrefixCombined pins down how the two flags
+// interact: --read-only-key-prefix is evaluated against the CLIENT-FACING key
+// (before --key-prefix is prepended), and only afterwards does --key-prefix
+// rewrite the path sent upstream. This ordering is what lets operators write
+// read-only prefixes in client terms while still confining writes to a fixed
+// upstream prefix.
+func TestHandlerKeyPrefixAndReadOnlyKeyPrefixCombined(t *testing.T) {
+	var upstreamPath string
+	thf := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		fmt.Fprintln(w, "Hello, client")
+	})
+	h := newTestProxyWithHandler(t, &thf)
+	h.KeyPrefix = "tenants/acme/"
+	h.ReadOnlyKeyPrefixes = []string{"protected/"}
+
+	// A write under the protected prefix is rejected — the check matches the
+	// client key "protected/secret.txt", NOT the upstream-rewritten
+	// "tenants/acme/protected/secret.txt" — and never reaches upstream.
+	req := httptest.NewRequest(http.MethodPut, "http://foobar.example.com/bucket/protected/secret.txt", nil)
+	signRequest(req)
+	resp := httptest.NewRecorder()
+	upstreamPath = ""
+	h.ServeHTTP(resp, req)
+	assert.Equal(t, http.StatusForbidden, resp.Code, "protected write must be rejected")
+	assert.Empty(t, upstreamPath, "rejected write must never reach upstream")
+
+	// A write outside the protected prefix is allowed AND arrives upstream with
+	// --key-prefix prepended: read-only check passed on the client key, then
+	// the prefix was injected.
+	req = httptest.NewRequest(http.MethodPut, "http://foobar.example.com/bucket/data/report.csv", nil)
+	signRequest(req)
+	resp = httptest.NewRecorder()
+	upstreamPath = ""
+	h.ServeHTTP(resp, req)
+	assert.NotEqual(t, http.StatusForbidden, resp.Code, "unprotected write must be allowed")
+	assert.Equal(t, "/bucket/tenants/acme/data/report.csv", upstreamPath,
+		"allowed write must reach upstream with the key prefix injected")
+
+	// Read-only prefixes are written in CLIENT terms: a client key that already
+	// starts with the --key-prefix path does not match "protected/", so it is
+	// NOT blocked. (Specifying "tenants/acme/protected/" would be the wrong
+	// mental model.)
+	req = httptest.NewRequest(http.MethodPut, "http://foobar.example.com/bucket/tenants/acme/protected/x.txt", nil)
+	signRequest(req)
+	resp = httptest.NewRecorder()
+	h.ServeHTTP(resp, req)
+	assert.NotEqual(t, http.StatusForbidden, resp.Code,
+		"protection is matched against the client-facing key, not the upstream path")
+}
+
 func TestHandlerValidSignatureS3cmd(t *testing.T) {
 	h := newTestProxy(t)
 

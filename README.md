@@ -89,6 +89,45 @@ Five optional flags extend the basic re-signing behaviour:
 All five default to off; without them the proxy behaves exactly as
 before.
 
+### Combining `--key-prefix` and `--read-only-key-prefix`
+
+These two flags operate on the same object key but in **different layers**, and
+the order matters. For every incoming request the proxy:
+
+1. **first** checks `--read-only-key-prefix` against the **client-facing** key
+   — the key exactly as the client sent it, *before* any `--key-prefix` is
+   applied — and rejects a mutating request with HTTP 403 if it matches;
+2. **then**, for requests that are allowed through, prepends `--key-prefix` to
+   the object key before signing and forwarding upstream.
+
+```
+client PUT /bucket/protected/x      [1] read-only check     [2] key-prefix prepend
+        └── key: protected/x   ───►  matches "protected/"  ───►  (never reached) ──► 403
+client PUT /bucket/data/y           matches nothing        ───►  /bucket/tenants/acme/data/y ──► S3
+        └── key: data/y
+```
+
+The practical consequence: **write `--read-only-key-prefix` in client terms,
+not in upstream terms.** You do not (and must not) repeat the `--key-prefix` in
+it. For example, with:
+
+```sh
+aws-s3-reverse-proxy \
+  --key-prefix tenants/acme/ \
+  --read-only-key-prefix protected/
+```
+
+| Client request (PUT) | Read-only match against | Result | Upstream path (if allowed) |
+| --- | --- | --- | --- |
+| `/bucket/protected/x` | `protected/x` → matches `protected/` | **403** | — |
+| `/bucket/data/y` | `data/y` → no match | proxied | `/bucket/tenants/acme/data/y` |
+
+> **Note:** this write protection is a property of *this proxy instance*, not of
+> the bucket. It confines what *this* proxy will forward; it is not a substitute
+> for an S3 bucket policy or IAM permissions. A different client reaching the
+> same upstream bucket directly — or through another proxy configured with a
+> different (or no) `--key-prefix` — is not affected by it.
+
 ## Releases
 
 Get the latest Docker image from [from
