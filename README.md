@@ -32,7 +32,7 @@ credentials to re-sign each request.
 
 ## Key Prefix, Separate Upstream Credentials, Region, and Read-Only Mode
 
-Five optional flags extend the basic re-signing behaviour:
+Six optional flags extend the basic re-signing behaviour:
 
   * `--key-prefix` (env `KEY_PREFIX`): a string prepended to every object
     key sent upstream. `GET /bucket/key` becomes `GET /bucket/<prefix>key`.
@@ -85,8 +85,29 @@ Five optional flags extend the basic re-signing behaviour:
         protected/
         locked/
     ```
+  * `--deny-key-prefix` (env `DENY_KEY_PREFIX`): like
+    `--read-only-key-prefix`, but stricter. Every request — **read and
+    write** — whose object key starts with one of the listed prefixes is
+    rejected with HTTP 403 (before it is signed or forwarded), and matching
+    keys are **hidden from bucket listings**: their `<Contents>` and
+    `<CommonPrefixes>` entries are stripped from LIST responses so a client
+    cannot even discover that they exist. Like `--read-only-key-prefix`,
+    prefixes are matched against the client-facing object key (before any
+    `--key-prefix` is prepended), bucket-level requests themselves are never
+    denied (only their listings are filtered), and the flag can be repeated —
+    or, via the environment variable, separated with newlines:
 
-All five default to off; without them the proxy behaves exactly as
+    ```sh
+    # CLI: repeat the flag
+    aws-s3-reverse-proxy \
+      --deny-key-prefix hidden/ \
+      --deny-key-prefix internal/
+
+    # Env (shell): newline-separated
+    export DENY_KEY_PREFIX=$'hidden/\ninternal/'
+    ```
+
+All six default to off; without them the proxy behaves exactly as
 before.
 
 ### Combining `--key-prefix` and `--read-only-key-prefix`
@@ -128,6 +149,11 @@ aws-s3-reverse-proxy \
 > same upstream bucket directly — or through another proxy configured with a
 > different (or no) `--key-prefix` — is not affected by it.
 
+`--deny-key-prefix` follows the same layering: it is checked against the
+client-facing key first (rejecting reads and writes alike, and hiding matching
+keys from listings), and only allowed requests then have `--key-prefix`
+prepended. The same instance-scoped caveat applies — it is not a bucket policy.
+
 ## Releases
 
 Get the latest Docker image from [from
@@ -147,6 +173,7 @@ GitHub](https://github.com/Kriechi/aws-s3-reverse-proxy/releases).
   * configuration via CLI, or using the same options in a config file
   * read-only mode to block all mutating requests before they reach S3
   * per-prefix read-only mode to protect selected object-key prefixes from writes
+  * per-prefix deny mode to block all access to selected object-key prefixes and hide them from listings
 
 ## Getting Started
 

@@ -374,6 +374,96 @@ func TestHandlerKeyPrefixAndReadOnlyKeyPrefixCombined(t *testing.T) {
 		"protection is matched against the client-facing key, not the upstream path")
 }
 
+func TestHandlerDenyKeyPrefixRejectsAllMethods(t *testing.T) {
+	h := newTestProxy(t)
+	h.DenyKeyPrefixes = []string{"hidden/", "secret/"}
+
+	paths := []string{
+		"http://foobar.example.com/bucket/hidden/file.txt",
+		"http://foobar.example.com/bucket/hidden/nested/deep.txt",
+		"http://foobar.example.com/bucket/secret/file.txt",
+	}
+	// Deny blocks reads AND writes — every method is rejected with 403.
+	for _, path := range paths {
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodPatch} {
+			req := httptest.NewRequest(method, path, nil)
+			signRequest(req) // a fully valid, signed request
+			resp := httptest.NewRecorder()
+			h.ServeHTTP(resp, req)
+			assert.Equal(t, http.StatusForbidden, resp.Code, "%s %s must be denied", method, path)
+		}
+	}
+}
+
+func TestHandlerDenyKeyPrefixAllowsOtherKeys(t *testing.T) {
+	h := newTestProxy(t)
+	h.DenyKeyPrefixes = []string{"hidden/"}
+
+	// Object keys outside the denied prefix, and bucket-level paths, are
+	// proxied (the test upstream answers 200) — never a 403.
+	paths := []string{
+		"http://foobar.example.com/bucket/public/file.txt",
+		"http://foobar.example.com/bucket/hiddenfile.txt", // shares the bytes but not the "hidden/" boundary
+		"http://foobar.example.com/bucket",                // bucket-level: no object key
+	}
+	for _, path := range paths {
+		for _, method := range []string{http.MethodGet, http.MethodPut} {
+			req := httptest.NewRequest(method, path, nil)
+			signRequest(req)
+			resp := httptest.NewRecorder()
+			h.ServeHTTP(resp, req)
+			assert.NotEqual(t, http.StatusForbidden, resp.Code, "%s %s must be allowed", method, path)
+		}
+	}
+}
+
+// TestHandlerKeyPrefixAndDenyKeyPrefixCombined pins down that --deny-key-prefix,
+// like --read-only-key-prefix, is evaluated against the CLIENT-FACING key
+// (before --key-prefix is prepended). A denied read never reaches upstream; an
+// allowed request still gets --key-prefix injected on the way out.
+func TestHandlerKeyPrefixAndDenyKeyPrefixCombined(t *testing.T) {
+	var upstreamPath string
+	thf := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		fmt.Fprintln(w, "Hello, client")
+	})
+	h := newTestProxyWithHandler(t, &thf)
+	h.KeyPrefix = "tenants/acme/"
+	h.DenyKeyPrefixes = []string{"hidden/"}
+
+	// A read under the denied prefix is rejected on the client key "hidden/x"
+	// — NOT the upstream-rewritten "tenants/acme/hidden/x" — and never reaches
+	// upstream.
+	req := httptest.NewRequest(http.MethodGet, "http://foobar.example.com/bucket/hidden/secret.txt", nil)
+	signRequest(req)
+	resp := httptest.NewRecorder()
+	upstreamPath = ""
+	h.ServeHTTP(resp, req)
+	assert.Equal(t, http.StatusForbidden, resp.Code, "denied read must be rejected")
+	assert.Empty(t, upstreamPath, "denied read must never reach upstream")
+
+	// A request outside the denied prefix is allowed AND arrives upstream with
+	// --key-prefix prepended.
+	req = httptest.NewRequest(http.MethodGet, "http://foobar.example.com/bucket/data/report.csv", nil)
+	signRequest(req)
+	resp = httptest.NewRecorder()
+	upstreamPath = ""
+	h.ServeHTTP(resp, req)
+	assert.NotEqual(t, http.StatusForbidden, resp.Code, "unprotected read must be allowed")
+	assert.Equal(t, "/bucket/tenants/acme/data/report.csv", upstreamPath,
+		"allowed read must reach upstream with the key prefix injected")
+
+	// Deny prefixes are written in CLIENT terms: a client key that already
+	// starts with the --key-prefix path does not match "hidden/", so it is
+	// NOT denied.
+	req = httptest.NewRequest(http.MethodGet, "http://foobar.example.com/bucket/tenants/acme/hidden/x.txt", nil)
+	signRequest(req)
+	resp = httptest.NewRecorder()
+	h.ServeHTTP(resp, req)
+	assert.NotEqual(t, http.StatusForbidden, resp.Code,
+		"denial is matched against the client-facing key, not the upstream path")
+}
+
 func TestHandlerValidSignatureS3cmd(t *testing.T) {
 	h := newTestProxy(t)
 

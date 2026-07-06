@@ -49,6 +49,17 @@ type Handler struct {
 	// (i.e. before any KeyPrefix is prepended). Empty disables the feature.
 	ReadOnlyKeyPrefixes []string
 
+	// Optional: a set of object-key prefixes that are fully denied. Unlike
+	// ReadOnlyKeyPrefixes (which only blocks mutations), ANY request — read
+	// or write — whose object key starts with one of these prefixes is
+	// rejected with 403 before the request is signed or forwarded (fail
+	// closed). In addition, keys under these prefixes are stripped from
+	// bucket-level LIST responses, so a client cannot even discover that they
+	// exist. Like ReadOnlyKeyPrefixes, the prefixes are matched against the
+	// client-facing object key (i.e. before any KeyPrefix is prepended).
+	// Empty disables the feature.
+	DenyKeyPrefixes []string
+
 	// http or https
 	UpstreamScheme string
 
@@ -269,7 +280,72 @@ func stripKeyPrefixFromListBody(body []byte, keyPrefix string) []byte {
 	})
 }
 
-// stripKeyPrefixFromResponse is wired into httputil.ReverseProxy's
+// Bucket-level LIST responses group each object under a <Contents> element
+// (with a <Key> child) and each rolled-up sub-directory under a
+// <CommonPrefixes> element (with a <Prefix> child). filterDeniedKeysFromListBody
+// removes whole such blocks when the key/prefix they carry falls under a denied
+// prefix, so denied keys never appear in a listing.
+//
+// The `[^<]*` value capture stays within a single element and the non-greedy
+// `[\s\S]*?` block body stops at the first closing tag, so a block is matched
+// as a unit and either kept verbatim or dropped in full.
+var listContentsBlockRegexp = regexp.MustCompile(`<Contents>[\s\S]*?</Contents>`)
+var listCommonPrefixesBlockRegexp = regexp.MustCompile(`<CommonPrefixes>[\s\S]*?</CommonPrefixes>`)
+var listKeyValueRegexp = regexp.MustCompile(`<Key>([^<]*)</Key>`)
+var listPrefixValueRegexp = regexp.MustCompile(`<Prefix>([^<]*)</Prefix>`)
+
+// keyValueUnderDenyPrefix reports whether a LIST element value (an object key
+// or common-prefix, in client-facing form) falls under any of the denied
+// prefixes. Both the literal form (`hidden/x`) and the URL-encoded form
+// (`hidden%2Fx`, which S3 returns when the request carries EncodingType=url)
+// are matched, mirroring stripPrefixFromValue.
+func keyValueUnderDenyPrefix(val []byte, denyPrefixes []string) bool {
+	for _, p := range denyPrefixes {
+		pb := []byte(p)
+		if bytes.HasPrefix(val, pb) {
+			return true
+		}
+		enc := urlEncodedPrefix(pb)
+		if !bytes.Equal(enc, pb) && bytes.HasPrefix(val, enc) {
+			return true
+		}
+	}
+	return false
+}
+
+// filterDeniedKeysFromListBody removes <Contents> and <CommonPrefixes> blocks
+// whose object key / common-prefix falls under a denied prefix, so a client
+// listing a bucket never sees keys it is not allowed to access. Values are
+// matched against the client-facing key, so this must run AFTER
+// stripKeyPrefixFromListBody has undone any KeyPrefix. A no-op when no denied
+// prefixes are configured.
+//
+// Only the enumerating LIST elements are touched; counts such as <KeyCount> are
+// left as-is (they may legitimately over-count once entries are hidden — the
+// same thing S3 itself does when a page is filtered by permissions). Pure
+// byte-level rewrite; unrelated elements and formatting are preserved.
+func filterDeniedKeysFromListBody(body []byte, denyPrefixes []string) []byte {
+	if len(denyPrefixes) == 0 {
+		return body
+	}
+	body = listContentsBlockRegexp.ReplaceAllFunc(body, func(block []byte) []byte {
+		m := listKeyValueRegexp.FindSubmatch(block)
+		if m != nil && keyValueUnderDenyPrefix(m[1], denyPrefixes) {
+			return nil
+		}
+		return block
+	})
+	body = listCommonPrefixesBlockRegexp.ReplaceAllFunc(body, func(block []byte) []byte {
+		m := listPrefixValueRegexp.FindSubmatch(block)
+		if m != nil && keyValueUnderDenyPrefix(m[1], denyPrefixes) {
+			return nil
+		}
+		return block
+	})
+	return body
+}
+
+// modifyResponse is wired into httputil.ReverseProxy's
 // ModifyResponse hook. It walks the upstream XML body and strips
 // h.KeyPrefix from elements that carry an object key path, so the
 // client sees a fully-transparent view of the proxy.
@@ -288,15 +364,24 @@ func stripKeyPrefixFromListBody(body []byte, keyPrefix string) []byte {
 // document that happens to be Content-Type: application/xml — we
 // only touch values that ALSO start with the configured KeyPrefix.
 //
+// It also drops <Contents>/<CommonPrefixes> blocks for keys under a
+// DenyKeyPrefixes prefix (see filterDeniedKeysFromListBody), so denied
+// keys never appear in a listing. The deny filter runs AFTER the strip so
+// it matches the client-facing key.
+//
 // Skipped when:
-//   - KeyPrefix is empty (proxy is fully transparent anyway)
+//   - KeyPrefix is empty AND no DenyKeyPrefixes are set (proxy is fully
+//     transparent anyway)
 //   - response is not XML (Content-Type check — opaque object
 //     payloads are never touched)
 //   - response is content-encoded (gzip etc.) — too risky to decode
 //     and re-encode here; upstream S3 doesn't compress these
 //     responses by default
-func (h *Handler) stripKeyPrefixFromResponse(resp *http.Response) error {
-	if h.KeyPrefix == "" || resp == nil {
+func (h *Handler) modifyResponse(resp *http.Response) error {
+	if resp == nil {
+		return nil
+	}
+	if h.KeyPrefix == "" && len(h.DenyKeyPrefixes) == 0 {
 		return nil
 	}
 	if resp.Header.Get("Content-Encoding") != "" {
@@ -315,6 +400,7 @@ func (h *Handler) stripKeyPrefixFromResponse(resp *http.Response) error {
 	}
 	resp.Body.Close()
 	rewritten := stripKeyPrefixFromListBody(body, h.KeyPrefix)
+	rewritten = filterDeniedKeysFromListBody(rewritten, h.DenyKeyPrefixes)
 	resp.Body = io.NopCloser(bytes.NewReader(rewritten))
 	resp.ContentLength = int64(len(rewritten))
 	resp.Header.Set("Content-Length", strconv.Itoa(len(rewritten)))
@@ -360,7 +446,42 @@ func (h *Handler) isProtectedKeyPath(p string) bool {
 	return false
 }
 
+// isDeniedKeyPath reports whether the object key in a path-style request path
+// falls under one of the configured DenyKeyPrefixes. Bucket-level paths (no
+// object key) are never denied — they carry no key to match, and their LIST
+// responses are filtered separately. Returns false when no prefixes are
+// configured.
+func (h *Handler) isDeniedKeyPath(p string) bool {
+	if len(h.DenyKeyPrefixes) == 0 {
+		return false
+	}
+	key, ok := objectKey(p)
+	if !ok {
+		return false
+	}
+	for _, prefix := range h.DenyKeyPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Deny enforcement, before anything else: any request — read or write —
+	// whose object key falls under a denied prefix is rejected up front and
+	// never signed or forwarded, regardless of the credentials it carries
+	// (fail closed). Denied keys are also hidden from listings by
+	// filterDeniedKeysFromListBody (via modifyResponse).
+	if h.isDeniedKeyPath(r.URL.Path) {
+		log.Warnf("deny key prefix: rejecting %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusForbidden)
+		if h.Debug {
+			w.Write([]byte("deny key prefix: access not allowed"))
+		}
+		return
+	}
+
 	// Read-only enforcement, before anything else: a mutating method is
 	// rejected up front and never signed or forwarded, regardless of the
 	// credentials it carries (fail closed).
@@ -402,9 +523,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	proxy := httputil.NewSingleHostReverseProxy(&url)
 	proxy.FlushInterval = 1
 	// Strip h.KeyPrefix from XML response bodies so the client view is
-	// fully transparent — see stripKeyPrefixFromResponse for the
-	// criteria.
-	proxy.ModifyResponse = h.stripKeyPrefixFromResponse
+	// fully transparent, and hide keys under any DenyKeyPrefixes from
+	// listings — see modifyResponse for the criteria.
+	proxy.ModifyResponse = h.modifyResponse
 	proxy.ServeHTTP(w, proxyReq)
 }
 

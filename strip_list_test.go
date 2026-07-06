@@ -272,14 +272,14 @@ func TestModifyListResponse_EndToEnd(t *testing.T) {
 
 	h := &Handler{KeyPrefix: "tenants/acme/"}
 
-	// Hit stripKeyPrefixFromResponse directly with a synthesised
+	// Hit modifyResponse directly with a synthesised
 	// *http.Response (the wiring inside ServeHTTP is the standard
 	// ReverseProxy pattern and is exercised by the existing
 	// handler_test.go suite).
 	upstreamResp, err := http.Get(upstream.URL + "/bucket/?list-type=2&prefix=uploads/")
 	require.NoError(t, err)
 
-	err = h.stripKeyPrefixFromResponse(upstreamResp)
+	err = h.modifyResponse(upstreamResp)
 	require.NoError(t, err)
 
 	body, err := io.ReadAll(upstreamResp.Body)
@@ -314,7 +314,7 @@ func TestStripKeyPrefixFromResponse_SkipsNonXmlObjectPayloads(t *testing.T) {
 		Body:    io.NopCloser(strings.NewReader("tenants/acme/uploads/x,1\n")),
 		Request: &http.Request{URL: &url.URL{Path: "/bucket/uploads/x.csv"}},
 	}
-	require.NoError(t, h.stripKeyPrefixFromResponse(resp))
+	require.NoError(t, h.modifyResponse(resp))
 	body, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, "tenants/acme/uploads/x,1\n", string(body))
 }
@@ -334,7 +334,7 @@ func TestStripKeyPrefixFromResponse_RunsOnObjectLevelXmlResponses(t *testing.T) 
 		Body:    io.NopCloser(strings.NewReader(body)),
 		Request: &http.Request{URL: &url.URL{Path: "/bucket/uploads/x.csv"}},
 	}
-	require.NoError(t, h.stripKeyPrefixFromResponse(resp))
+	require.NoError(t, h.modifyResponse(resp))
 	got, _ := io.ReadAll(resp.Body)
 	assert.Contains(t, string(got),
 		`<Location>https://bucket.s3.region.amazonaws.com/uploads/x.csv</Location>`)
@@ -356,7 +356,7 @@ func TestStripKeyPrefixFromResponse_RunsOnErrorResponses(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(body)),
 		Request:    &http.Request{URL: &url.URL{Path: "/bucket/uploads/missing.csv"}},
 	}
-	require.NoError(t, h.stripKeyPrefixFromResponse(resp))
+	require.NoError(t, h.modifyResponse(resp))
 	got, _ := io.ReadAll(resp.Body)
 	assert.Contains(t, string(got), `<Resource>/bucket/uploads/missing.csv</Resource>`)
 	assert.NotContains(t, string(got), "tenants/acme/")
@@ -370,7 +370,7 @@ func TestModifyListResponse_SkipsWhenKeyPrefixEmpty(t *testing.T) {
 		Body:    io.NopCloser(strings.NewReader(body)),
 		Request: &http.Request{URL: &url.URL{Path: "/bucket/"}},
 	}
-	require.NoError(t, h.stripKeyPrefixFromResponse(resp))
+	require.NoError(t, h.modifyResponse(resp))
 	got, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, body, string(got))
 }
@@ -389,7 +389,7 @@ func TestModifyListResponse_SkipsContentEncoded(t *testing.T) {
 		Body:    io.NopCloser(strings.NewReader(body)),
 		Request: &http.Request{URL: &url.URL{Path: "/bucket/"}},
 	}
-	require.NoError(t, h.stripKeyPrefixFromResponse(resp))
+	require.NoError(t, h.modifyResponse(resp))
 	got, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, body, string(got))
 }
