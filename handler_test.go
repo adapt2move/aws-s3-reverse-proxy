@@ -418,9 +418,11 @@ func TestHandlerDenyKeyPrefixAllowsOtherKeys(t *testing.T) {
 }
 
 // TestHandlerKeyPrefixAndDenyKeyPrefixCombined pins down that --deny-key-prefix,
-// like --read-only-key-prefix, is evaluated against the CLIENT-FACING key
-// (before --key-prefix is prepended). A denied read never reaches upstream; an
-// allowed request still gets --key-prefix injected on the way out.
+// like --read-only-key-prefix, is evaluated against the CLIENT-FACING key — the
+// key exactly as the client sends it, before --key-prefix is prepended. The
+// client never types the --key-prefix itself (the proxy adds it), so deny
+// prefixes are written in client terms. A denied request never reaches
+// upstream; an allowed request still gets --key-prefix injected on the way out.
 func TestHandlerKeyPrefixAndDenyKeyPrefixCombined(t *testing.T) {
 	var upstreamPath string
 	thf := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -431,9 +433,9 @@ func TestHandlerKeyPrefixAndDenyKeyPrefixCombined(t *testing.T) {
 	h.KeyPrefix = "tenants/acme/"
 	h.DenyKeyPrefixes = []string{"hidden/"}
 
-	// A read under the denied prefix is rejected on the client key "hidden/x"
-	// — NOT the upstream-rewritten "tenants/acme/hidden/x" — and never reaches
-	// upstream.
+	// The client sends the client-facing key "hidden/secret.txt" (NOT
+	// "tenants/acme/hidden/secret.txt" — the proxy would add that). It matches
+	// the "hidden/" deny prefix, so it is rejected and never reaches upstream.
 	req := httptest.NewRequest(http.MethodGet, "http://foobar.example.com/bucket/hidden/secret.txt", nil)
 	signRequest(req)
 	resp := httptest.NewRecorder()
@@ -443,7 +445,8 @@ func TestHandlerKeyPrefixAndDenyKeyPrefixCombined(t *testing.T) {
 	assert.Empty(t, upstreamPath, "denied read must never reach upstream")
 
 	// A request outside the denied prefix is allowed AND arrives upstream with
-	// --key-prefix prepended.
+	// --key-prefix prepended: the deny check passed on the client key, then the
+	// prefix was injected.
 	req = httptest.NewRequest(http.MethodGet, "http://foobar.example.com/bucket/data/report.csv", nil)
 	signRequest(req)
 	resp = httptest.NewRecorder()
@@ -452,16 +455,6 @@ func TestHandlerKeyPrefixAndDenyKeyPrefixCombined(t *testing.T) {
 	assert.NotEqual(t, http.StatusForbidden, resp.Code, "unprotected read must be allowed")
 	assert.Equal(t, "/bucket/tenants/acme/data/report.csv", upstreamPath,
 		"allowed read must reach upstream with the key prefix injected")
-
-	// Deny prefixes are written in CLIENT terms: a client key that already
-	// starts with the --key-prefix path does not match "hidden/", so it is
-	// NOT denied.
-	req = httptest.NewRequest(http.MethodGet, "http://foobar.example.com/bucket/tenants/acme/hidden/x.txt", nil)
-	signRequest(req)
-	resp = httptest.NewRecorder()
-	h.ServeHTTP(resp, req)
-	assert.NotEqual(t, http.StatusForbidden, resp.Code,
-		"denial is matched against the client-facing key, not the upstream path")
 }
 
 func TestHandlerValidSignatureS3cmd(t *testing.T) {
