@@ -28,6 +28,19 @@ func TestParseOptions(t *testing.T) {
 	assert.Contains(t, h.Signers, "baaaaaaaaaaaaaar")
 }
 
+func TestParseOptionsDenyKeyPrefixes(t *testing.T) {
+	h, err := NewAwsS3ReverseProxy(Options{
+		AllowedSourceEndpoint: "foobar.endpoint.example.com",
+		AwsCredentials:        []string{"fooooooooooooooo,bar"},
+		Region:                "eu-test-1",
+		// Empty entries must be dropped: an empty prefix matches every key
+		// and would silently deny the whole bucket.
+		DenyKeyPrefixes: []string{"hidden/", "", "internal/"},
+	})
+	assert.Nil(t, err)
+	assert.Equal(t, []string{"hidden/", "internal/"}, h.DenyKeyPrefixes)
+}
+
 func TestParseOptionsBrokenSubnets(t *testing.T) {
 	_, err := NewAwsS3ReverseProxy(Options{
 		AllowedSourceSubnet: []string{"foobar"},
