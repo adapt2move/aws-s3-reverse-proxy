@@ -153,10 +153,8 @@ func signedDeleteRequest(body string) *http.Request {
 	return req
 }
 
-// The regression this whole feature is about: with --key-prefix set, a batch
-// delete used to travel upstream with the raw client keys. S3 answers a delete
-// of a non-existent key with success, so the client saw every key "deleted"
-// while the prefixed objects were still there.
+// The regression: with --key-prefix set, a batch delete used to travel upstream
+// with raw client keys, so it reported success while nothing was deleted.
 func TestHandlerBatchDeleteInjectsKeyPrefixIntoBody(t *testing.T) {
 	h, upstream, upstreamBody := captureUpstream(t)
 	h.KeyPrefix = "tenants/acme/"

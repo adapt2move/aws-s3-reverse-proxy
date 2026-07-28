@@ -38,9 +38,9 @@ Six optional flags extend the basic re-signing behaviour:
     key sent upstream. `GET /bucket/key` becomes `GET /bucket/<prefix>key`.
     For bucket-level listings the prefix is prepended to the request's
     `prefix` query parameter instead, so a client cannot enumerate keys
-    outside the configured prefix. Batch deletes carry their keys in the
-    request body and are rewritten there — see [Batch deletes
-    (`DeleteObjects`)](#batch-deletes-deleteobjects).
+    outside the configured prefix. See [Batch deletes
+    (`DeleteObjects`)](#batch-deletes-deleteobjects) for keys sent in a
+    request body.
   * `--upstream-credentials` (env `UPSTREAM_CREDENTIALS`): an
     `"AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY"` pair used to re-sign
     upstream requests instead of the client's credentials. When set, the
@@ -158,37 +158,13 @@ prepended. The same instance-scoped caveat applies — it is not a bucket policy
 
 ### Batch deletes (`DeleteObjects`)
 
-A batch delete is the one S3 operation that addresses object keys in the
-request **body** instead of the URL path:
-
-```http
-POST /my-bucket?delete
-<Delete><Object><Key>a.csv</Key></Object><Object><Key>b.csv</Key></Object></Delete>
-```
-
-The three key-scoped flags apply to those keys exactly as they do to a
-single-object path — the proxy parses the body, checks every key, and prepends
-`--key-prefix` to each one before signing and forwarding:
-
-| Configuration | Client sends | Proxy does |
-| --- | --- | --- |
-| `--key-prefix tenants/acme/` | `<Key>a.csv</Key>` | forwards `<Key>tenants/acme/a.csv</Key>` |
-| `--deny-key-prefix hidden/` | `<Key>public/a.csv</Key>`, `<Key>hidden/x</Key>` | **403**, nothing forwarded |
-| `--read-only-key-prefix protected/` | `<Key>protected/x</Key>` | **403**, nothing forwarded |
-
-Notes:
-
-  * A single denied or protected key rejects the **whole** batch, rather than
-    dropping that one entry: a partial delete would report success for keys the
-    proxy never forwarded.
-  * The proxy recomputes the request's `Content-MD5` after rewriting the body and
-    drops the client's now-stale flexible checksums (`x-amz-checksum-*`).
-  * A `DeleteObjects` body that cannot be parsed is rejected with HTTP 400 while
-    any of the three flags is set — forwarding it would bypass both the prefix
-    injection and the checks. Without those flags the body is forwarded
-    untouched, as before.
-  * The `DeleteResult` response is rewritten back into client terms, so the keys
-    the client gets back are the keys it sent.
+A batch delete (`POST /my-bucket?delete`, e.g. `aws s3 rm --recursive`) sends
+its object keys in the request body instead of the URL path. All three
+key-scoped flags apply to those keys just as they do to a single-object
+request: `--key-prefix` is prepended to every key, and a batch containing a
+denied or read-only key is rejected with HTTP 403 as a whole — no partial
+delete. A batch delete the proxy cannot read is rejected with HTTP 400 while
+any of the three flags is set.
 
 ## Releases
 
@@ -210,7 +186,7 @@ GitHub](https://github.com/Kriechi/aws-s3-reverse-proxy/releases).
   * read-only mode to block all mutating requests before they reach S3
   * per-prefix read-only mode to protect selected object-key prefixes from writes
   * per-prefix deny mode to block all access to selected object-key prefixes and hide them from listings
-  * key prefixing and per-prefix rules also cover batch deletes, whose keys live in the request body
+  * key prefixing and per-prefix rules also cover batch deletes
 
 ## Getting Started
 
