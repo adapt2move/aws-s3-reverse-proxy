@@ -3,7 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/md5"
 	"crypto/subtle"
+	"encoding/base64"
+	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -426,6 +430,17 @@ func objectKey(p string) (string, bool) {
 	return trimmed[idx+1:], true
 }
 
+// hasAnyPrefix reports whether an object key starts with any of the given
+// prefixes. Always false for an empty prefix list.
+func hasAnyPrefix(key string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // isProtectedKeyPath reports whether the object key in a path-style request
 // path falls under one of the configured ReadOnlyKeyPrefixes. Bucket-level
 // paths (no object key) are never protected. Returns false when no prefixes
@@ -438,12 +453,7 @@ func (h *Handler) isProtectedKeyPath(p string) bool {
 	if !ok {
 		return false
 	}
-	for _, prefix := range h.ReadOnlyKeyPrefixes {
-		if strings.HasPrefix(key, prefix) {
-			return true
-		}
-	}
-	return false
+	return hasAnyPrefix(key, h.ReadOnlyKeyPrefixes)
 }
 
 // isDeniedKeyPath reports whether the object key in a path-style request path
@@ -459,12 +469,166 @@ func (h *Handler) isDeniedKeyPath(p string) bool {
 	if !ok {
 		return false
 	}
-	for _, prefix := range h.DenyKeyPrefixes {
-		if strings.HasPrefix(key, prefix) {
-			return true
+	return hasAnyPrefix(key, h.DenyKeyPrefixes)
+}
+
+// A batch delete (DeleteObjects) is the one S3 operation that addresses object
+// keys in the request BODY instead of the URL path:
+//
+//	POST /<bucket>?delete
+//	<Delete><Object><Key>a.csv</Key></Object><Object><Key>b.csv</Key></Object></Delete>
+//
+// The path carries no key at all, so every key-based rule in this proxy —
+// injectKeyPrefix, isDeniedKeyPath, isProtectedKeyPath — sees nothing to act
+// on. Left alone, such a request travels upstream with raw client keys:
+//
+//   - with --key-prefix the delete misses the prefixed objects entirely, and
+//     because S3 reports a delete of a non-existent key as successful, the
+//     client gets `<Deleted><Key>a.csv</Key></Deleted>` for every key while
+//     nothing under the prefix was touched — the deletes are silently dropped;
+//   - with --deny-key-prefix / --read-only-key-prefix it is worse than a
+//     no-op: a batch delete would reach keys that the same client cannot
+//     touch one-by-one, and (with --key-prefix) even keys outside the
+//     prefix the proxy is supposed to confine it to.
+//
+// The rewrite below closes that gap: the keys are parsed out of the body,
+// checked against the deny / read-only prefixes, and prepended with KeyPrefix
+// before the request is signed and forwarded.
+
+// errDeniedKeyPrefix and errReadOnlyKeyPrefix mark a violation found in a
+// request body rather than in the request path. They travel up through
+// buildUpstreamRequest, where ServeHTTP turns them into the same fail-closed
+// 403 the path-based checks return — the request is never forwarded.
+var (
+	errDeniedKeyPrefix   = errors.New("deny key prefix: access not allowed")
+	errReadOnlyKeyPrefix = errors.New("read-only key prefix: write not allowed")
+)
+
+// deleteObjectsRequestBody is the subset of a DeleteObjects request body we
+// need: the object keys. Unmarshalling gives us the true, XML-unescaped keys to
+// match the configured prefixes against.
+type deleteObjectsRequestBody struct {
+	XMLName xml.Name `xml:"Delete"`
+	Objects []struct {
+		Key string `xml:"Key"`
+	} `xml:"Object"`
+}
+
+// deleteObjectsKeyRegexp matches the <Key> elements of a DeleteObjects request
+// body. Same shape as listKeyValueRegexp, but used on the request side: it
+// drives the byte-level prefix injection so the rest of the body (<VersionId>,
+// <Quiet>, namespaces, formatting) is forwarded verbatim.
+var deleteObjectsKeyRegexp = regexp.MustCompile(`<Key>([^<]*)</Key>`)
+
+// isDeleteObjectsRequest reports whether req is an S3 batch delete:
+// `POST /<bucket>?delete`, with the object keys in the XML request body.
+func isDeleteObjectsRequest(req *http.Request) bool {
+	if req.Method != http.MethodPost || !isBucketLevelPath(req.URL.Path) {
+		return false
+	}
+	_, ok := req.URL.Query()["delete"]
+	return ok
+}
+
+// deleteObjectsKeys extracts the object keys from a DeleteObjects request body.
+//
+// The keys come from the XML parser (so they are properly unescaped and
+// namespace-agnostic), but the number of parsed keys must agree with the number
+// of <Key> elements the regexp sees, because that regexp is what performs the
+// prefix injection. A disagreement means the two views of the body differ, and
+// we refuse the request instead of forwarding a body we did not fully
+// understand — a key the regexp misses would otherwise travel upstream
+// unprefixed (and unchecked).
+func deleteObjectsKeys(body []byte) ([]string, error) {
+	var parsed deleteObjectsRequestBody
+	if err := xml.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("batch delete: cannot parse request body: %v", err)
+	}
+	matches := deleteObjectsKeyRegexp.FindAllIndex(body, -1)
+	if len(matches) != len(parsed.Objects) {
+		return nil, fmt.Errorf("batch delete: request body has %d <Object> entries but %d <Key> elements", len(parsed.Objects), len(matches))
+	}
+	keys := make([]string, 0, len(parsed.Objects))
+	for _, obj := range parsed.Objects {
+		keys = append(keys, obj.Key)
+	}
+	return keys, nil
+}
+
+// prefixDeleteObjectsKeys prepends keyPrefix to every <Key> in a DeleteObjects
+// request body, the body-level counterpart of injectKeyPrefix. The prefix is
+// XML-escaped so a prefix containing `&` or `<` cannot corrupt the document.
+func prefixDeleteObjectsKeys(body []byte, keyPrefix string) []byte {
+	var escaped bytes.Buffer
+	xml.EscapeText(&escaped, []byte(keyPrefix))
+	prefix := escaped.Bytes()
+	return deleteObjectsKeyRegexp.ReplaceAllFunc(body, func(match []byte) []byte {
+		sm := deleteObjectsKeyRegexp.FindSubmatch(match)
+		out := make([]byte, 0, len(match)+len(prefix))
+		out = append(out, "<Key>"...)
+		out = append(out, prefix...)
+		out = append(out, sm[1]...)
+		out = append(out, "</Key>"...)
+		return out
+	})
+}
+
+// rewritesDeleteObjects reports whether any key-scoped feature is configured,
+// i.e. whether a batch delete body needs to be inspected at all. Without one the
+// proxy only re-signs, and the body is forwarded untouched.
+func (h *Handler) rewritesDeleteObjects() bool {
+	return h.KeyPrefix != "" || len(h.DenyKeyPrefixes) > 0 || len(h.ReadOnlyKeyPrefixes) > 0
+}
+
+// rewriteDeleteObjectsBody enforces the deny and read-only prefixes against
+// every key in a DeleteObjects request body and returns the body with KeyPrefix
+// prepended to each key.
+//
+// A single denied / protected key rejects the WHOLE batch (fail closed) rather
+// than dropping that entry: a partial delete would report success for keys the
+// proxy never forwarded, which is exactly the kind of silent mismatch this
+// rewrite exists to prevent.
+//
+// Returns the body unchanged when no key-scoped feature is configured, so a
+// plain re-signing proxy stays byte-for-byte transparent.
+func (h *Handler) rewriteDeleteObjectsBody(body []byte) ([]byte, error) {
+	if !h.rewritesDeleteObjects() {
+		return body, nil
+	}
+	keys, err := deleteObjectsKeys(body)
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range keys {
+		if hasAnyPrefix(key, h.DenyKeyPrefixes) {
+			return nil, fmt.Errorf("%w: batch delete of key %q", errDeniedKeyPrefix, key)
+		}
+		if hasAnyPrefix(key, h.ReadOnlyKeyPrefixes) {
+			return nil, fmt.Errorf("%w: batch delete of key %q", errReadOnlyKeyPrefix, key)
 		}
 	}
-	return false
+	if h.KeyPrefix == "" {
+		return body, nil
+	}
+	return prefixDeleteObjectsKeys(body, h.KeyPrefix), nil
+}
+
+// dropStaleBodyDigestHeaders removes the digest headers a client computed over
+// the body we are about to replace: the SigV4 payload hash and the flexible
+// checksums (x-amz-checksum-*, and the trailer/algorithm headers announcing
+// them). Without this they would be copied onto the upstream request by
+// copyHeaderWithoutOverwrite — after signing — and the upstream would reject
+// the request with 400 BadDigest / XAmzContentSHA256Mismatch. Content-Md5 is
+// left to the caller, which recomputes it (S3 requires one on a batch delete).
+func dropStaleBodyDigestHeaders(header http.Header) {
+	for name := range header {
+		if strings.HasPrefix(http.CanonicalHeaderKey(name), "X-Amz-Checksum-") {
+			header.Del(name)
+		}
+	}
+	header.Del("X-Amz-Sdk-Checksum-Algorithm")
+	header.Del("X-Amz-Trailer")
+	header.Del("X-Amz-Content-Sha256")
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -509,6 +673,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	proxyReq, err := h.buildUpstreamRequest(r)
 	if err != nil {
+		// A deny / read-only violation found in the request BODY (batch delete,
+		// whose keys are not in the path) is the same fail-closed rejection as
+		// the path-based checks above: 403, and nothing was forwarded.
+		if errors.Is(err, errDeniedKeyPrefix) || errors.Is(err, errReadOnlyKeyPrefix) {
+			log.Warnf("%v: rejecting %s %s", err, r.Method, r.URL.RequestURI())
+			w.WriteHeader(http.StatusForbidden)
+			if h.Debug {
+				w.Write([]byte(err.Error()))
+			}
+			return
+		}
 		log.WithError(err).Error("unable to proxy request")
 		w.WriteHeader(http.StatusBadRequest)
 
@@ -692,7 +867,10 @@ func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, regi
 	prefixedPath := h.injectKeyPrefix(req.URL.Path)
 	proxyURL.Path = prefixedPath
 	proxyURL.RawPath = prefixedPath
-	if isBucketLevelPath(req.URL.Path) {
+	// A batch delete is bucket-level too, but its keys live in the body — a
+	// `prefix=` query parameter is meaningless there and only the body rewrite
+	// below confines it.
+	if isBucketLevelPath(req.URL.Path) && !isDeleteObjectsRequest(req) {
 		h.scopeListPrefix(&proxyURL)
 	}
 	// A client streaming an upload (e.g. DuckDB httpfs, the AWS SDKs) sends the
@@ -718,6 +896,34 @@ func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, regi
 		req.Header.Del("Content-Encoding")
 		req.Header.Del("X-Amz-Decoded-Content-Length")
 		req.Header.Del("X-Amz-Content-Sha256")
+	}
+
+	// A batch delete carries its object keys in the body, where injectKeyPrefix
+	// above cannot reach them: enforce the deny / read-only prefixes on those
+	// keys and prepend KeyPrefix to each of them (see rewriteDeleteObjectsBody).
+	// Runs after the aws-chunked decode so it operates on real XML.
+	if isDeleteObjectsRequest(req) && h.rewritesDeleteObjects() {
+		if body == nil {
+			body = http.NoBody
+		}
+		raw, err := io.ReadAll(body)
+		if err != nil {
+			return nil, fmt.Errorf("batch delete: reading request body: %w", err)
+		}
+		rewritten, err := h.rewriteDeleteObjectsBody(raw)
+		if err != nil {
+			return nil, err
+		}
+		body = io.NopCloser(bytes.NewReader(rewritten))
+		if !bytes.Equal(rewritten, raw) {
+			// The body changed, so every digest the client computed over the
+			// old bytes is stale. S3 requires a Content-MD5 (or a checksum) on
+			// a batch delete, so recompute that one and drop the rest.
+			req.ContentLength = int64(len(rewritten))
+			dropStaleBodyDigestHeaders(req.Header)
+			sum := md5.Sum(rewritten)
+			req.Header.Set("Content-Md5", base64.StdEncoding.EncodeToString(sum[:]))
+		}
 	}
 
 	proxyReq, err := http.NewRequest(req.Method, proxyURL.String(), body)
