@@ -68,6 +68,13 @@ func TestDeleteObjectsKeysRejectsBodyWeCannotFullyRewrite(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestCountDeleteObjectsKeys(t *testing.T) {
+	assert.Equal(t, 0, countDeleteObjectsKeys([]byte(`<Delete></Delete>`)))
+	assert.Equal(t, 2, countDeleteObjectsKeys([]byte(deleteBody("a.csv", "b.csv"))))
+	// Same count the rewrite acts on: an unterminated element is not a match.
+	assert.Equal(t, 1, countDeleteObjectsKeys([]byte(`<Key>a</Key><Key>b`)))
+}
+
 func TestPrefixDeleteObjectsKeys(t *testing.T) {
 	got := string(prefixDeleteObjectsKeys([]byte(deleteBody("a.csv", "nested/b.parquet")), "tenants/acme/"))
 	assert.Contains(t, got, `<Key>tenants/acme/a.csv</Key>`)
@@ -217,6 +224,21 @@ func TestHandlerBatchDeleteIsTransparentWithoutKeyPrefix(t *testing.T) {
 	// Nothing was rewritten, so the client's own digests still describe the
 	// body and are forwarded as they always were.
 	assert.Equal(t, "AAAAAA==", upstream.Header.Get("X-Amz-Checksum-Crc32"))
+}
+
+// The keys in a batch delete body are attacker-controlled and we have to hold
+// the whole body in memory to check it — so an oversized one is refused instead
+// of buffered. (A legitimate DeleteObjects body stays around 1 MB: S3 allows
+// 1000 keys of at most 1024 bytes.)
+func TestHandlerBatchDeleteRefusesOversizedBody(t *testing.T) {
+	h, _, upstreamBody := captureUpstream(t)
+	h.KeyPrefix = "tenants/acme/"
+
+	resp := httptest.NewRecorder()
+	h.ServeHTTP(resp, signedDeleteRequest(deleteBody(strings.Repeat("a", maxDeleteObjectsBodySize))))
+	assert.Equal(t, http.StatusBadRequest, resp.Code)
+	assert.Contains(t, resp.Body.String(), "exceeds")
+	assert.Nil(t, *upstreamBody, "an oversized batch delete must never reach upstream")
 }
 
 func TestHandlerBatchDeleteRejectedInReadOnlyMode(t *testing.T) {

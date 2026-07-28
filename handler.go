@@ -507,6 +507,13 @@ type deleteObjectsRequestBody struct {
 // body (<VersionId>, <Quiet>, namespaces, formatting) is forwarded verbatim.
 var deleteObjectsKeyRegexp = regexp.MustCompile(`<Key>([^<]*)</Key>`)
 
+// maxDeleteObjectsBodySize bounds the batch delete body we buffer, parse and
+// rewrite — the work is proportional to the number of keys in it. S3 caps a
+// DeleteObjects request at 1000 keys of at most 1024 bytes, so a legitimate
+// body stays near 1 MB; twice that leaves room to spare while keeping the
+// memory a single request can ask for bounded.
+const maxDeleteObjectsBodySize = 2 << 20 // 2 MiB
+
 // isDeleteObjectsRequest reports whether req is an S3 batch delete:
 // `POST /<bucket>?delete`, with the object keys in the XML request body.
 func isDeleteObjectsRequest(req *http.Request) bool {
@@ -515,6 +522,21 @@ func isDeleteObjectsRequest(req *http.Request) bool {
 	}
 	_, ok := req.URL.Query()["delete"]
 	return ok
+}
+
+// countDeleteObjectsKeys counts the <Key> elements the rewrite will touch. It
+// walks the body instead of using FindAll…, which would hold a match list for
+// every key of a batch at once.
+func countDeleteObjectsKeys(body []byte) int {
+	count := 0
+	for {
+		loc := deleteObjectsKeyRegexp.FindIndex(body)
+		if loc == nil {
+			return count
+		}
+		count++
+		body = body[loc[1]:]
+	}
 }
 
 // deleteObjectsKeys extracts the object keys from a DeleteObjects request body.
@@ -526,9 +548,8 @@ func deleteObjectsKeys(body []byte) ([]string, error) {
 	if err := xml.Unmarshal(body, &parsed); err != nil {
 		return nil, fmt.Errorf("batch delete: cannot parse request body: %v", err)
 	}
-	matches := deleteObjectsKeyRegexp.FindAllIndex(body, -1)
-	if len(matches) != len(parsed.Objects) {
-		return nil, fmt.Errorf("batch delete: request body has %d <Object> entries but %d <Key> elements", len(parsed.Objects), len(matches))
+	if n := countDeleteObjectsKeys(body); n != len(parsed.Objects) {
+		return nil, fmt.Errorf("batch delete: request body has %d <Object> entries but %d <Key> elements", len(parsed.Objects), n)
 	}
 	keys := make([]string, 0, len(parsed.Objects))
 	for _, obj := range parsed.Objects {
@@ -545,11 +566,13 @@ func prefixDeleteObjectsKeys(body []byte, keyPrefix string) []byte {
 	xml.EscapeText(&escaped, []byte(keyPrefix))
 	prefix := escaped.Bytes()
 	return deleteObjectsKeyRegexp.ReplaceAllFunc(body, func(match []byte) []byte {
-		sm := deleteObjectsKeyRegexp.FindSubmatch(match)
+		// Every match is exactly `<Key>value</Key>`, so the value can be sliced
+		// out instead of running a second, allocating submatch pass over it.
+		value := match[len("<Key>") : len(match)-len("</Key>")]
 		out := make([]byte, 0, len(match)+len(prefix))
 		out = append(out, "<Key>"...)
 		out = append(out, prefix...)
-		out = append(out, sm[1]...)
+		out = append(out, value...)
 		out = append(out, "</Key>"...)
 		return out
 	})
@@ -876,9 +899,17 @@ func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, regi
 		if body == nil {
 			body = http.NoBody
 		}
-		raw, err := io.ReadAll(body)
+		if req.ContentLength > maxDeleteObjectsBodySize {
+			return nil, fmt.Errorf("batch delete: request body exceeds %d bytes", maxDeleteObjectsBodySize)
+		}
+		// ContentLength is -1 when the client does not declare one, so the read
+		// itself is bounded too.
+		raw, err := io.ReadAll(io.LimitReader(body, maxDeleteObjectsBodySize+1))
 		if err != nil {
 			return nil, fmt.Errorf("batch delete: reading request body: %w", err)
+		}
+		if len(raw) > maxDeleteObjectsBodySize {
+			return nil, fmt.Errorf("batch delete: request body exceeds %d bytes", maxDeleteObjectsBodySize)
 		}
 		rewritten, err := h.rewriteDeleteObjectsBody(raw)
 		if err != nil {
