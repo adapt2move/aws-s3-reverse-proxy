@@ -38,7 +38,9 @@ Six optional flags extend the basic re-signing behaviour:
     key sent upstream. `GET /bucket/key` becomes `GET /bucket/<prefix>key`.
     For bucket-level listings the prefix is prepended to the request's
     `prefix` query parameter instead, so a client cannot enumerate keys
-    outside the configured prefix.
+    outside the configured prefix. See [Batch deletes
+    (`DeleteObjects`)](#batch-deletes-deleteobjects) for keys sent in a
+    request body.
   * `--upstream-credentials` (env `UPSTREAM_CREDENTIALS`): an
     `"AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY"` pair used to re-sign
     upstream requests instead of the client's credentials. When set, the
@@ -154,6 +156,16 @@ client-facing key first (rejecting reads and writes alike, and hiding matching
 keys from listings), and only allowed requests then have `--key-prefix`
 prepended. The same instance-scoped caveat applies — it is not a bucket policy.
 
+### Batch deletes (`DeleteObjects`)
+
+A batch delete (`POST /my-bucket?delete`, e.g. `aws s3 rm --recursive`) sends
+its object keys in the request body instead of the URL path. All three
+key-scoped flags apply to those keys just as they do to a single-object
+request: `--key-prefix` is prepended to every key, and a batch containing a
+denied or read-only key is rejected with HTTP 403 as a whole — no partial
+delete. A batch delete the proxy cannot read is rejected with HTTP 400 while
+any of the three flags is set.
+
 ## Releases
 
 Get the latest Docker image from [from
@@ -174,6 +186,7 @@ GitHub](https://github.com/Kriechi/aws-s3-reverse-proxy/releases).
   * read-only mode to block all mutating requests before they reach S3
   * per-prefix read-only mode to protect selected object-key prefixes from writes
   * per-prefix deny mode to block all access to selected object-key prefixes and hide them from listings
+  * key prefixing and per-prefix rules also cover batch deletes
 
 ## Getting Started
 
