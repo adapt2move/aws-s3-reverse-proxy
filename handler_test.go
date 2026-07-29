@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -161,9 +164,10 @@ func TestDecodeAwsChunkedUnsigned(t *testing.T) {
 	body.Write(payload)
 	body.WriteString("\r\n0\r\n\r\n")
 
-	got, err := decodeAwsChunked(bytes.NewReader(body.Bytes()))
+	got, trailers, err := decodeAwsChunked(bytes.NewReader(body.Bytes()))
 	require.NoError(t, err)
 	require.Equal(t, payload, got)
+	require.Empty(t, trailers)
 }
 
 func TestDecodeAwsChunkedSignedMultiChunk(t *testing.T) {
@@ -180,9 +184,59 @@ func TestDecodeAwsChunkedSignedMultiChunk(t *testing.T) {
 	body.WriteString("\r\n")
 	body.WriteString("0;chunk-signature=" + strings.Repeat("0", 64) + "\r\n\r\n")
 
-	got, err := decodeAwsChunked(bytes.NewReader(body.Bytes()))
+	got, _, err := decodeAwsChunked(bytes.NewReader(body.Bytes()))
 	require.NoError(t, err)
 	require.Equal(t, append(append([]byte{}, c1...), c2...), got)
+}
+
+// STREAMING-UNSIGNED-PAYLOAD-TRAILER, the @aws-sdk/client-s3 default for a
+// stream body: the flexible checksum is a TRAILER after the final chunk, not a
+// header. It has to survive the decode or the integrity check is lost.
+func TestDecodeAwsChunkedReadsChecksumTrailer(t *testing.T) {
+	payload := []byte("PAR1-payload")
+	var body bytes.Buffer
+	fmt.Fprintf(&body, "%x\r\n", len(payload))
+	body.Write(payload)
+	body.WriteString("\r\n0\r\n")
+	body.WriteString("x-amz-checksum-crc32:sOO8/Q==\r\n\r\n")
+
+	got, trailers, err := decodeAwsChunked(bytes.NewReader(body.Bytes()))
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+	require.Equal(t, "sOO8/Q==", trailers.Get("x-amz-checksum-crc32"))
+}
+
+// A trailer signature (STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER) is parsed
+// like any other trailer but must never be promoted to an upstream header — it
+// signs framing bytes the upstream never sees, with a key it does not hold.
+func TestChecksumTrailersKeepsOnlyChecksums(t *testing.T) {
+	trailers := http.Header{}
+	trailers.Set("x-amz-checksum-crc32", "sOO8/Q==")
+	trailers.Set("x-amz-trailer-signature", strings.Repeat("a", 64))
+
+	got := checksumTrailers(trailers)
+	require.Equal(t, "sOO8/Q==", got.Get("X-Amz-Checksum-Crc32"))
+	require.Empty(t, got.Get("X-Amz-Trailer-Signature"))
+	require.Len(t, got, 1)
+
+	require.Nil(t, checksumTrailers(http.Header{}), "nothing to promote -> nil")
+}
+
+func TestStripAwsChunkedEncoding(t *testing.T) {
+	for _, tc := range []struct {
+		in, want string
+	}{
+		{"aws-chunked", ""},
+		{"AWS-CHUNKED", ""},
+		{"aws-chunked,gzip", "gzip"},
+		{"gzip, aws-chunked", "gzip"},
+		{"gzip", "gzip"},
+	} {
+		h := http.Header{}
+		h.Set("Content-Encoding", tc.in)
+		stripAwsChunkedEncoding(h)
+		require.Equal(t, tc.want, h.Get("Content-Encoding"), "input %q", tc.in)
+	}
 }
 
 // The wiring: assembleUpstreamReq must hand the UPSTREAM request a DECODED body
@@ -213,6 +267,47 @@ func TestAssembleUpstreamReqDecodesChunkedBody(t *testing.T) {
 	require.Equal(t, int64(len(payload)), up.ContentLength)
 	require.Empty(t, up.Header.Get("Content-Encoding"), "aws-chunked marker must not be forwarded")
 	require.Empty(t, up.Header.Get("X-Amz-Decoded-Content-Length"))
+}
+
+// The regression: an @aws-sdk/client-s3 PutObject with a stream body sends the
+// checksum in a trailer and announces it with x-amz-trailer. Once the proxy
+// de-chunks the body those trailer bytes are gone, so forwarding x-amz-trailer
+// promises the upstream a checksum it will never receive — MinIO answers "The
+// provided 'x-amz-checksum' header does not match what was computed". The
+// announcement must be dropped and the digest re-attached as a plain header.
+func TestAssembleUpstreamReqPromotesChecksumTrailer(t *testing.T) {
+	h := newTestProxy(t)
+	payload := []byte("PAR1-the-real-object-content-PAR1")
+	var framed bytes.Buffer
+	fmt.Fprintf(&framed, "%x\r\n", len(payload))
+	framed.Write(payload)
+	framed.WriteString("\r\n0\r\n")
+	framed.WriteString("x-amz-checksum-crc32:sOO8/Q==\r\n\r\n")
+
+	req := httptest.NewRequest(http.MethodPut, "http://foobar.example.com/bucket/key", bytes.NewReader(framed.Bytes()))
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(payload)))
+	req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32")
+	req.Header.Set("X-Amz-Sdk-Checksum-Algorithm", "CRC32")
+
+	var signer *v4.Signer
+	for _, s := range h.Signers {
+		signer = s
+	}
+	up, err := h.assembleUpstreamReq(signer, req, "eu-test-1")
+	require.NoError(t, err)
+
+	gotBody, _ := io.ReadAll(up.Body)
+	require.Equal(t, payload, gotBody)
+	require.Empty(t, up.Header.Get("X-Amz-Trailer"), "a trailer that no longer exists must not be announced upstream")
+	require.Equal(t, "sOO8/Q==", up.Header.Get("X-Amz-Checksum-Crc32"), "the client's digest must travel upstream as a header")
+	// Promoted before signing, so the upstream signature covers it.
+	require.Contains(t, up.Header.Get("Authorization"), "x-amz-checksum-crc32")
+	// The payload hash is a real digest of the decoded body now, not a marker.
+	require.NotContains(t, up.Header.Get("X-Amz-Content-Sha256"), "STREAMING-")
+	sum := sha256.Sum256(payload)
+	require.Equal(t, hex.EncodeToString(sum[:]), up.Header.Get("X-Amz-Content-Sha256"))
 }
 
 func TestIsAwsChunkedUpload(t *testing.T) {
