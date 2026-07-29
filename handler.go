@@ -813,18 +813,32 @@ func isAwsChunkedUpload(req *http.Request) bool {
 	return strings.Contains(strings.ToLower(req.Header.Get("Content-Encoding")), "aws-chunked")
 }
 
-// decodeAwsChunked decodes an aws-chunked body into the raw object content. Each
-// chunk is `<hex-size>[;chunk-signature=…]\r\n<size bytes>\r\n`; a zero-size
-// chunk ends the stream (any trailer that follows is ignored). Per-chunk
-// signatures (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) are accepted and ignored — we
-// only need the payload bytes.
-func decodeAwsChunked(r io.Reader) ([]byte, error) {
+// maxAwsChunkedTrailers bounds the trailing header lines we accept after the
+// final chunk. A real client sends one (the flexible checksum), two with a
+// trailer signature; the cap keeps a malformed or hostile stream from growing
+// the map without end.
+const maxAwsChunkedTrailers = 16
+
+// decodeAwsChunked decodes an aws-chunked body into the raw object content and
+// the trailing headers that follow it. Each chunk is
+// `<hex-size>[;chunk-signature=…]\r\n<size bytes>\r\n`; a zero-size chunk ends
+// the payload, after which `name:value` trailer lines run until an empty line
+// or the end of the stream. Per-chunk signatures
+// (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) are accepted and ignored — we only need
+// the payload bytes.
+//
+// The trailers matter: with STREAMING-UNSIGNED-PAYLOAD-TRAILER the client's
+// flexible checksum (x-amz-checksum-crc32 & co.) lives there and nowhere else,
+// so dropping it would either lose the integrity check or — worse — leave the
+// upstream waiting for a checksum that the de-chunked body no longer carries.
+// See checksumTrailers for what we do with them.
+func decodeAwsChunked(r io.Reader) ([]byte, http.Header, error) {
 	br := bufio.NewReader(r)
 	var out bytes.Buffer
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
-			return nil, fmt.Errorf("reading chunk size: %w", err)
+			return nil, nil, fmt.Errorf("reading chunk size: %w", err)
 		}
 		sizeField := strings.TrimRight(line, "\r\n")
 		if i := strings.IndexByte(sizeField, ';'); i >= 0 {
@@ -832,18 +846,116 @@ func decodeAwsChunked(r io.Reader) ([]byte, error) {
 		}
 		size, err := strconv.ParseInt(strings.TrimSpace(sizeField), 16, 64)
 		if err != nil {
-			return nil, fmt.Errorf("invalid chunk size %q: %w", sizeField, err)
+			return nil, nil, fmt.Errorf("invalid chunk size %q: %w", sizeField, err)
 		}
 		if size == 0 {
-			return out.Bytes(), nil // final chunk; trailers (if any) ignored
+			trailers, terr := readAwsChunkedTrailers(br)
+			if terr != nil {
+				return nil, nil, terr
+			}
+			return out.Bytes(), trailers, nil
 		}
 		if _, err := io.CopyN(&out, br, size); err != nil {
-			return nil, fmt.Errorf("reading chunk data: %w", err)
+			return nil, nil, fmt.Errorf("reading chunk data: %w", err)
 		}
 		if _, err := br.Discard(2); err != nil { // consume the CRLF after chunk data
-			return nil, fmt.Errorf("reading chunk terminator: %w", err)
+			return nil, nil, fmt.Errorf("reading chunk terminator: %w", err)
 		}
 	}
+}
+
+// readAwsChunkedTrailers reads the `name:value` lines that follow the final
+// (zero-size) chunk, up to the terminating empty line. A stream that simply
+// ends after the last trailer — no closing empty line — is accepted too, since
+// we have all the bytes either way.
+func readAwsChunkedTrailers(br *bufio.Reader) (http.Header, error) {
+	trailers := http.Header{}
+	for i := 0; ; i++ {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				addAwsChunkedTrailer(trailers, line)
+				return trailers, nil
+			}
+			return nil, fmt.Errorf("reading chunk trailer: %w", err)
+		}
+		if strings.TrimRight(line, "\r\n") == "" {
+			return trailers, nil
+		}
+		if i >= maxAwsChunkedTrailers {
+			return nil, fmt.Errorf("more than %d chunk trailers", maxAwsChunkedTrailers)
+		}
+		addAwsChunkedTrailer(trailers, line)
+	}
+}
+
+// addAwsChunkedTrailer parses one `name:value` trailer line into h. Lines
+// without a colon (or with an empty name) are skipped rather than rejected —
+// they carry nothing we act on.
+func addAwsChunkedTrailer(h http.Header, line string) {
+	field := strings.TrimRight(line, "\r\n")
+	i := strings.IndexByte(field, ':')
+	if i < 0 {
+		return
+	}
+	name := strings.TrimSpace(field[:i])
+	if name == "" {
+		return
+	}
+	h.Set(name, strings.TrimSpace(field[i+1:]))
+}
+
+// checksumTrailers picks the flexible-checksum trailers (x-amz-checksum-crc32,
+// -crc32c, -sha1, -sha256, …) out of a decoded aws-chunked body, so they can
+// travel upstream as ordinary headers. The value is the client's own digest of
+// the payload — computed over the object bytes, not over the chunk framing —
+// which is exactly what the upstream receives once the framing is gone, so the
+// end-to-end integrity check survives the re-signing.
+//
+// Everything else a client may append is dropped. x-amz-trailer-signature above
+// all: it signs the framing bytes with the client's key, and neither the bytes
+// nor the key exist on the upstream request.
+//
+// Returns nil when there is nothing to promote.
+func checksumTrailers(trailers http.Header) http.Header {
+	var out http.Header
+	for name, values := range trailers {
+		canonical := http.CanonicalHeaderKey(name)
+		if !strings.HasPrefix(canonical, "X-Amz-Checksum-") {
+			continue
+		}
+		if out == nil {
+			out = http.Header{}
+		}
+		out[canonical] = values
+	}
+	return out
+}
+
+// stripAwsChunkedEncoding removes the `aws-chunked` token from Content-Encoding
+// once the framing has been decoded, keeping any other encoding the client
+// applied underneath it (`aws-chunked,gzip` -> `gzip`; the payload really is
+// still gzipped). The header is dropped entirely when nothing else remains.
+func stripAwsChunkedEncoding(header http.Header) {
+	values, ok := header["Content-Encoding"]
+	if !ok {
+		return
+	}
+	var kept []string
+	for _, value := range values {
+		for _, token := range strings.Split(value, ",") {
+			token = strings.TrimSpace(token)
+			if token == "" || strings.EqualFold(token, "aws-chunked") {
+				continue
+			}
+			kept = append(kept, token)
+		}
+	}
+	if len(kept) == 0 {
+		header.Del("Content-Encoding")
+		return
+	}
+	header.Set("Content-Encoding", strings.Join(kept, ", "))
 }
 
 func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, region string) (*http.Request, error) {
@@ -877,19 +989,34 @@ func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, regi
 	// the real content. Validation of the incoming signature already happened
 	// above against the original headers and is unaffected (the body is not part
 	// of a STREAMING canonical request).
+	//
+	// The framing can also carry the client's flexible checksum as a TRAILER
+	// after the last chunk — that is what `x-amz-trailer: x-amz-checksum-crc32`
+	// together with `STREAMING-UNSIGNED-PAYLOAD-TRAILER` announces, and it is the
+	// only place the checksum exists (the SDK cannot hash a stream up front, so
+	// it never sends an x-amz-checksum-… header). De-chunking removes those
+	// trailer bytes, so both the announcement and the digest have to be carried
+	// over by hand: x-amz-trailer must NOT reach the upstream — it would promise
+	// a trailing checksum that the decoded body no longer contains, and the
+	// upstream rejects the upload with "The provided 'x-amz-checksum' header does
+	// not match what was computed" — while the digest itself is re-attached below
+	// as a plain x-amz-checksum-… header on the upstream request.
 	body := req.Body
+	var checksumHeaders http.Header
 	if isAwsChunkedUpload(req) {
-		decoded, derr := decodeAwsChunked(req.Body)
+		decoded, trailers, derr := decodeAwsChunked(req.Body)
 		if derr != nil {
 			return nil, fmt.Errorf("aws-chunked decode: %w", derr)
 		}
 		body = io.NopCloser(bytes.NewReader(decoded))
 		req.ContentLength = int64(len(decoded))
+		checksumHeaders = checksumTrailers(trailers)
 		// Strip the streaming markers so they are not copied upstream and the
 		// signer computes a normal payload hash over the decoded body.
-		req.Header.Del("Content-Encoding")
+		stripAwsChunkedEncoding(req.Header)
 		req.Header.Del("X-Amz-Decoded-Content-Length")
 		req.Header.Del("X-Amz-Content-Sha256")
+		req.Header.Del("X-Amz-Trailer")
 	}
 
 	// A batch delete carries its object keys in the body, out of reach of
@@ -918,8 +1045,11 @@ func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, regi
 		body = io.NopCloser(bytes.NewReader(rewritten))
 		if !bytes.Equal(rewritten, raw) {
 			// S3 requires a Content-MD5 on a batch delete: recompute it for the
-			// new body and drop the client's other, now stale digests.
+			// new body and drop the client's other, now stale digests — including
+			// any checksum recovered from the aws-chunked trailers, which covers
+			// the pre-rewrite keys.
 			req.ContentLength = int64(len(rewritten))
+			checksumHeaders = nil
 			dropStaleBodyDigestHeaders(req.Header)
 			sum := md5.Sum(rewritten)
 			req.Header.Set("Content-Md5", base64.StdEncoding.EncodeToString(sum[:]))
@@ -936,6 +1066,12 @@ func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, regi
 	}
 	if val, ok := req.Header["Content-Md5"]; ok {
 		proxyReq.Header["Content-Md5"] = val
+	}
+	// Re-attach a checksum the client sent as a trailer of the aws-chunked body
+	// (see above). Set before signing so it is covered by the upstream
+	// signature, exactly like the header a non-streaming client would send.
+	for name, values := range checksumHeaders {
+		proxyReq.Header[name] = values
 	}
 
 	// Sign the upstream request — with the dedicated upstream credentials
