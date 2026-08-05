@@ -18,13 +18,23 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-//   - new less strict regexp in order to allow different region naming (compatibility with other providers)
+// The Credential field of an Authorization header is
+// `<access-key-id>/<date>/<region>/s3/aws4_request`.
+//
+// The access-key-id capture is deliberately permissive. Its *shape* is the
+// policy file's business — identity.accessKeyIdPattern decides it, and
+// ResolveIdentity enforces that — so anything this regexp excludes is a
+// layout an operator could configure but never authenticate with. Only the
+// two characters that would make the header ambiguous are excluded: `/`
+// separates the credential's own fields, and `,` separates the header's.
+//
+// The region capture is likewise loose, for compatibility across providers:
 //   - east-eu-1 => pass (aws style)
 //   - gra => pass (ceph style)
 //   - "" => pass (some S3 clients, e.g. DuckDB's httpfs, leave the region
 //     segment empty when no region is configured; the signature is still
 //     valid, it just has an empty region scope)
-var awsAuthorizationCredentialRegexp = regexp.MustCompile("Credential=([a-zA-Z0-9]+)/[0-9]+/([a-zA-Z-0-9]*)/s3/aws4_request")
+var awsAuthorizationCredentialRegexp = regexp.MustCompile(`Credential=([^/,\s]+)/[0-9]+/([a-zA-Z-0-9]*)/s3/aws4_request`)
 var awsAuthorizationSignedHeadersRegexp = regexp.MustCompile("SignedHeaders=([a-zA-Z0-9;-]+)")
 
 // emptyPayloadSHA256 is the SigV4 payload hash of a zero-length body.
@@ -485,6 +495,15 @@ func (h *Handler) buildUpstreamRequest(req *http.Request, st *requestState) (*ht
 
 	// Add origin headers after the request is signed (no overwrite).
 	copyHeaderWithoutOverwrite(proxyReq.Header, req.Header)
+	if st.operation.rewritesXML {
+		// This response has to be read to strip the tenant prefix back out
+		// of it. Forwarding the client's Accept-Encoding would let the
+		// upstream compress it *and* stop Go's transport from undoing that
+		// automatically — leaving a body we would have to pass through
+		// unrewritten. Dropping the header hands the negotiation to the
+		// transport, which decompresses transparently.
+		proxyReq.Header.Del("Accept-Encoding")
+	}
 	// The client's own credential must never travel upstream — the
 	// upstream signature replaced it.
 	proxyReq.Header.Del("X-Amz-Decoded-Content-Length")

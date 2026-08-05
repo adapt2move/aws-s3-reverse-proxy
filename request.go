@@ -214,7 +214,11 @@ func splitBucketKey(u *url.URL) (bucket, key, escapedKey string, bucketLevel boo
 	bucket, key = splitFirstSegment(strings.TrimPrefix(path, "/"))
 	_, escapedKey = splitFirstSegment(strings.TrimPrefix(escaped, "/"))
 	if bucket == "" {
-		return "", "", "", false, fmt.Errorf("%w: no bucket in request path", errInvalidKey)
+		// `GET /` is ListBuckets, and every other bucket-less path is some
+		// account-level call. None of them is an operation this proxy
+		// implements, so they are refused like the rest of them rather than
+		// reported as a malformed key.
+		return "", "", "", false, fmt.Errorf("%w: account-level request", errUnsupportedOperation)
 	}
 	if strings.Contains(bucket, "..") {
 		return "", "", "", false, fmt.Errorf("%w: bucket name contains %q", errInvalidKey, "..")

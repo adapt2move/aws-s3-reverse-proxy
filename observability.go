@@ -135,4 +135,10 @@ var (
 
 func init() {
 	prometheus.MustRegister(authzDecisions, deniedBatchKeys, proxiedRequestDuration, policyReloads)
+	// Create the reload series up front. A counter that only appears after
+	// the event it counts is one an alert cannot be written against — the
+	// first rejected reload would look like a gap rather than a spike.
+	for _, outcome := range []string{"applied", "rejected", "unchanged"} {
+		policyReloads.WithLabelValues(outcome)
+	}
 }

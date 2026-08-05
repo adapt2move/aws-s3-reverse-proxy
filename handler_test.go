@@ -559,3 +559,43 @@ func testSubnets(t *testing.T, cidrs ...string) []*net.IPNet {
 	}
 	return out
 }
+
+// The access-key-id layout is the policy file's business. A deployment that
+// spells its ids with a separator — or with anything else outside
+// `[a-zA-Z0-9]` — must be able to authenticate, which it could not while the
+// Authorization header's Credential field was parsed with a narrower
+// character class than the one identity.accessKeyIdPattern allows.
+func TestAccessKeyIDLayoutIsNotHardCoded(t *testing.T) {
+	policy, err := ParsePolicy([]byte(`
+identity:
+  accessKeyIdPattern: '^(?P<tenant>[a-z0-9]+)-(?P<level>reader|writer)$'
+  secretTemplate: 'v1/{level}/{tenant}'
+  keyPrefixTemplate: 'tenants/{tenant}/data/'
+levels: [reader, writer]
+rules:
+  - pathPattern: 'datasets/**'
+    grant: { reader: read, writer: full }
+`))
+	require.NoError(t, err)
+
+	h, upstream := newTestProxy(t)
+	h.Policy = NewStaticPolicyStore(policy)
+
+	rec := do(t, h, clientRequest{
+		method: http.MethodPut, target: "/bucket/datasets/a.csv", body: []byte("x"),
+		accessKeyID: "acmecorp-writer",
+		secret:      deriveSecret(testPepper, "v1/writer/acmecorp"),
+	})
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "/bucket/tenants/acmecorp/data/datasets/a.csv", upstream.last(t).path)
+
+	// And the level still separates the two credentials.
+	before := upstream.count()
+	rec = do(t, h, clientRequest{
+		method: http.MethodPut, target: "/bucket/datasets/a.csv", body: []byte("x"),
+		accessKeyID: "acmecorp-reader",
+		secret:      deriveSecret(testPepper, "v1/reader/acmecorp"),
+	})
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Equal(t, before, upstream.count())
+}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -69,12 +70,6 @@ func rewriteUpstreamResponse(resp *http.Response) error {
 	if resp.Body == nil {
 		return nil
 	}
-	// Content-encoded bodies would have to be decoded and re-encoded; S3
-	// does not compress these responses, so refusing to touch them costs
-	// nothing and avoids guessing at the encoding.
-	if resp.Header.Get("Content-Encoding") != "" {
-		return nil
-	}
 	if !strings.Contains(resp.Header.Get("Content-Type"), "xml") {
 		return nil
 	}
@@ -84,6 +79,16 @@ func rewriteUpstreamResponse(resp *http.Response) error {
 	if err != nil {
 		return err
 	}
+	// The upstream is asked not to compress the responses we have to read
+	// (see buildUpstreamRequest), but an object store that compresses
+	// regardless must not turn into a silent pass-through: the body would
+	// reach the client still carrying the tenant prefix, and a batch
+	// delete would lose its per-key denials.
+	body, err = decodeContentEncoding(body, resp.Header.Get("Content-Encoding"), st.maxRewriteSize)
+	if err != nil {
+		return err
+	}
+	resp.Header.Del("Content-Encoding")
 
 	body = stripKeyPrefixFromListBody(body, st.identity.KeyPrefix)
 	if st.operation.kind == opListObjects {
@@ -97,6 +102,29 @@ func rewriteUpstreamResponse(resp *http.Response) error {
 	resp.ContentLength = int64(len(body))
 	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	return nil
+}
+
+// decodeContentEncoding undoes the content coding of a response we have to
+// rewrite. gzip is the only one worth handling — it is what S3-compatible
+// stores actually emit — and anything else is refused rather than forwarded:
+// a body we cannot read is a body we cannot strip the tenant prefix out of,
+// and passing it on would leak the upstream key layout to the client.
+func decodeContentEncoding(body []byte, encoding string, max int64) ([]byte, error) {
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "", "identity":
+		return body, nil
+	case "gzip", "x-gzip":
+		zr, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("upstream response: cannot read gzip body: %w", err)
+		}
+		defer zr.Close()
+		// The same cap as the compressed read: a small compressed body can
+		// otherwise expand without bound.
+		return readCapped(zr, max, "upstream response")
+	default:
+		return nil, fmt.Errorf("upstream response uses content-encoding %q, which this proxy cannot rewrite", encoding)
+	}
 }
 
 // urlEncodedPrefix returns the same prefix with every `/` replaced by

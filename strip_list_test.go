@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"net/http"
 	"strings"
 	"testing"
@@ -161,4 +163,61 @@ func TestStripPrefixFromValue(t *testing.T) {
 	for _, tc := range cases {
 		assert.Equal(t, tc.want, string(stripPrefixFromValue([]byte(tc.in), prefix)), tc.in)
 	}
+}
+
+// An upstream that compresses a listing must not turn the rewrite into a
+// silent pass-through: the body would reach the client still carrying the
+// tenant prefix, and a batch delete would lose its per-key denials. MinIO
+// compresses these responses whenever the client's Accept-Encoding reaches
+// it, which is exactly what happens through a proxy.
+func TestCompressedListingIsStillStripped(t *testing.T) {
+	h, upstream := newTestProxy(t)
+	body := `<ListBucketResult><Contents><Key>` + tenantA + `/datasets/a.csv</Key></Contents></ListBucketResult>`
+	upstream.respond = func(w http.ResponseWriter, r *http.Request) {
+		// The proxy must not have asked for a compressed body here...
+		if ae := r.Header.Get("Accept-Encoding"); strings.Contains(ae, "gzip") && !strings.Contains(ae, "identity") {
+			// Go's transport adds its own gzip and undoes it transparently;
+			// what matters is that the *client's* header was not forwarded.
+			assert.NotEqual(t, "gzip, deflate, custom-from-client", ae)
+		}
+		// ...but answer compressed anyway, as a stubborn store would.
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		_, _ = zw.Write([]byte(body))
+		require.NoError(t, zw.Close())
+
+		w.Header().Set("Content-Type", "application/xml")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(buf.Bytes())
+	}
+
+	rec := do(t, h, clientRequest{
+		method: http.MethodGet, target: "/bucket/?list-type=2&prefix=datasets/",
+		tenant: tenantA, level: "ro",
+		headers: http.Header{"Accept-Encoding": {"gzip, deflate, custom-from-client"}},
+	})
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "<Key>datasets/a.csv</Key>")
+	assert.NotContains(t, rec.Body.String(), tenantA)
+	assert.Empty(t, rec.Header().Get("Content-Encoding"), "the body was decoded, so it must not still claim to be encoded")
+}
+
+// A coding we cannot undo must fail closed rather than forward a body the
+// tenant prefix was never stripped from.
+func TestUndecodableListingFailsClosed(t *testing.T) {
+	h, upstream := newTestProxy(t)
+	upstream.respond = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.Header().Set("Content-Encoding", "br")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("\x00\x01not-brotli-either"))
+	}
+
+	rec := do(t, h, clientRequest{
+		method: http.MethodGet, target: "/bucket/?list-type=2&prefix=datasets/",
+		tenant: tenantA, level: "ro",
+	})
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
+	assert.NotContains(t, rec.Body.String(), tenantA)
 }
