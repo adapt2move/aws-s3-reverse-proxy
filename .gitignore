@@ -1,4 +1,9 @@
-aws-s3-reverse-proxy
-aws-s3-reverse-proxy.tar
-config
-test.txt
+# Build artifacts and local scratch files, anchored to the repository root.
+#
+# The leading slashes matter: an unanchored pattern matches at every depth, so
+# a bare `config` here would silently exclude internal/config — which is
+# exactly what it did once, with `git status` reporting nothing amiss.
+/aws-s3-reverse-proxy
+/aws-s3-reverse-proxy.tar
+/config
+/test.txt
