@@ -16,9 +16,7 @@ Two properties drive the design:
     against the object store directly.
 
 The intended clients are untrusted or semi-trusted workloads, so the proxy is
-the security boundary — not a convenience layer in front of one. Nothing
-tenant-specific is configured anywhere: onboarding a tenant is a no-op for the
-proxy.
+the security boundary — not a convenience layer in front of one.
 
 ## How a request is served
 
@@ -179,10 +177,24 @@ second flag to keep in sync.
 
 ### Hot reload
 
-The policy file is re-read on a timer and on `SIGHUP`. A reload that fails
-validation is **rejected** and the previously loaded policy keeps serving — a
-bad edit must not open or close the gate by accident. Rejections are logged at
-error level and counted in `s3proxy_policy_reloads_total{outcome="rejected"}`.
+The policy file is re-read on `SIGHUP` and, by default, on a timer. A reload
+that fails validation is **rejected** and the previously loaded policy keeps
+serving — a bad edit must not open or close the gate by accident. Rejections
+are logged at error level and counted in
+`s3proxy_policy_reloads_total{outcome="rejected"}`.
+
+`SIGHUP` is the immediate path; the timer is the fallback for the case nobody
+is around to send one. It is a poll rather than a filesystem watch on purpose:
+a Kubernetes ConfigMap update does not write to the file, it swaps the
+directory symlink the file is reached through, and an inotify watch registered
+on the path stops firing the moment that happens. Watching the parent
+directory instead works, but the event to watch for differs by how the volume
+is mounted, so the failure mode is a policy that silently stops updating.
+Re-reading the bytes costs one small read per interval and is correct
+everywhere.
+
+Set `--policy-reload-interval=0` for signal-only operation, and the proxy will
+never touch the file except when told to.
 
 ## Scoping and fail-closed behaviour
 
@@ -271,10 +283,10 @@ an unbounded label is an unbounded number of time series.
 
 ## Releases
 
-Get the latest Docker image from [from
-DockerHub](https://hub.docker.com/r/thomaskriechbaumer/aws-s3-reverse-proxy/tags)
-or download the source release [from
-GitHub](https://github.com/Kriechi/aws-s3-reverse-proxy/releases).
+Container images are published to
+[ghcr.io/adapt2move/aws-s3-reverse-proxy](https://github.com/adapt2move/aws-s3-reverse-proxy/pkgs/container/aws-s3-reverse-proxy),
+and source releases are [on
+GitHub](https://github.com/adapt2move/aws-s3-reverse-proxy/releases).
 
 ## Build
 
@@ -345,5 +357,5 @@ details, see the `LICENSE` file in the repository.
 
 ## Authors
 
-`aws-s3-reverse-proxy` was created by Thomas Kriechbaumer, and is maintained
-by the community.
+Originally created by Thomas Kriechbaumer; enhanced by Maximilian Pfennig and
+the contributors of Adapt2Move GmbH.
