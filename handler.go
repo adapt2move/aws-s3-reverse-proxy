@@ -1,73 +1,65 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"crypto/md5"
+	"context"
 	"crypto/subtle"
-	"encoding/base64"
-	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws/credentials"
 	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
 	log "github.com/sirupsen/logrus"
 )
 
-// - new less strict regexp in order to allow different region naming (compatibility with other providers)
-// - east-eu-1 => pass (aws style)
-// - gra => pass (ceph style)
-// - "" => pass (some S3 clients, e.g. DuckDB's httpfs, leave the region
-//   segment empty when no region is configured; the signature is still
-//   valid, it just has an empty region scope)
+//   - new less strict regexp in order to allow different region naming (compatibility with other providers)
+//   - east-eu-1 => pass (aws style)
+//   - gra => pass (ceph style)
+//   - "" => pass (some S3 clients, e.g. DuckDB's httpfs, leave the region
+//     segment empty when no region is configured; the signature is still
+//     valid, it just has an empty region scope)
 var awsAuthorizationCredentialRegexp = regexp.MustCompile("Credential=([a-zA-Z0-9]+)/[0-9]+/([a-zA-Z-0-9]*)/s3/aws4_request")
 var awsAuthorizationSignedHeadersRegexp = regexp.MustCompile("SignedHeaders=([a-zA-Z0-9;-]+)")
 
-// Handler is a special handler that re-signs any AWS S3 request and sends it upstream
+// emptyPayloadSHA256 is the SigV4 payload hash of a zero-length body.
+const emptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// unsignedPayload tells the upstream that the payload hash is not part of
+// the signature. We use it for the bodies we forward as a stream and whose
+// digest we therefore never see (see prepareBody).
+const unsignedPayload = "UNSIGNED-PAYLOAD"
+
+// hexSHA256Regexp matches a literal payload hash as a client sends it in
+// x-amz-content-sha256.
+var hexSHA256Regexp = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// Handler is a multi-tenant S3 reverse proxy. Every request carries its own
+// identity: the access-key id names the tenant and the access level, the
+// secret is derived from a deployment-wide pepper, and the tenant's key
+// prefix is injected by the proxy rather than sent by the client. Nothing
+// tenant-specific is configured anywhere, so onboarding a tenant is a no-op
+// here.
 type Handler struct {
-	// Print debug information
+	// Print debug information, and include the rejection reason in error
+	// responses. Never includes credentials or signatures.
 	Debug bool
 
-	// When true, only read methods (GET, HEAD) are proxied; every mutating
-	// method (PUT, POST, DELETE, PATCH) is rejected with 403 before the request
-	// is signed or forwarded. This is an upstream-credential-independent
-	// safety boundary: even a fully valid write request never reaches S3.
+	// When true, every mutating method is rejected regardless of policy —
+	// a deployment-wide kill switch for maintenance windows, independent
+	// of the file on disk.
 	ReadOnly bool
 
-	// Optional: a set of object-key prefixes that are protected from
-	// mutation. A mutating request (PUT, POST, DELETE, PATCH) whose object
-	// key starts with any of these prefixes is rejected with 403 before the
-	// request is signed or forwarded — exactly like ReadOnly, but scoped to
-	// the listed prefixes instead of the whole bucket. Reads are always
-	// allowed. The prefixes are matched against the client-facing object key
-	// (i.e. before any KeyPrefix is prepended). Empty disables the feature.
-	ReadOnlyKeyPrefixes []string
-
-	// Optional: a set of object-key prefixes that are fully denied. Unlike
-	// ReadOnlyKeyPrefixes (which only blocks mutations), ANY request — read
-	// or write — whose object key starts with one of these prefixes is
-	// rejected with 403 before the request is signed or forwarded (fail
-	// closed). In addition, keys under these prefixes are stripped from
-	// bucket-level LIST responses, so a client cannot even discover that they
-	// exist. Like ReadOnlyKeyPrefixes, the prefixes are matched against the
-	// client-facing object key (i.e. before any KeyPrefix is prepended).
-	// Empty disables the feature.
-	DenyKeyPrefixes []string
-
-	// http or https
+	// http or https, derived from the configured upstream endpoint.
 	UpstreamScheme string
 
-	// Upstream S3 endpoint URL
+	// Upstream S3 endpoint (host[:port]); empty auto-detects AWS S3 from
+	// the request's region.
 	UpstreamEndpoint string
 
 	// Allowed endpoint, i.e., Host header to accept incoming requests from
@@ -76,708 +68,343 @@ type Handler struct {
 	// Allowed source IPs and subnets for incoming requests
 	AllowedSourceSubnet []*net.IPNet
 
-	// AWS Credentials, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-	AWSCredentials map[string]string
+	// Policy in force. Swapped atomically by a hot reload; a request reads
+	// it exactly once so it is decided by one consistent policy throughout.
+	Policy *PolicyStore
 
-	// AWS Signature v4
-	Signers map[string]*v4.Signer
+	// Pepper keys the HMAC that derives a client's secret. Comes from the
+	// environment or a mounted secret, never from the policy file.
+	Pepper []byte
 
-	// Optional: prepend this prefix to every object key (and to the
-	// `prefix` query parameter of bucket-level listings) before the
-	// request is sent upstream. Empty disables the feature.
-	KeyPrefix string
-
-	// Optional: when set, upstream requests are re-signed with these
-	// credentials instead of the client's. This lets the proxy hold
-	// credentials the client never needs to know.
+	// UpstreamSigner re-signs requests with the credentials only this
+	// process holds. Clients never see them.
 	UpstreamSigner *v4.Signer
 
-	// Optional: when set, upstream requests are signed for this region
-	// instead of the region from the client's request. Useful when the
-	// client signs with a placeholder (or empty) region but the real
-	// backend expects a specific one.
+	// Optional: sign upstream requests for this region instead of the
+	// region from the client's request. Useful when the client signs with
+	// a placeholder (or empty) region but the backend expects a real one.
 	UpstreamRegion string
 
-	// Reverse Proxy
+	// MaxClockSkew bounds how far an X-Amz-Date may be from our clock in
+	// either direction. It is what stops a captured signature from being
+	// replayed indefinitely.
+	MaxClockSkew time.Duration
+
+	// MaxChunkedBodySize caps the aws-chunked body we buffer in order to
+	// recover a checksum trailer (see prepareBody).
+	MaxChunkedBodySize int64
+
+	// MaxDeleteBodySize caps the DeleteObjects body we buffer, parse and
+	// rebuild.
+	MaxDeleteBodySize int64
+
+	// MaxRewriteBodySize caps the XML response we buffer in order to strip
+	// the tenant prefix back out.
+	MaxRewriteBodySize int64
+
+	// TenantMetricLabel adds the tenant id as a Prometheus label. Off by
+	// default: tenant count is unbounded and each one would mint a new
+	// time series.
+	TenantMetricLabel bool
+
+	// Proxy is built once and shared: it carries the connection pool, so
+	// re-creating it per request would throw away every keep-alive.
 	Proxy *httputil.ReverseProxy
 }
 
-// isBucketLevelPath reports whether a path-style S3 request path addresses
-// a bucket itself (e.g. "/my-bucket" or "/") rather than an object within
-// it ("/my-bucket/some/key").
-// isBucketLevelPath returns true for a path that addresses the bucket
-// itself (no object key) — used to choose between injectKeyPrefix
-// (object operations: GET, HEAD, PUT, DELETE) and scopeListPrefix
-// (bucket-level operations: GET ?list-type=2, ?versions, ?location, …).
-//
-// Both `/my-bucket` and `/my-bucket/` count as bucket-level. The AWS
-// SDK with `forcePathStyle: true` emits ListObjectsV2 as
-// `GET /<bucket>/?list-type=2&prefix=<...>`, where the trailing slash
-// is purely cosmetic — without TrimSuffix the slash would look like a
-// separator into an empty object key and the request would be misrouted
-// through injectKeyPrefix, producing an upstream path like
-// `/<bucket>/<KeyPrefix>` (no `?prefix=` rewrite) and a confusing 404
-// from the upstream store.
-func isBucketLevelPath(p string) bool {
-	s := strings.TrimSuffix(strings.TrimPrefix(p, "/"), "/")
-	return strings.IndexByte(s, '/') < 0
+// requestState is everything the response side needs to know about a
+// request it is answering. It travels on the upstream request's context so
+// that one shared ReverseProxy can serve every tenant.
+type requestState struct {
+	policy    *Policy
+	identity  *Identity
+	operation *operation
+
+	// deniedDeletes are the batch-delete keys (client-facing) policy
+	// refused. They are merged back into the upstream response as per-key
+	// AccessDenied entries, which is what S3 itself does for a key the
+	// caller may not delete.
+	deniedDeletes []string
+
+	// rule is the policy rule a body-level authorization matched, for the
+	// access log — the URL-level path records it directly on the entry.
+	rule string
+
+	// clientRegion is the region scope the client signed with. It is only
+	// used when no upstream region is configured, and it may legitimately
+	// be empty (DuckDB's httpfs signs that way).
+	clientRegion string
+
+	// maxRewriteSize mirrors Handler.MaxRewriteBodySize so the response
+	// rewrite needs nothing but this struct.
+	maxRewriteSize int64
 }
 
-// injectKeyPrefix prepends h.KeyPrefix to the object-key portion of a
-// path-style request path: "/bucket/key" becomes "/bucket/<prefix>key".
-// Bucket-level paths are returned unchanged (see scopeListPrefix). It is a
-// no-op when KeyPrefix is empty.
-func (h *Handler) injectKeyPrefix(p string) string {
-	if h.KeyPrefix == "" || isBucketLevelPath(p) {
-		return p
-	}
-	trimmed := strings.TrimPrefix(p, "/")
-	idx := strings.IndexByte(trimmed, '/')
-	bucket := trimmed[:idx]
-	key := trimmed[idx+1:]
-	return "/" + bucket + "/" + h.KeyPrefix + key
+type requestStateKey struct{}
+
+func withRequestState(ctx context.Context, st *requestState) context.Context {
+	return context.WithValue(ctx, requestStateKey{}, st)
 }
 
-// scopeListPrefix confines a bucket-level listing to h.KeyPrefix by
-// prepending it to the request's `prefix` query parameter, so a client
-// cannot enumerate keys outside the configured prefix.
-func (h *Handler) scopeListPrefix(u *url.URL) {
-	if h.KeyPrefix == "" {
-		return
-	}
-	q := u.Query()
-	q.Set("prefix", h.KeyPrefix+q.Get("prefix"))
-	u.RawQuery = q.Encode()
+func requestStateFrom(ctx context.Context) *requestState {
+	st, _ := ctx.Value(requestStateKey{}).(*requestState)
+	return st
 }
 
-// XML elements whose text content references an object key path and
-// therefore carries the upstream-prefixed form when KeyPrefix is set.
-// Tokens that are opaque (ContinuationToken, NextContinuationToken,
-// UploadIdMarker, …) are NOT in this set — stripping them would
-// corrupt random tokens that happen to start with the prefix bytes.
-//
-// Element families:
-//
-//   - <Key> / <Prefix>                  ListObjects / ListObjectsV2
-//   - <Marker> / <NextMarker>           ListObjects v1 pagination
-//   - <StartAfter>                       ListObjectsV2 pagination
-//   - <KeyMarker> / <NextKeyMarker>      ListObjectVersions / ListMultipartUploads
-//   - <Location>                         CompleteMultipartUpload response
-//                                        (a URL whose path holds the key)
-//   - <Resource>                         Error response — the request path
-//                                        S3 was acting on; also a URL/path
-var listKeyElementRegexp = regexp.MustCompile(
-	`<(Key|Prefix|Marker|NextMarker|StartAfter|KeyMarker|NextKeyMarker|Location|Resource)>([^<]*)</(Key|Prefix|Marker|NextMarker|StartAfter|KeyMarker|NextKeyMarker|Location|Resource)>`,
-)
+// NewHandler wires up the shared reverse proxy. The transport keeps a
+// generous idle-connection pool: Go's default of two per host would force a
+// fresh TCP (and TLS) handshake on most requests, which alone would blow
+// the added-latency budget.
+func NewHandler(h *Handler) *Handler {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 512
+	transport.MaxIdleConnsPerHost = 128
+	transport.IdleConnTimeout = 90 * time.Second
 
-// urlEncodedPrefix returns the same prefix with every `/` replaced by
-// `%2F` (uppercase). S3 responses URL-encode object keys whenever the
-// client request carries `EncodingType=url` — boto3, DuckDB's httpfs
-// and the standard AWS SDKs all set that by default. Without matching
-// the encoded form, the prefix would stay in the response and the
-// client would see upstream-shaped keys (e.g.
-// `<Key>tenants%2Facme%2Fuploads%2Fx.csv</Key>`) — defeating the whole
-// point of the strip.
-//
-// We deliberately encode ONLY the slash, not the rest of the prefix,
-// because:
-//   - S3's encoding-type=url percent-encodes `/` and unsafe bytes;
-//     ASCII letters/digits stay literal.
-//   - Encoding more aggressively (e.g. `.`) would create needles that
-//     never appear in the response and silently miss real matches.
-func urlEncodedPrefix(prefix []byte) []byte {
-	if !bytes.ContainsRune(prefix, '/') {
-		return prefix
+	if h.UpstreamSigner != nil {
+		// S3 does not escape the canonical URI a second time. Without this
+		// the signature would cover a path that differs from the one on the
+		// wire for every key containing a character that needs escaping — a
+		// space, a `+`, a non-ASCII byte.
+		h.UpstreamSigner.DisableURIPathEscaping = true
 	}
-	return bytes.ReplaceAll(prefix, []byte("/"), []byte("%2F"))
-}
 
-// stripPrefixFromValue removes the KeyPrefix from an element text
-// value. Three shapes are supported:
-//
-//  1. Bare key (literal): the value IS the prefixed key — e.g.
-//     <Key>tenants/acme/uploads/x.csv</Key>. Chop the prefix off the front.
-//
-//  2. Bare key (URL-encoded): the value is the same key but with slashes
-//     percent-encoded — e.g.
-//     <Key>tenants%2Facme%2Fuploads%2Fx.csv</Key>. This is what S3
-//     returns whenever the request carries `EncodingType=url` (boto3 and
-//     DuckDB do that by default). Chop the encoded prefix off the front.
-//
-//  3. URL or absolute path: the value embeds the prefixed key after a
-//     path separator — e.g.
-//        <Location>https://bucket.s3.region.amazonaws.com/tenants/acme/uploads/x.csv</Location>
-//        <Resource>/bucket/tenants/acme/uploads/x.csv</Resource>
-//     Splice the prefix out at its `/<KeyPrefix>` occurrence.
-//
-// Returns the value unchanged when no occurrence is found — never
-// removes "the wrong" bytes silently.
-func stripPrefixFromValue(val, prefix []byte) []byte {
-	if len(val) == 0 || len(prefix) == 0 {
-		return val
+	h.Proxy = &httputil.ReverseProxy{
+		// The request handed to ServeHTTP already carries the absolute
+		// upstream URL, so there is nothing left to direct.
+		Director:      func(*http.Request) {},
+		Transport:     transport,
+		FlushInterval: -1, // flush every write: object downloads stream
+		ModifyResponse: func(resp *http.Response) error {
+			return rewriteUpstreamResponse(resp)
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.WithError(err).Warn("upstream request failed")
+			writeS3Error(w, http.StatusBadGateway, "InternalError", "The proxy could not reach the object store.")
+		},
 	}
-	// 1. Bare key form (literal).
-	if bytes.HasPrefix(val, prefix) {
-		out := make([]byte, len(val)-len(prefix))
-		copy(out, val[len(prefix):])
-		return out
-	}
-	// 2. Bare key form (URL-encoded). Only consider when the prefix
-	//    actually contains a slash — otherwise the encoded form equals
-	//    the literal form and the path-1 branch already handled it.
-	encPrefix := urlEncodedPrefix(prefix)
-	if !bytes.Equal(encPrefix, prefix) && bytes.HasPrefix(val, encPrefix) {
-		out := make([]byte, len(val)-len(encPrefix))
-		copy(out, val[len(encPrefix):])
-		return out
-	}
-	// 3. URL / absolute path form: look for `/<prefix>` and splice.
-	needle := append(append(make([]byte, 0, len(prefix)+1), '/'), prefix...)
-	idx := bytes.Index(val, needle)
-	if idx < 0 {
-		return val
-	}
-	out := make([]byte, 0, len(val)-len(prefix))
-	out = append(out, val[:idx+1]...) // keep the leading slash
-	out = append(out, val[idx+len(needle):]...)
-	return out
-}
-
-// stripKeyPrefixFromListBody undoes scopeListPrefix on the upstream
-// response body so the client sees a fully-transparent view. Without
-// this rewrite a client that pipes a Contents.Key (or a Location URL)
-// straight into a follow-up GetObject would hit a double-prepended
-// path upstream (the proxy adds KeyPrefix again on GET) and 404.
-//
-// Targets the specific XML elements that hold object key paths; leaves
-// opaque pagination tokens (ContinuationToken, …) untouched. Pure
-// byte-level rewrite — preserves the upstream XML formatting,
-// namespaces, comments and any unknown elements.
-func stripKeyPrefixFromListBody(body []byte, keyPrefix string) []byte {
-	if keyPrefix == "" {
-		return body
-	}
-	prefixBytes := []byte(keyPrefix)
-	return listKeyElementRegexp.ReplaceAllFunc(body, func(match []byte) []byte {
-		sm := listKeyElementRegexp.FindSubmatch(match)
-		// sm = [whole, openTag, value, closeTag]
-		if len(sm) != 4 || !bytes.Equal(sm[1], sm[3]) {
-			return match
-		}
-		stripped := stripPrefixFromValue(sm[2], prefixBytes)
-		if bytes.Equal(stripped, sm[2]) {
-			// No occurrence found — leave the element verbatim so we
-			// never silently corrupt a value that just happened to
-			// share the bytes.
-			return match
-		}
-		// Reassemble: <Tag>stripped</Tag>
-		out := make([]byte, 0, len(match)-(len(sm[2])-len(stripped)))
-		out = append(out, '<')
-		out = append(out, sm[1]...)
-		out = append(out, '>')
-		out = append(out, stripped...)
-		out = append(out, '<', '/')
-		out = append(out, sm[3]...)
-		out = append(out, '>')
-		return out
-	})
-}
-
-// Bucket-level LIST responses group each object under a <Contents> element
-// (with a <Key> child) and each rolled-up sub-directory under a
-// <CommonPrefixes> element (with a <Prefix> child). filterDeniedKeysFromListBody
-// removes whole such blocks when the key/prefix they carry falls under a denied
-// prefix, so denied keys never appear in a listing.
-//
-// The `[^<]*` value capture stays within a single element and the non-greedy
-// `[\s\S]*?` block body stops at the first closing tag, so a block is matched
-// as a unit and either kept verbatim or dropped in full.
-var listContentsBlockRegexp = regexp.MustCompile(`<Contents>[\s\S]*?</Contents>`)
-var listCommonPrefixesBlockRegexp = regexp.MustCompile(`<CommonPrefixes>[\s\S]*?</CommonPrefixes>`)
-var listKeyValueRegexp = regexp.MustCompile(`<Key>([^<]*)</Key>`)
-var listPrefixValueRegexp = regexp.MustCompile(`<Prefix>([^<]*)</Prefix>`)
-
-// keyValueUnderDenyPrefix reports whether a LIST element value (an object key
-// or common-prefix, in client-facing form) falls under any of the denied
-// prefixes. Both the literal form (`hidden/x`) and the URL-encoded form
-// (`hidden%2Fx`, which S3 returns when the request carries EncodingType=url)
-// are matched, mirroring stripPrefixFromValue.
-func keyValueUnderDenyPrefix(val []byte, denyPrefixes []string) bool {
-	for _, p := range denyPrefixes {
-		pb := []byte(p)
-		if bytes.HasPrefix(val, pb) {
-			return true
-		}
-		enc := urlEncodedPrefix(pb)
-		if !bytes.Equal(enc, pb) && bytes.HasPrefix(val, enc) {
-			return true
-		}
-	}
-	return false
-}
-
-// filterDeniedKeysFromListBody removes <Contents> and <CommonPrefixes> blocks
-// whose object key / common-prefix falls under a denied prefix, so a client
-// listing a bucket never sees keys it is not allowed to access. Values are
-// matched against the client-facing key, so this must run AFTER
-// stripKeyPrefixFromListBody has undone any KeyPrefix. A no-op when no denied
-// prefixes are configured.
-//
-// Only the enumerating LIST elements are touched; counts such as <KeyCount> are
-// left as-is (they may legitimately over-count once entries are hidden — the
-// same thing S3 itself does when a page is filtered by permissions). Pure
-// byte-level rewrite; unrelated elements and formatting are preserved.
-func filterDeniedKeysFromListBody(body []byte, denyPrefixes []string) []byte {
-	if len(denyPrefixes) == 0 {
-		return body
-	}
-	body = listContentsBlockRegexp.ReplaceAllFunc(body, func(block []byte) []byte {
-		m := listKeyValueRegexp.FindSubmatch(block)
-		if m != nil && keyValueUnderDenyPrefix(m[1], denyPrefixes) {
-			return nil
-		}
-		return block
-	})
-	body = listCommonPrefixesBlockRegexp.ReplaceAllFunc(body, func(block []byte) []byte {
-		m := listPrefixValueRegexp.FindSubmatch(block)
-		if m != nil && keyValueUnderDenyPrefix(m[1], denyPrefixes) {
-			return nil
-		}
-		return block
-	})
-	return body
-}
-
-// modifyResponse is wired into httputil.ReverseProxy's
-// ModifyResponse hook. It walks the upstream XML body and strips
-// h.KeyPrefix from elements that carry an object key path, so the
-// client sees a fully-transparent view of the proxy.
-//
-// XML response families this covers:
-//   - LIST / ListObjects / ListObjectsV2 / ListObjectVersions /
-//     ListMultipartUploads (bucket-level paths)
-//   - CompleteMultipartUploadResult (object-level path; <Location>
-//     and <Key> both carry the prefixed path)
-//   - InitiateMultipartUploadResult (object-level; <Key>)
-//   - Error responses on any path (<Resource> holds the request path)
-//
-// The element allow-list in `listKeyElementRegexp` plus the
-// `HasPrefix`/`/<prefix>` guard inside `stripPrefixFromValue` keep
-// the rewrite safe even when the body is a user-uploaded XML
-// document that happens to be Content-Type: application/xml — we
-// only touch values that ALSO start with the configured KeyPrefix.
-//
-// It also drops <Contents>/<CommonPrefixes> blocks for keys under a
-// DenyKeyPrefixes prefix (see filterDeniedKeysFromListBody), so denied
-// keys never appear in a listing. The deny filter runs AFTER the strip so
-// it matches the client-facing key.
-//
-// Skipped when:
-//   - KeyPrefix is empty AND no DenyKeyPrefixes are set (proxy is fully
-//     transparent anyway)
-//   - response is not XML (Content-Type check — opaque object
-//     payloads are never touched)
-//   - response is content-encoded (gzip etc.) — too risky to decode
-//     and re-encode here; upstream S3 doesn't compress these
-//     responses by default
-func (h *Handler) modifyResponse(resp *http.Response) error {
-	if resp == nil {
-		return nil
-	}
-	if h.KeyPrefix == "" && len(h.DenyKeyPrefixes) == 0 {
-		return nil
-	}
-	if resp.Header.Get("Content-Encoding") != "" {
-		return nil
-	}
-	ct := resp.Header.Get("Content-Type")
-	if !strings.Contains(ct, "xml") {
-		return nil
-	}
-	if resp.Body == nil {
-		return nil
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
-	rewritten := stripKeyPrefixFromListBody(body, h.KeyPrefix)
-	rewritten = filterDeniedKeysFromListBody(rewritten, h.DenyKeyPrefixes)
-	resp.Body = io.NopCloser(bytes.NewReader(rewritten))
-	resp.ContentLength = int64(len(rewritten))
-	resp.Header.Set("Content-Length", strconv.Itoa(len(rewritten)))
-	return nil
-}
-
-// isReadMethod reports whether an HTTP method is a non-mutating S3 read:
-// GET (object download, ListObjects/V2, ListObjectVersions, location, …) and
-// HEAD (object existence/metadata). Every other method mutates state.
-func isReadMethod(method string) bool {
-	return method == http.MethodGet || method == http.MethodHead
-}
-
-// objectKey returns the object-key portion of a path-style request path
-// ("/bucket/key" -> "key", true). A bucket-level path ("/bucket" or
-// "/bucket/") addresses no object key and returns ("", false).
-func objectKey(p string) (string, bool) {
-	if isBucketLevelPath(p) {
-		return "", false
-	}
-	trimmed := strings.TrimPrefix(p, "/")
-	idx := strings.IndexByte(trimmed, '/')
-	return trimmed[idx+1:], true
-}
-
-// hasAnyPrefix reports whether an object key starts with any of the given
-// prefixes. Always false for an empty prefix list.
-func hasAnyPrefix(key string, prefixes []string) bool {
-	for _, prefix := range prefixes {
-		if strings.HasPrefix(key, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-// isProtectedKeyPath reports whether the object key in a path-style request
-// path falls under one of the configured ReadOnlyKeyPrefixes. Bucket-level
-// paths (no object key) are never protected. Returns false when no prefixes
-// are configured.
-func (h *Handler) isProtectedKeyPath(p string) bool {
-	if len(h.ReadOnlyKeyPrefixes) == 0 {
-		return false
-	}
-	key, ok := objectKey(p)
-	if !ok {
-		return false
-	}
-	return hasAnyPrefix(key, h.ReadOnlyKeyPrefixes)
-}
-
-// isDeniedKeyPath reports whether the object key in a path-style request path
-// falls under one of the configured DenyKeyPrefixes. Bucket-level paths (no
-// object key) are never denied — they carry no key to match, and their LIST
-// responses are filtered separately. Returns false when no prefixes are
-// configured.
-func (h *Handler) isDeniedKeyPath(p string) bool {
-	if len(h.DenyKeyPrefixes) == 0 {
-		return false
-	}
-	key, ok := objectKey(p)
-	if !ok {
-		return false
-	}
-	return hasAnyPrefix(key, h.DenyKeyPrefixes)
-}
-
-// A batch delete (DeleteObjects) is the one S3 operation that addresses object
-// keys in the request BODY instead of the URL path:
-//
-//	POST /<bucket>?delete
-//	<Delete><Object><Key>a.csv</Key></Object><Object><Key>b.csv</Key></Object></Delete>
-//
-// The path carries no key, so injectKeyPrefix, isDeniedKeyPath and
-// isProtectedKeyPath all see nothing to act on and the batch would travel
-// upstream with raw client keys: unprefixed (S3 reports a delete of a
-// non-existent key as successful, so the client sees success while nothing was
-// deleted) and unchecked against the deny / read-only prefixes. The rewrite
-// below applies both rules to the keys in the body.
-
-// errDeniedKeyPrefix and errReadOnlyKeyPrefix mark a violation found in a
-// request body. They travel up through buildUpstreamRequest, where ServeHTTP
-// turns them into the same fail-closed 403 the path-based checks return.
-var (
-	errDeniedKeyPrefix   = errors.New("deny key prefix: access not allowed")
-	errReadOnlyKeyPrefix = errors.New("read-only key prefix: write not allowed")
-)
-
-// deleteObjectsRequestBody is the part of a DeleteObjects request body we need.
-// Unmarshalling yields the true, XML-unescaped keys to match prefixes against.
-type deleteObjectsRequestBody struct {
-	XMLName xml.Name `xml:"Delete"`
-	Objects []struct {
-		Key string `xml:"Key"`
-	} `xml:"Object"`
-}
-
-// deleteObjectsKeyRegexp matches the <Key> elements of a DeleteObjects request
-// body. It drives the byte-level prefix injection, so everything else in the
-// body (<VersionId>, <Quiet>, namespaces, formatting) is forwarded verbatim.
-var deleteObjectsKeyRegexp = regexp.MustCompile(`<Key>([^<]*)</Key>`)
-
-// maxDeleteObjectsBodySize bounds the batch delete body we buffer, parse and
-// rewrite — the work is proportional to the number of keys in it. S3 caps a
-// DeleteObjects request at 1000 keys of at most 1024 bytes, so a legitimate
-// body stays near 1 MB; twice that leaves room to spare while keeping the
-// memory a single request can ask for bounded.
-const maxDeleteObjectsBodySize = 2 << 20 // 2 MiB
-
-// isDeleteObjectsRequest reports whether req is an S3 batch delete:
-// `POST /<bucket>?delete`, with the object keys in the XML request body.
-func isDeleteObjectsRequest(req *http.Request) bool {
-	if req.Method != http.MethodPost || !isBucketLevelPath(req.URL.Path) {
-		return false
-	}
-	_, ok := req.URL.Query()["delete"]
-	return ok
-}
-
-// countDeleteObjectsKeys counts the <Key> elements the rewrite will touch. It
-// walks the body instead of using FindAll…, which would hold a match list for
-// every key of a batch at once.
-func countDeleteObjectsKeys(body []byte) int {
-	count := 0
-	for {
-		loc := deleteObjectsKeyRegexp.FindIndex(body)
-		if loc == nil {
-			return count
-		}
-		count++
-		body = body[loc[1]:]
-	}
-}
-
-// deleteObjectsKeys extracts the object keys from a DeleteObjects request body.
-// The parsed keys must agree in number with the <Key> elements the regexp sees,
-// since that regexp performs the prefix injection: a key it misses would travel
-// upstream unprefixed and unchecked, so we refuse the request instead.
-func deleteObjectsKeys(body []byte) ([]string, error) {
-	var parsed deleteObjectsRequestBody
-	if err := xml.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("batch delete: cannot parse request body: %v", err)
-	}
-	if n := countDeleteObjectsKeys(body); n != len(parsed.Objects) {
-		return nil, fmt.Errorf("batch delete: request body has %d <Object> entries but %d <Key> elements", len(parsed.Objects), n)
-	}
-	keys := make([]string, 0, len(parsed.Objects))
-	for _, obj := range parsed.Objects {
-		keys = append(keys, obj.Key)
-	}
-	return keys, nil
-}
-
-// prefixDeleteObjectsKeys prepends keyPrefix to every <Key> in a DeleteObjects
-// request body, the body-level counterpart of injectKeyPrefix. The prefix is
-// XML-escaped so a prefix containing `&` or `<` cannot corrupt the document.
-func prefixDeleteObjectsKeys(body []byte, keyPrefix string) []byte {
-	var escaped bytes.Buffer
-	xml.EscapeText(&escaped, []byte(keyPrefix))
-	prefix := escaped.Bytes()
-	return deleteObjectsKeyRegexp.ReplaceAllFunc(body, func(match []byte) []byte {
-		// Every match is exactly `<Key>value</Key>`, so the value can be sliced
-		// out instead of running a second, allocating submatch pass over it.
-		value := match[len("<Key>") : len(match)-len("</Key>")]
-		out := make([]byte, 0, len(match)+len(prefix))
-		out = append(out, "<Key>"...)
-		out = append(out, prefix...)
-		out = append(out, value...)
-		out = append(out, "</Key>"...)
-		return out
-	})
-}
-
-// rewritesDeleteObjects reports whether any key-scoped feature is configured,
-// i.e. whether a batch delete body needs to be inspected at all.
-func (h *Handler) rewritesDeleteObjects() bool {
-	return h.KeyPrefix != "" || len(h.DenyKeyPrefixes) > 0 || len(h.ReadOnlyKeyPrefixes) > 0
-}
-
-// rewriteDeleteObjectsBody enforces the deny and read-only prefixes against
-// every key in a DeleteObjects request body and returns the body with KeyPrefix
-// prepended to each key. A single denied / protected key rejects the WHOLE
-// batch: a partial delete would report success for keys we never forwarded.
-// Returns the body unchanged when no key-scoped feature is configured.
-func (h *Handler) rewriteDeleteObjectsBody(body []byte) ([]byte, error) {
-	if !h.rewritesDeleteObjects() {
-		return body, nil
-	}
-	keys, err := deleteObjectsKeys(body)
-	if err != nil {
-		return nil, err
-	}
-	for _, key := range keys {
-		if hasAnyPrefix(key, h.DenyKeyPrefixes) {
-			return nil, fmt.Errorf("%w: batch delete of key %q", errDeniedKeyPrefix, key)
-		}
-		if hasAnyPrefix(key, h.ReadOnlyKeyPrefixes) {
-			return nil, fmt.Errorf("%w: batch delete of key %q", errReadOnlyKeyPrefix, key)
-		}
-	}
-	if h.KeyPrefix == "" {
-		return body, nil
-	}
-	return prefixDeleteObjectsKeys(body, h.KeyPrefix), nil
-}
-
-// dropStaleBodyDigestHeaders removes the digest headers a client computed over
-// a body we replaced: the SigV4 payload hash and the flexible checksums.
-// copyHeaderWithoutOverwrite would otherwise copy them onto the upstream
-// request after signing, and the upstream would answer 400 BadDigest.
-// Content-Md5 is left to the caller, which recomputes it.
-func dropStaleBodyDigestHeaders(header http.Header) {
-	for name := range header {
-		if strings.HasPrefix(http.CanonicalHeaderKey(name), "X-Amz-Checksum-") {
-			header.Del(name)
-		}
-	}
-	header.Del("X-Amz-Sdk-Checksum-Algorithm")
-	header.Del("X-Amz-Trailer")
-	header.Del("X-Amz-Content-Sha256")
+	return h
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Deny enforcement, before anything else: any request — read or write —
-	// whose object key falls under a denied prefix is rejected up front and
-	// never signed or forwarded, regardless of the credentials it carries
-	// (fail closed). Denied keys are also hidden from listings by
-	// filterDeniedKeysFromListBody (via modifyResponse).
-	if h.isDeniedKeyPath(r.URL.Path) {
-		log.Warnf("deny key prefix: rejecting %s %s", r.Method, r.URL.Path)
-		w.WriteHeader(http.StatusForbidden)
-		if h.Debug {
-			w.Write([]byte("deny key prefix: access not allowed"))
-		}
+	start := time.Now()
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	entry := &accessLogEntry{method: r.Method, path: r.URL.Path}
+
+	proxyReq, st, err := h.prepare(rec, r, entry)
+	if err != nil || proxyReq == nil {
+		h.finishAccessLog(entry, rec, start)
 		return
 	}
 
-	// Read-only enforcement, before anything else: a mutating method is
-	// rejected up front and never signed or forwarded, regardless of the
-	// credentials it carries (fail closed).
-	if h.ReadOnly && !isReadMethod(r.Method) {
-		log.Warnf("read-only proxy: rejecting %s %s", r.Method, r.URL.Path)
-		w.WriteHeader(http.StatusForbidden)
-		if h.Debug {
-			w.Write([]byte("read-only proxy: method not allowed"))
-		}
-		return
+	h.Proxy.ServeHTTP(rec, proxyReq.WithContext(withRequestState(r.Context(), st)))
+	h.finishAccessLog(entry, rec, start)
+}
+
+// prepare runs the whole per-request lifecycle up to the point where the
+// request is ready to be forwarded: verify, resolve, inject, authorize,
+// re-sign. It returns (nil, nil, nil) when it has already answered the
+// request itself — a rejection, or a batch delete in which policy refused
+// every key.
+func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, entry *accessLogEntry) (*http.Request, *requestState, error) {
+	if err := h.validateIncomingSourceIP(r); err != nil {
+		h.reject(w, entry, http.StatusForbidden, "AccessDenied", err)
+		return nil, nil, err
 	}
 
-	// Per-prefix read-only enforcement: a mutating request whose object key
-	// falls under one of the protected prefixes is rejected up front, before
-	// it is signed or forwarded — independent of the credentials it carries
-	// (fail closed).
-	if !isReadMethod(r.Method) && h.isProtectedKeyPath(r.URL.Path) {
-		log.Warnf("read-only key prefix: rejecting %s %s", r.Method, r.URL.Path)
-		w.WriteHeader(http.StatusForbidden)
-		if h.Debug {
-			w.Write([]byte("read-only key prefix: write not allowed"))
-		}
-		return
-	}
-
-	proxyReq, err := h.buildUpstreamRequest(r)
+	// Classify before authenticating: an operation this proxy does not
+	// implement is refused whether or not the caller holds a valid
+	// credential, so an unsupported call can never fall through to the
+	// upstream by accident.
+	op, err := classifyRequest(r)
 	if err != nil {
-		// A violation found in the request body (batch delete) is the same
-		// fail-closed rejection as the path-based checks above.
-		if errors.Is(err, errDeniedKeyPrefix) || errors.Is(err, errReadOnlyKeyPrefix) {
-			log.Warnf("%v: rejecting %s %s", err, r.Method, r.URL.RequestURI())
-			w.WriteHeader(http.StatusForbidden)
-			if h.Debug {
-				w.Write([]byte(err.Error()))
-			}
-			return
+		status := http.StatusForbidden
+		if errors.Is(err, errInvalidKey) {
+			status = http.StatusBadRequest
 		}
-		log.WithError(err).Error("unable to proxy request")
-		w.WriteHeader(http.StatusBadRequest)
-
-		// for security reasons, only write detailed error information in debug mode
-		if h.Debug {
-			w.Write([]byte(err.Error()))
-		}
-		return
+		h.reject(w, entry, status, "AccessDenied", err)
+		return nil, nil, err
+	}
+	entry.operation = string(op.kind)
+	entry.key = op.key
+	if op.kind == opListObjects {
+		entry.key = op.listPrefix
 	}
 
-	url := url.URL{Scheme: proxyReq.URL.Scheme, Host: proxyReq.Host}
-	proxy := httputil.NewSingleHostReverseProxy(&url)
-	proxy.FlushInterval = 1
-	// Strip h.KeyPrefix from XML response bodies so the client view is
-	// fully transparent, and hide keys under any DenyKeyPrefixes from
-	// listings — see modifyResponse for the criteria.
-	proxy.ModifyResponse = h.modifyResponse
-	proxy.ServeHTTP(w, proxyReq)
-}
-
-func (h *Handler) sign(signer *v4.Signer, req *http.Request, region string) error {
-	return h.signWithTime(signer, req, region, time.Now())
-}
-
-func (h *Handler) signWithTime(signer *v4.Signer, req *http.Request, region string, signTime time.Time) error {
-	body := bytes.NewReader([]byte{})
-	if req.Body != nil {
-		b, err := ioutil.ReadAll(req.Body)
-		if err != nil {
-			return err
-		}
-		body = bytes.NewReader(b)
+	if h.ReadOnly && !isReadMethod(r.Method) {
+		err := fmt.Errorf("proxy is in read-only mode")
+		h.reject(w, entry, http.StatusForbidden, "AccessDenied", err)
+		return nil, nil, err
 	}
 
-	_, err := signer.Sign(req, body, "s3", region, signTime)
-	return err
-}
+	policy := h.Policy.Current()
+	identity, region, err := h.authenticate(policy, r)
+	if err != nil {
+		h.reject(w, entry, http.StatusForbidden, "AccessDenied", err)
+		return nil, nil, err
+	}
+	entry.tenant, entry.level = identity.Tenant, identity.Level
 
-func copyHeaderWithoutOverwrite(dst http.Header, src http.Header) {
-	for k, v := range src {
-		if _, ok := dst[k]; !ok {
-			for _, vv := range v {
-				dst.Add(k, vv)
-			}
+	st := &requestState{
+		policy:         policy,
+		identity:       identity,
+		operation:      op,
+		clientRegion:   region,
+		maxRewriteSize: h.MaxRewriteBodySize,
+	}
+
+	// A batch delete is authorized key by key inside prepareBody, because
+	// its keys live in the request body. Everything else has exactly one
+	// subject: the object key, or the prefix of a listing.
+	if op.kind != opDeleteObjects {
+		subject := op.key
+		if op.kind == opListObjects {
+			subject = op.listPrefix
+		}
+		decision := policy.Authorize(identity.Level, subject, r.Method)
+		entry.rule, entry.allowed = decision.Rule, decision.Allowed
+		if !decision.Allowed {
+			err := fmt.Errorf("policy denies %s on %q for level %q", r.Method, subject, identity.Level)
+			h.reject(w, entry, http.StatusForbidden, "AccessDenied", err)
+			return nil, nil, err
 		}
 	}
+
+	proxyReq, err := h.buildUpstreamRequest(r, st)
+	if op.kind == opDeleteObjects {
+		// A batch delete is authorized inside the body preparation, so its
+		// outcome only becomes known here.
+		entry.rule = st.rule
+		entry.deniedKeys = len(st.deniedDeletes)
+		entry.allowed = err == nil
+	}
+	if err != nil {
+		if errors.Is(err, errAllKeysDenied) {
+			// Nothing survived authorization, so there is no upstream call
+			// to make — answer with the per-key AccessDenied entries S3
+			// would have returned.
+			entry.reason = err.Error()
+			writeDeleteResult(w, st.deniedDeletes)
+			return nil, nil, nil
+		}
+		status := http.StatusBadRequest
+		code := "InvalidRequest"
+		if errors.Is(err, errUnsupportedOperation) {
+			status, code = http.StatusForbidden, "AccessDenied"
+		}
+		h.reject(w, entry, status, code, err)
+		return nil, nil, err
+	}
+	return proxyReq, st, nil
+}
+
+// reject answers a refused request. The body is an S3-shaped error so SDK
+// clients surface something meaningful; the internal reason is logged, and
+// only echoed to the client in debug mode.
+func (h *Handler) reject(w http.ResponseWriter, entry *accessLogEntry, status int, code string, err error) {
+	entry.allowed = false
+	entry.reason = err.Error()
+	message := "Access Denied."
+	if h.Debug {
+		message = err.Error()
+	}
+	writeS3Error(w, status, code, message)
+}
+
+// authenticate verifies the inbound SigV4 header signature and resolves the
+// identity behind it.
+//
+// The secret is never stored: it is recomputed from the pepper for this one
+// access-key id, the client's canonical request is reconstructed with it,
+// and the two Authorization headers are compared in constant time. An
+// anonymous request has no Authorization header and fails at the first
+// step; an unknown access-key id fails at resolution; a forged signature
+// fails at the comparison. All three are the same 403 to the client.
+func (h *Handler) authenticate(policy *Policy, req *http.Request) (*Identity, string, error) {
+	accessKeyID, region, err := h.validateIncomingHeaders(req)
+	if err != nil {
+		return nil, "", err
+	}
+
+	signTime, err := time.Parse("20060102T150405Z", req.Header["X-Amz-Date"][0])
+	if err != nil {
+		return nil, "", fmt.Errorf("malformed X-Amz-Date")
+	}
+	// A signature stays valid forever unless its timestamp is bounded, so a
+	// captured Authorization header could be replayed at will.
+	if skew := time.Since(signTime); skew > h.MaxClockSkew || skew < -h.MaxClockSkew {
+		return nil, "", fmt.Errorf("X-Amz-Date is outside the accepted clock skew of %s", h.MaxClockSkew)
+	}
+
+	identity, err := policy.ResolveIdentity(accessKeyID, h.Pepper)
+	if err != nil {
+		return nil, "", err
+	}
+
+	signer := v4.NewSigner(credentials.NewStaticCredentialsFromCreds(credentials.Value{
+		AccessKeyID:     accessKeyID,
+		SecretAccessKey: identity.SecretAccessKey,
+	}))
+	// Match how an S3 client signs: the canonical URI is the request path
+	// exactly as written on the wire, not that path escaped again.
+	signer.DisableURIPathEscaping = true
+	fakeReq, err := h.generateFakeIncomingRequest(signer, req, region, signTime)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// WORKAROUND S3CMD which dont use white space before the some commas in
+	// the authorization header.
+	authorizationStr := strings.Replace(req.Header["Authorization"][0], ",Signature", ", Signature", 1)
+	authorizationStr = strings.Replace(authorizationStr, ",SignedHeaders", ", SignedHeaders", 1)
+
+	if subtle.ConstantTimeCompare([]byte(fakeReq.Header.Get("Authorization")), []byte(authorizationStr)) == 0 {
+		// Deliberately no request dump here: it would carry the client's
+		// Authorization header — and therefore its signature — into the log
+		// at debug level.
+		return nil, "", fmt.Errorf("invalid signature in Authorization header")
+	}
+	return identity, region, nil
 }
 
 func (h *Handler) validateIncomingSourceIP(req *http.Request) error {
-	allowed := false
+	ip, _, _ := net.SplitHostPort(req.RemoteAddr)
+	userIP := net.ParseIP(ip)
 	for _, subnet := range h.AllowedSourceSubnet {
-		ip, _, _ := net.SplitHostPort(req.RemoteAddr)
-		userIP := net.ParseIP(ip)
 		if subnet.Contains(userIP) {
-			allowed = true
+			return nil
 		}
 	}
-	if !allowed {
-		return fmt.Errorf("source IP not allowed: %v", req)
-	}
-	return nil
+	return fmt.Errorf("source IP %s not allowed", ip)
 }
 
 func (h *Handler) validateIncomingHeaders(req *http.Request) (string, string, error) {
-	amzDateHeader := req.Header["X-Amz-Date"]
-	if len(amzDateHeader) != 1 {
-		return "", "", fmt.Errorf("X-Amz-Date header missing or set multiple times: %v", req)
+	if len(req.Header["X-Amz-Date"]) != 1 {
+		return "", "", fmt.Errorf("X-Amz-Date header missing or set multiple times")
 	}
-
-	authorizationHeader := req.Header["Authorization"]
-	if len(authorizationHeader) != 1 {
-		return "", "", fmt.Errorf("Authorization header missing or set multiple times: %v", req)
+	if len(req.Header["Authorization"]) != 1 {
+		return "", "", fmt.Errorf("Authorization header missing or set multiple times")
 	}
-	match := awsAuthorizationCredentialRegexp.FindStringSubmatch(authorizationHeader[0])
+	match := awsAuthorizationCredentialRegexp.FindStringSubmatch(req.Header["Authorization"][0])
 	if len(match) != 3 {
-		return "", "", fmt.Errorf("invalid Authorization header: Credential not found: %v", req)
+		return "", "", fmt.Errorf("invalid Authorization header: Credential not found")
 	}
-	receivedAccessKeyID := match[1]
-	region := match[2]
-
-	// Validate the received Credential (ACCESS_KEY_ID) is allowed
-	for accessKeyID := range h.AWSCredentials {
-		if subtle.ConstantTimeCompare([]byte(receivedAccessKeyID), []byte(accessKeyID)) == 1 {
-			return accessKeyID, region, nil
-		}
-	}
-	return "", "", fmt.Errorf("invalid AccessKeyID in Credential: %v", req)
+	return match[1], match[2], nil
 }
 
-func (h *Handler) generateFakeIncomingRequest(signer *v4.Signer, req *http.Request, region string) (*http.Request, error) {
+// generateFakeIncomingRequest rebuilds the canonical request the client
+// signed and signs it with the derived secret, so the two Authorization
+// headers can be compared.
+func (h *Handler) generateFakeIncomingRequest(signer *v4.Signer, req *http.Request, region string, signTime time.Time) (*http.Request, error) {
+	// req.URL.String() round-trips the path in exactly the form the client
+	// wrote it, which is the form it signed.
 	fakeReq, err := http.NewRequest(req.Method, req.URL.String(), nil)
 	if err != nil {
 		return nil, err
 	}
-	fakeReq.URL.RawPath = req.URL.Path
 
-	// We already validated there there is exactly one Authorization header
-	authorizationHeader := req.Header.Get("authorization")
-	match := awsAuthorizationSignedHeadersRegexp.FindStringSubmatch(authorizationHeader)
+	// We already validated that there is exactly one Authorization header.
+	match := awsAuthorizationSignedHeadersRegexp.FindStringSubmatch(req.Header.Get("authorization"))
 	if len(match) == 2 {
 		for _, header := range strings.Split(match[1], ";") {
 			fakeReq.Header.Set(header, req.Header.Get(header))
@@ -788,373 +415,125 @@ func (h *Handler) generateFakeIncomingRequest(signer *v4.Signer, req *http.Reque
 	fakeReq.Header.Del("host")
 	fakeReq.Host = h.AllowedSourceEndpoint
 
-	// The X-Amz-Date header contains a timestamp, such as: 20190929T182805Z
-	signTime, err := time.Parse("20060102T150405Z", req.Header["X-Amz-Date"][0])
-	if err != nil {
-		return nil, fmt.Errorf("error parsing X-Amz-Date %v - %v", req.Header["X-Amz-Date"][0], err)
-	}
-
-	// Sign the fake request with the original timestamp
-	if err := h.signWithTime(signer, fakeReq, region, signTime); err != nil {
+	// The body is never read here: whatever payload hash the client signed
+	// is among the signed headers we just copied, and the signer uses that
+	// header verbatim when it is present. Verification therefore costs
+	// nothing in memory, no matter how large the upload is.
+	if _, err := signer.Sign(fakeReq, nil, "s3", region, signTime); err != nil {
 		return nil, err
 	}
-
 	return fakeReq, nil
 }
 
-// isAwsChunkedUpload reports whether the incoming request carries an
-// aws-chunked (streaming) request body, identified by an x-amz-content-sha256
-// of STREAMING-… (the AWS SigV4 streaming-upload markers). DuckDB's httpfs and
-// the AWS SDKs use this for PUT / UploadPart bodies.
-func isAwsChunkedUpload(req *http.Request) bool {
-	if strings.HasPrefix(req.Header.Get("X-Amz-Content-Sha256"), "STREAMING-") {
-		return true
-	}
-	return strings.Contains(strings.ToLower(req.Header.Get("Content-Encoding")), "aws-chunked")
+// isReadMethod reports whether an HTTP method is a non-mutating S3 read.
+func isReadMethod(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead
 }
 
-// maxAwsChunkedTrailers bounds the trailing header lines we accept after the
-// final chunk. A real client sends one (the flexible checksum), two with a
-// trailer signature; the cap keeps a malformed or hostile stream from growing
-// the map without end.
-const maxAwsChunkedTrailers = 16
-
-// decodeAwsChunked decodes an aws-chunked body into the raw object content and
-// the trailing headers that follow it. Each chunk is
-// `<hex-size>[;chunk-signature=…]\r\n<size bytes>\r\n`; a zero-size chunk ends
-// the payload, after which `name:value` trailer lines run until an empty line
-// or the end of the stream. Per-chunk signatures
-// (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) are accepted and ignored — we only need
-// the payload bytes.
-//
-// The trailers matter: with STREAMING-UNSIGNED-PAYLOAD-TRAILER the client's
-// flexible checksum (x-amz-checksum-crc32 & co.) lives there and nowhere else,
-// so dropping it would either lose the integrity check or — worse — leave the
-// upstream waiting for a checksum that the de-chunked body no longer carries.
-// See checksumTrailers for what we do with them.
-func decodeAwsChunked(r io.Reader) ([]byte, http.Header, error) {
-	br := bufio.NewReader(r)
-	var out bytes.Buffer
-	for {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			return nil, nil, fmt.Errorf("reading chunk size: %w", err)
-		}
-		sizeField := strings.TrimRight(line, "\r\n")
-		if i := strings.IndexByte(sizeField, ';'); i >= 0 {
-			sizeField = sizeField[:i] // drop chunk extensions (e.g. chunk-signature)
-		}
-		size, err := strconv.ParseInt(strings.TrimSpace(sizeField), 16, 64)
-		if err != nil {
-			return nil, nil, fmt.Errorf("invalid chunk size %q: %w", sizeField, err)
-		}
-		if size == 0 {
-			trailers, terr := readAwsChunkedTrailers(br)
-			if terr != nil {
-				return nil, nil, terr
-			}
-			return out.Bytes(), trailers, nil
-		}
-		if _, err := io.CopyN(&out, br, size); err != nil {
-			return nil, nil, fmt.Errorf("reading chunk data: %w", err)
-		}
-		if _, err := br.Discard(2); err != nil { // consume the CRLF after chunk data
-			return nil, nil, fmt.Errorf("reading chunk terminator: %w", err)
-		}
+// buildUpstreamRequest injects the tenant prefix, prepares the body and
+// re-signs the request with the upstream credentials.
+func (h *Handler) buildUpstreamRequest(req *http.Request, st *requestState) (*http.Request, error) {
+	region := h.UpstreamRegion
+	if region == "" {
+		region = st.clientRegion
 	}
-}
-
-// readAwsChunkedTrailers reads the `name:value` lines that follow the final
-// (zero-size) chunk, up to the terminating empty line. A stream that simply
-// ends after the last trailer — no closing empty line — is accepted too, since
-// we have all the bytes either way.
-func readAwsChunkedTrailers(br *bufio.Reader) (http.Header, error) {
-	trailers := http.Header{}
-	for i := 0; ; i++ {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				addAwsChunkedTrailer(trailers, line)
-				return trailers, nil
-			}
-			return nil, fmt.Errorf("reading chunk trailer: %w", err)
-		}
-		if strings.TrimRight(line, "\r\n") == "" {
-			return trailers, nil
-		}
-		if i >= maxAwsChunkedTrailers {
-			return nil, fmt.Errorf("more than %d chunk trailers", maxAwsChunkedTrailers)
-		}
-		addAwsChunkedTrailer(trailers, line)
-	}
-}
-
-// addAwsChunkedTrailer parses one `name:value` trailer line into h. Lines
-// without a colon (or with an empty name) are skipped rather than rejected —
-// they carry nothing we act on.
-func addAwsChunkedTrailer(h http.Header, line string) {
-	field := strings.TrimRight(line, "\r\n")
-	i := strings.IndexByte(field, ':')
-	if i < 0 {
-		return
-	}
-	name := strings.TrimSpace(field[:i])
-	if name == "" {
-		return
-	}
-	h.Set(name, strings.TrimSpace(field[i+1:]))
-}
-
-// checksumTrailers picks the flexible-checksum trailers (x-amz-checksum-crc32,
-// -crc32c, -sha1, -sha256, …) out of a decoded aws-chunked body, so they can
-// travel upstream as ordinary headers. The value is the client's own digest of
-// the payload — computed over the object bytes, not over the chunk framing —
-// which is exactly what the upstream receives once the framing is gone, so the
-// end-to-end integrity check survives the re-signing.
-//
-// Everything else a client may append is dropped. x-amz-trailer-signature above
-// all: it signs the framing bytes with the client's key, and neither the bytes
-// nor the key exist on the upstream request.
-//
-// Returns nil when there is nothing to promote.
-func checksumTrailers(trailers http.Header) http.Header {
-	var out http.Header
-	for name, values := range trailers {
-		canonical := http.CanonicalHeaderKey(name)
-		if !strings.HasPrefix(canonical, "X-Amz-Checksum-") {
-			continue
-		}
-		if out == nil {
-			out = http.Header{}
-		}
-		out[canonical] = values
-	}
-	return out
-}
-
-// stripAwsChunkedEncoding removes the `aws-chunked` token from Content-Encoding
-// once the framing has been decoded, keeping any other encoding the client
-// applied underneath it (`aws-chunked,gzip` -> `gzip`; the payload really is
-// still gzipped). The header is dropped entirely when nothing else remains.
-func stripAwsChunkedEncoding(header http.Header) {
-	values, ok := header["Content-Encoding"]
-	if !ok {
-		return
-	}
-	var kept []string
-	for _, value := range values {
-		for _, token := range strings.Split(value, ",") {
-			token = strings.TrimSpace(token)
-			if token == "" || strings.EqualFold(token, "aws-chunked") {
-				continue
-			}
-			kept = append(kept, token)
-		}
-	}
-	if len(kept) == 0 {
-		header.Del("Content-Encoding")
-		return
-	}
-	header.Set("Content-Encoding", strings.Join(kept, ", "))
-}
-
-func (h *Handler) assembleUpstreamReq(signer *v4.Signer, req *http.Request, region string) (*http.Request, error) {
 	upstreamEndpoint := h.UpstreamEndpoint
-	if len(upstreamEndpoint) == 0 {
+	if upstreamEndpoint == "" {
+		// No configured endpoint: fall back to AWS S3 for the region the
+		// request is signed for, as the single-tenant proxy always did.
 		upstreamEndpoint = fmt.Sprintf("s3.%s.amazonaws.com", region)
-		log.Infof("Using %s as upstream endpoint", upstreamEndpoint)
 	}
 
 	proxyURL := *req.URL
 	proxyURL.Scheme = h.UpstreamScheme
 	proxyURL.Host = upstreamEndpoint
-	// Optionally confine the request to a fixed key prefix: prepend it to
-	// the object key, or — for a bucket-level listing — to the `prefix`
-	// query parameter. Both are no-ops when KeyPrefix is empty.
-	prefixedPath := h.injectKeyPrefix(req.URL.Path)
-	proxyURL.Path = prefixedPath
-	proxyURL.RawPath = prefixedPath
-	// A batch delete is bucket-level too, but a `prefix=` query parameter is
-	// meaningless there — only the body rewrite below confines it.
-	if isBucketLevelPath(req.URL.Path) && !isDeleteObjectsRequest(req) {
-		h.scopeListPrefix(&proxyURL)
-	}
-	// A client streaming an upload (e.g. DuckDB httpfs, the AWS SDKs) sends the
-	// body in `aws-chunked` form — `<hex-size>[;chunk-signature=…]\r\n<data>\r\n`
-	// repeated, ending `0\r\n…\r\n` — signalled by an `x-amz-content-sha256` of
-	// `STREAMING-…`. We re-sign the request with a plain payload hash, which
-	// drops the streaming semantics, so the upstream would store the *framed*
-	// bytes verbatim (corrupting the object: a parquet becomes
-	// `165D\r\nPAR1…\r\n\r\n`). Decode the framing here so the upstream receives
-	// the real content. Validation of the incoming signature already happened
-	// above against the original headers and is unaffected (the body is not part
-	// of a STREAMING canonical request).
-	//
-	// The framing can also carry the client's flexible checksum as a TRAILER
-	// after the last chunk — that is what `x-amz-trailer: x-amz-checksum-crc32`
-	// together with `STREAMING-UNSIGNED-PAYLOAD-TRAILER` announces, and it is the
-	// only place the checksum exists (the SDK cannot hash a stream up front, so
-	// it never sends an x-amz-checksum-… header). De-chunking removes those
-	// trailer bytes, so both the announcement and the digest have to be carried
-	// over by hand: x-amz-trailer must NOT reach the upstream — it would promise
-	// a trailing checksum that the decoded body no longer contains, and the
-	// upstream rejects the upload with "The provided 'x-amz-checksum' header does
-	// not match what was computed" — while the digest itself is re-attached below
-	// as a plain x-amz-checksum-… header on the upstream request.
-	body := req.Body
-	var checksumHeaders http.Header
-	if isAwsChunkedUpload(req) {
-		decoded, trailers, derr := decodeAwsChunked(req.Body)
-		if derr != nil {
-			return nil, fmt.Errorf("aws-chunked decode: %w", derr)
-		}
-		body = io.NopCloser(bytes.NewReader(decoded))
-		req.ContentLength = int64(len(decoded))
-		checksumHeaders = checksumTrailers(trailers)
-		// Strip the streaming markers so they are not copied upstream and the
-		// signer computes a normal payload hash over the decoded body.
-		stripAwsChunkedEncoding(req.Header)
-		req.Header.Del("X-Amz-Decoded-Content-Length")
-		req.Header.Del("X-Amz-Content-Sha256")
-		req.Header.Del("X-Amz-Trailer")
-	}
+	scopeToTenant(&proxyURL, st.identity.KeyPrefix, st.operation)
 
-	// A batch delete carries its object keys in the body, out of reach of
-	// injectKeyPrefix above — see rewriteDeleteObjectsBody. Runs after the
-	// aws-chunked decode so it operates on real XML.
-	if isDeleteObjectsRequest(req) && h.rewritesDeleteObjects() {
-		if body == nil {
-			body = http.NoBody
-		}
-		if req.ContentLength > maxDeleteObjectsBodySize {
-			return nil, fmt.Errorf("batch delete: request body exceeds %d bytes", maxDeleteObjectsBodySize)
-		}
-		// ContentLength is -1 when the client does not declare one, so the read
-		// itself is bounded too.
-		raw, err := io.ReadAll(io.LimitReader(body, maxDeleteObjectsBodySize+1))
-		if err != nil {
-			return nil, fmt.Errorf("batch delete: reading request body: %w", err)
-		}
-		if len(raw) > maxDeleteObjectsBodySize {
-			return nil, fmt.Errorf("batch delete: request body exceeds %d bytes", maxDeleteObjectsBodySize)
-		}
-		rewritten, err := h.rewriteDeleteObjectsBody(raw)
-		if err != nil {
-			return nil, err
-		}
-		body = io.NopCloser(bytes.NewReader(rewritten))
-		if !bytes.Equal(rewritten, raw) {
-			// S3 requires a Content-MD5 on a batch delete: recompute it for the
-			// new body and drop the client's other, now stale digests — including
-			// any checksum recovered from the aws-chunked trailers, which covers
-			// the pre-rewrite keys.
-			req.ContentLength = int64(len(rewritten))
-			checksumHeaders = nil
-			dropStaleBodyDigestHeaders(req.Header)
-			sum := md5.Sum(rewritten)
-			req.Header.Set("Content-Md5", base64.StdEncoding.EncodeToString(sum[:]))
-		}
-	}
-
-	proxyReq, err := http.NewRequest(req.Method, proxyURL.String(), body)
+	body, payloadHash, err := h.prepareBody(req, st)
 	if err != nil {
 		return nil, err
 	}
-	proxyReq.ContentLength = req.ContentLength
+
+	proxyReq, err := http.NewRequest(req.Method, proxyURL.String(), body.reader)
+	if err != nil {
+		return nil, err
+	}
+	proxyReq.ContentLength = body.contentLength
 	if val, ok := req.Header["Content-Type"]; ok {
 		proxyReq.Header["Content-Type"] = val
 	}
 	if val, ok := req.Header["Content-Md5"]; ok {
 		proxyReq.Header["Content-Md5"] = val
 	}
-	// Re-attach a checksum the client sent as a trailer of the aws-chunked body
-	// (see above). Set before signing so it is covered by the upstream
-	// signature, exactly like the header a non-streaming client would send.
-	for name, values := range checksumHeaders {
+	for name, values := range body.extraHeaders {
 		proxyReq.Header[name] = values
 	}
+	// Set before signing so the signer adopts this digest instead of
+	// reading the body to compute one — that read is what would otherwise
+	// pull an entire upload into memory.
+	proxyReq.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
-	// Sign the upstream request — with the dedicated upstream credentials
-	// when configured, otherwise with the client's (the default). The
-	// region is the client's unless an upstream region is configured.
-	upstreamSigner := signer
-	if h.UpstreamSigner != nil {
-		upstreamSigner = h.UpstreamSigner
-	}
-	upstreamRegion := region
-	if h.UpstreamRegion != "" {
-		upstreamRegion = h.UpstreamRegion
-	}
-	if err := h.sign(upstreamSigner, proxyReq, upstreamRegion); err != nil {
+	// The signer attaches whatever body it was handed to the request, and
+	// we hand it none on purpose — so that it adopts the payload hash set
+	// above instead of reading the upload to compute one. Put the real body
+	// back afterwards.
+	signedBody, signedLength := proxyReq.Body, proxyReq.ContentLength
+	if _, err := h.UpstreamSigner.Sign(proxyReq, nil, "s3", region, time.Now()); err != nil {
 		return nil, err
 	}
+	proxyReq.Body, proxyReq.ContentLength = signedBody, signedLength
 
-	// Add origin headers after request is signed (no overwrite)
+	// Add origin headers after the request is signed (no overwrite).
 	copyHeaderWithoutOverwrite(proxyReq.Header, req.Header)
+	// The client's own credential must never travel upstream — the
+	// upstream signature replaced it.
+	proxyReq.Header.Del("X-Amz-Decoded-Content-Length")
 
 	return proxyReq, nil
 }
 
-// Do validates the incoming request and create a new request for an upstream server
-func (h *Handler) buildUpstreamRequest(req *http.Request) (*http.Request, error) {
-	// Ensure the request was sent from an allowed IP address
-	err := h.validateIncomingSourceIP(req)
-	if err != nil {
-		return nil, err
+// scopeToTenant is the whole isolation mechanism: the tenant's key prefix
+// is *injected* here, never validated against something the client sent. A
+// client cannot express a path outside its own scope, because the scope is
+// not part of the request it makes.
+//
+// It covers the object key and, for a listing, the parameters that name
+// keys: `prefix`, `marker` (ListObjects v1) and `start-after`
+// (ListObjectsV2).
+//
+// `continuation-token` is deliberately forwarded verbatim. It is an opaque
+// value the upstream minted for an already-scoped listing — prefixing it
+// would corrupt it (and with it, pagination), while forwarding it is safe
+// precisely because the client could not have obtained a token for any
+// other scope.
+func scopeToTenant(u *url.URL, keyPrefix string, op *operation) {
+	if op.isBucketLevel() {
+		if op.kind != opListObjects {
+			return
+		}
+		q := u.Query()
+		q.Set("prefix", keyPrefix+op.listPrefix)
+		for _, param := range []string{"marker", "start-after"} {
+			if v := q.Get(param); v != "" {
+				q.Set(param, keyPrefix+v)
+			}
+		}
+		u.RawQuery = q.Encode()
+		return
 	}
+	// The key prefix is restricted to characters that need no escaping
+	// (see validateRenderedKeyPrefix), so the decoded and the as-written
+	// path stay in agreement.
+	u.Path = "/" + op.bucket + "/" + keyPrefix + op.key
+	u.RawPath = "/" + op.bucket + "/" + keyPrefix + op.escapedKey
+}
 
-	// Validate incoming headers and extract AWS_ACCESS_KEY_ID
-	accessKeyID, region, err := h.validateIncomingHeaders(req)
-	if err != nil {
-		return nil, err
+func copyHeaderWithoutOverwrite(dst http.Header, src http.Header) {
+	for k, v := range src {
+		if _, ok := dst[k]; !ok {
+			for _, vv := range v {
+				dst.Add(k, vv)
+			}
+		}
 	}
-
-	// Get the AWS Signature signer for this AccessKey
-	signer := h.Signers[accessKeyID]
-
-	// Assemble a signed fake request to verify the incoming requests signature
-	fakeReq, err := h.generateFakeIncomingRequest(signer, req, region)
-	if err != nil {
-		return nil, err
-	}
-
-	// WORKAROUND S3CMD which dont use white space before the some commas in the authorization header
-	fakeAuthorizationStr := fakeReq.Header.Get("Authorization")
-	// Sanitize fakeReq to add white spaces after the comma signature if missing
-	authorizationStr := strings.Replace(req.Header["Authorization"][0], ",Signature", ", Signature", 1)
-	// Sanitize fakeReq to add white spaces after the comma signheaders if missing
-	authorizationStr = strings.Replace(authorizationStr, ",SignedHeaders", ", SignedHeaders", 1)
-
-	// Verify that the fake request and the incoming request have the same signature
-	// This ensures it was sent and signed by a client with correct AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-	cmpResult := subtle.ConstantTimeCompare([]byte(fakeAuthorizationStr), []byte(authorizationStr))
-	if cmpResult == 0 {
-		v, _ := httputil.DumpRequest(fakeReq, false)
-		log.Debugf("Fake request: %v", string(v))
-
-		v, _ = httputil.DumpRequest(req, false)
-		log.Debugf("Incoming request: %v", string(v))
-		return nil, fmt.Errorf("invalid signature in Authorization header")
-	}
-
-	if log.GetLevel() == log.DebugLevel {
-		initialReqDump, _ := httputil.DumpRequest(req, false)
-		log.Debugf("Initial request dump: %v", string(initialReqDump))
-	}
-
-	// Assemble a new upstream request
-	proxyReq, err := h.assembleUpstreamReq(signer, req, region)
-	if err != nil {
-		return nil, err
-	}
-
-	// Disable Go's "Transfer-Encoding: chunked" madness
-	proxyReq.ContentLength = req.ContentLength
-
-	if log.GetLevel() == log.DebugLevel {
-		proxyReqDump, _ := httputil.DumpRequest(proxyReq, false)
-		log.Debugf("Proxying request: %v", string(proxyReqDump))
-	}
-
-	return proxyReq, nil
 }

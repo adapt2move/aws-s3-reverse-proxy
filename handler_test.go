@@ -10,679 +10,552 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
+	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// func TestMain(m *testing.M) {
-// 	log.SetOutput(ioutil.Discard)
-// }
+// testPolicyYAML is the policy from the design, verbatim: a writable
+// dataset area, a read-only carve-out nested *inside* a writable workspace
+// tree, and the broader workspace rule after it. The ordering is the point
+// — see TestPolicyNestedCarveOut.
+const testPolicyYAML = `
+identity:
+  accessKeyIdPattern: '^(?P<tenant>[0-9a-f]{32})(?P<level>ro|rw|rws)$'
+  secretTemplate: '{tenant}:{level}'
+  keyPrefixTemplate: '{tenant}/'
 
-func newTestProxy(t *testing.T) *Handler {
-	thf := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "Hello, client")
-	})
-	return newTestProxyWithHandler(t, &thf)
+levels: [ro, rw, rws]
+
+rules:
+  - pathPattern: 'datasets/**'
+    grant: { ro: read, rw: full, rws: full }
+
+  - pathPattern: 'workspaces/*/inbox/**'
+    grant: { ro: read, rw: read, rws: read }
+
+  - pathPattern: 'workspaces/**'
+    grant: { ro: full, rw: full, rws: full }
+`
+
+const (
+	tenantA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	tenantB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	testEndpoint = "s3.proxy.example.com:8099"
+	testRegion   = "eu-central-1"
+)
+
+var testPepper = []byte("a-deployment-wide-pepper-value")
+
+func init() {
+	// The access log is noise in test output; failures are asserted on, not
+	// read.
+	log.SetLevel(log.PanicLevel)
 }
 
-func newTestProxyWithHandler(t *testing.T, thf *http.HandlerFunc) *Handler {
-	ts := httptest.NewServer(thf)
-	tsURL, _ := url.Parse(ts.URL)
-
-	h, err := NewAwsS3ReverseProxy(Options{
-		Debug:                 true,
-		AllowedSourceEndpoint: "foobar.example.com",
-		AllowedSourceSubnet:   []string{"0.0.0.0/0"},
-		AwsCredentials:        []string{"fooooooooooooooo,bar"},
-		Region:                "eu-test-1",
-		UpstreamInsecure:      true,
-		UpstreamEndpoint:      tsURL.Host,
-	})
-	assert.Nil(t, err)
-	return h
+func mustPolicy(t testing.TB) *Policy {
+	t.Helper()
+	policy, err := ParsePolicy([]byte(testPolicyYAML))
+	require.NoError(t, err)
+	return policy
 }
 
-func signRequest(r *http.Request) {
-	// delete headers to get clean signature
-	r.Header.Del("accept-encoding")
-	r.Header.Del("authorization")
-	r.Header.Set("X-Amz-Date", "20060102T150405Z")
-	r.URL.RawPath = r.URL.Path
+// fakeUpstream stands in for the object store. It records what the proxy
+// actually forwarded — the assertions about prefix injection and re-signing
+// are all made against these recordings.
+type fakeUpstream struct {
+	mu       sync.Mutex
+	requests []recordedRequest
+	respond  func(w http.ResponseWriter, r *http.Request)
+	server   *httptest.Server
+}
 
-	// compute the expected signature with valid credentials
-	body := bytes.NewReader([]byte{})
-	signTime, _ := time.Parse("20060102T150405Z", r.Header["X-Amz-Date"][0])
-	signer := v4.NewSigner(credentials.NewStaticCredentialsFromCreds(credentials.Value{
-		AccessKeyID:     "fooooooooooooooo",
-		SecretAccessKey: "bar",
+type recordedRequest struct {
+	method string
+	path   string
+	query  url.Values
+	header http.Header
+	body   string
+}
+
+func newFakeUpstream(t *testing.T) *fakeUpstream {
+	u := &fakeUpstream{}
+	u.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		u.mu.Lock()
+		u.requests = append(u.requests, recordedRequest{
+			method: r.Method,
+			path:   r.URL.Path,
+			query:  r.URL.Query(),
+			header: r.Header.Clone(),
+			body:   string(body),
+		})
+		respond := u.respond
+		u.mu.Unlock()
+		if respond != nil {
+			respond(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	}))
-	signer.Sign(r, body, "s3", "eu-test-1", signTime)
+	t.Cleanup(u.server.Close)
+	return u
 }
 
-func verifySignature(w http.ResponseWriter, r *http.Request) {
-	// save copy of the received signature
-	receivedAuthorization := r.Header["Authorization"][0]
+func (u *fakeUpstream) last(t *testing.T) recordedRequest {
+	t.Helper()
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	require.NotEmpty(t, u.requests, "the proxy did not forward anything upstream")
+	return u.requests[len(u.requests)-1]
+}
 
-	// delete headers to get clean signature
-	r.Header.Del("accept-encoding")
-	r.Header.Del("authorization")
+func (u *fakeUpstream) count() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return len(u.requests)
+}
 
-	// compute the expected signature with valid credentials
-	body := bytes.NewReader([]byte{})
-	signTime, _ := time.Parse("20060102T150405Z", r.Header["X-Amz-Date"][0])
-	signer := v4.NewSigner(credentials.NewStaticCredentialsFromCreds(credentials.Value{
-		AccessKeyID:     "fooooooooooooooo",
-		SecretAccessKey: "bar",
-	}))
-	signer.Sign(r, body, "s3", "eu-test-1", signTime)
-	expectedAuthorization := r.Header["Authorization"][0]
+// newTestProxy builds a handler wired to a fake upstream, with the same
+// defaults main() applies.
+func newTestProxy(t *testing.T) (*Handler, *fakeUpstream) {
+	t.Helper()
+	upstream := newFakeUpstream(t)
+	h := NewHandler(&Handler{
+		UpstreamScheme:        "http",
+		UpstreamEndpoint:      strings.TrimPrefix(upstream.server.URL, "http://"),
+		AllowedSourceEndpoint: testEndpoint,
+		AllowedSourceSubnet:   testSubnets(t, "0.0.0.0/0"),
+		Policy:                NewStaticPolicyStore(mustPolicy(t)),
+		Pepper:                testPepper,
+		UpstreamSigner: v4.NewSigner(credentials.NewStaticCredentialsFromCreds(credentials.Value{
+			AccessKeyID:     "UPSTREAMKEYID",
+			SecretAccessKey: "upstream-secret",
+		})),
+		UpstreamRegion:     testRegion,
+		MaxClockSkew:       15 * time.Minute,
+		MaxChunkedBodySize: 1 << 20,
+		MaxDeleteBodySize:  1 << 20,
+		MaxRewriteBodySize: 1 << 20,
+	})
+	return h, upstream
+}
 
-	// WORKAROUND S3CMD who dont use white space before the comma in the authorization header
-	// Sanitize fakeReq to remove white spaces before the comma signature
-	receivedAuthorization = strings.Replace(receivedAuthorization, ",Signature", ", Signature", 1)
-	// Sanitize fakeReq to remove white spaces before the comma signheaders
-	receivedAuthorization = strings.Replace(receivedAuthorization, ",SignedHeaders", ", SignedHeaders", 1)
+func accessKeyFor(tenant, level string) string { return tenant + level }
 
-	// verify signature
-	fmt.Fprintln(w, receivedAuthorization, expectedAuthorization)
-	if receivedAuthorization == expectedAuthorization {
-		fmt.Fprintln(w, "ok")
-	} else {
-		fmt.Fprintln(w, "failed signature check")
+func secretFor(tenant, level string) string {
+	return deriveSecret(testPepper, tenant+":"+level)
+}
+
+// clientRequest is a request as a real S3 client would send it: signed with
+// SigV4 over the derived secret, addressed to the proxy's endpoint.
+type clientRequest struct {
+	method   string
+	target   string
+	body     []byte
+	tenant   string
+	level    string
+	headers  http.Header
+	signTime time.Time
+
+	// accessKeyID overrides the id derived from tenant+level, for the
+	// forged-credential cases.
+	accessKeyID string
+	// secret overrides the derived secret, for the forged-signature cases.
+	secret string
+	// unsigned skips signing entirely (anonymous request).
+	unsigned bool
+}
+
+func (c clientRequest) build(t *testing.T) *http.Request {
+	t.Helper()
+	var body io.Reader
+	if c.body != nil {
+		body = bytes.NewReader(c.body)
 	}
-}
+	req := httptest.NewRequest(c.method, c.target, body)
+	req.Host = testEndpoint
+	req.RemoteAddr = "10.1.2.3:54321"
+	for name, values := range c.headers {
+		req.Header[http.CanonicalHeaderKey(name)] = values
+	}
+	if c.unsigned {
+		return req
+	}
 
-func TestHandlerMissingAmzDate(t *testing.T) {
-	h := newTestProxy(t)
-
-	req := httptest.NewRequest(http.MethodGet, "http://foobar.example.com", nil)
-	resp := httptest.NewRecorder()
-	h.ServeHTTP(resp, req)
-	assert.Equal(t, 400, resp.Code)
-	assert.Contains(t, resp.Body.String(), "X-Amz-Date header missing or set multiple times")
-}
-
-func TestHandlerMissingAuthorization(t *testing.T) {
-	h := newTestProxy(t)
-
-	req := httptest.NewRequest(http.MethodGet, "http://foobar.example.com", nil)
-	req.Header.Set("X-Amz-Date", "20060102T150405Z")
-	resp := httptest.NewRecorder()
-	h.ServeHTTP(resp, req)
-	assert.Equal(t, 400, resp.Code)
-	assert.Contains(t, resp.Body.String(), "Authorization header missing or set multiple times")
-}
-
-func TestHandlerMissingCredential(t *testing.T) {
-	h := newTestProxy(t)
-
-	req := httptest.NewRequest(http.MethodGet, "http://foobar.example.com", nil)
-	req.Header.Set("X-Amz-Date", "20060102T150405Z")
-	req.Header.Set("Authorization", "foobar")
-	resp := httptest.NewRecorder()
-	h.ServeHTTP(resp, req)
-	assert.Equal(t, 400, resp.Code)
-	assert.Contains(t, resp.Body.String(), "invalid Authorization header: Credential not found")
-}
-
-func TestHandlerInvalidSignature(t *testing.T) {
-	h := newTestProxy(t)
-
-	req := httptest.NewRequest(http.MethodGet, "http://foobar.example.com", nil)
-	req.Header.Set("X-Amz-Date", "20060102T150405Z")
-	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=fooooooooooooooo/20190101/eu-test-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=some-signature")
-	resp := httptest.NewRecorder()
-	h.ServeHTTP(resp, req)
-	assert.Equal(t, 400, resp.Code)
-	assert.Contains(t, resp.Body.String(), "invalid signature in Authorization header")
-}
-
-func TestHandlerValidSignature(t *testing.T) {
-	h := newTestProxy(t)
-
-	req := httptest.NewRequest(http.MethodGet, "http://foobar.example.com", nil)
-	signRequest(req)
-	resp := httptest.NewRecorder()
-	h.ServeHTTP(resp, req)
-	assert.Equal(t, 200, resp.Code)
-	assert.Contains(t, resp.Body.String(), "Hello, client")
-}
-func TestDecodeAwsChunkedUnsigned(t *testing.T) {
-	// STREAMING-UNSIGNED-PAYLOAD-TRAILER: plain `<hex>\r\n<data>\r\n` per chunk,
-	// terminated by `0\r\n\r\n` — exactly the framing seen baked into the corrupt
-	// parquet objects (`165D\r\nPAR1…\r\n\r\n`).
-	payload := bytes.Repeat([]byte("PAR1-payload-bytes-"), 500) // ~9.5 KB, multi-read
-	var body bytes.Buffer
-	fmt.Fprintf(&body, "%x\r\n", len(payload))
-	body.Write(payload)
-	body.WriteString("\r\n0\r\n\r\n")
-
-	got, trailers, err := decodeAwsChunked(bytes.NewReader(body.Bytes()))
+	if req.Header.Get("X-Amz-Content-Sha256") == "" {
+		sum := sha256.Sum256(c.body)
+		req.Header.Set("X-Amz-Content-Sha256", hex.EncodeToString(sum[:]))
+	}
+	accessKeyID := c.accessKeyID
+	if accessKeyID == "" {
+		accessKeyID = accessKeyFor(c.tenant, c.level)
+	}
+	secret := c.secret
+	if secret == "" {
+		secret = secretFor(c.tenant, c.level)
+	}
+	signTime := c.signTime
+	if signTime.IsZero() {
+		signTime = time.Now()
+	}
+	signer := v4.NewSigner(credentials.NewStaticCredentialsFromCreds(credentials.Value{
+		AccessKeyID:     accessKeyID,
+		SecretAccessKey: secret,
+	}))
+	// The AWS SDKs sign S3 requests without escaping the canonical URI a
+	// second time; a test client that did otherwise would not exercise what
+	// real clients send.
+	signer.DisableURIPathEscaping = true
+	_, err := signer.Sign(req, bytes.NewReader(c.body), "s3", testRegion, signTime)
 	require.NoError(t, err)
-	require.Equal(t, payload, got)
-	require.Empty(t, trailers)
+	return req
 }
 
-func TestDecodeAwsChunkedSignedMultiChunk(t *testing.T) {
-	// STREAMING-AWS4-HMAC-SHA256-PAYLOAD: each size line carries a
-	// `;chunk-signature=…` extension we must ignore. Two data chunks.
-	c1 := bytes.Repeat([]byte("A"), 17)
-	c2 := bytes.Repeat([]byte("B"), 9)
-	var body bytes.Buffer
-	fmt.Fprintf(&body, "%x;chunk-signature=%064x\r\n", len(c1), 1)
-	body.Write(c1)
-	body.WriteString("\r\n")
-	fmt.Fprintf(&body, "%x;chunk-signature=%064x\r\n", len(c2), 2)
-	body.Write(c2)
-	body.WriteString("\r\n")
-	body.WriteString("0;chunk-signature=" + strings.Repeat("0", 64) + "\r\n\r\n")
-
-	got, _, err := decodeAwsChunked(bytes.NewReader(body.Bytes()))
-	require.NoError(t, err)
-	require.Equal(t, append(append([]byte{}, c1...), c2...), got)
+func do(t *testing.T, h *Handler, c clientRequest) *httptest.ResponseRecorder {
+	t.Helper()
+	return doRequest(t, h, c.build(t))
 }
 
-// STREAMING-UNSIGNED-PAYLOAD-TRAILER, the @aws-sdk/client-s3 default for a
-// stream body: the flexible checksum is a TRAILER after the final chunk, not a
-// header. It has to survive the decode or the integrity check is lost.
-func TestDecodeAwsChunkedReadsChecksumTrailer(t *testing.T) {
-	payload := []byte("PAR1-payload")
-	var body bytes.Buffer
-	fmt.Fprintf(&body, "%x\r\n", len(payload))
-	body.Write(payload)
-	body.WriteString("\r\n0\r\n")
-	body.WriteString("x-amz-checksum-crc32:sOO8/Q==\r\n\r\n")
-
-	got, trailers, err := decodeAwsChunked(bytes.NewReader(body.Bytes()))
-	require.NoError(t, err)
-	require.Equal(t, payload, got)
-	require.Equal(t, "sOO8/Q==", trailers.Get("x-amz-checksum-crc32"))
+func doRequest(t *testing.T, h *Handler, req *http.Request) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
 }
 
-// A trailer signature (STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER) is parsed
-// like any other trailer but must never be promoted to an upstream header — it
-// signs framing bytes the upstream never sees, with a key it does not hold.
-func TestChecksumTrailersKeepsOnlyChecksums(t *testing.T) {
-	trailers := http.Header{}
-	trailers.Set("x-amz-checksum-crc32", "sOO8/Q==")
-	trailers.Set("x-amz-trailer-signature", strings.Repeat("a", 64))
+func TestReadWriteDeleteRoundTrip(t *testing.T) {
+	h, upstream := newTestProxy(t)
 
-	got := checksumTrailers(trailers)
-	require.Equal(t, "sOO8/Q==", got.Get("X-Amz-Checksum-Crc32"))
-	require.Empty(t, got.Get("X-Amz-Trailer-Signature"))
-	require.Len(t, got, 1)
+	t.Run("get injects the tenant prefix", func(t *testing.T) {
+		rec := do(t, h, clientRequest{
+			method: http.MethodGet, target: "/bucket/datasets/2026/a.parquet",
+			tenant: tenantA, level: "ro",
+		})
+		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, "/bucket/"+tenantA+"/datasets/2026/a.parquet", upstream.last(t).path)
+	})
 
-	require.Nil(t, checksumTrailers(http.Header{}), "nothing to promote -> nil")
+	t.Run("put with a real payload hash is forwarded verbatim", func(t *testing.T) {
+		payload := []byte("column,value\n1,2\n")
+		rec := do(t, h, clientRequest{
+			method: http.MethodPut, target: "/bucket/datasets/2026/b.csv",
+			body: payload, tenant: tenantA, level: "rw",
+		})
+		assert.Equal(t, http.StatusOK, rec.Code)
+
+		got := upstream.last(t)
+		assert.Equal(t, "/bucket/"+tenantA+"/datasets/2026/b.csv", got.path)
+		assert.Equal(t, string(payload), got.body)
+
+		// The client's own digest describes the bytes we forwarded, so it
+		// travels on untouched — no buffering, integrity preserved.
+		sum := sha256.Sum256(payload)
+		assert.Equal(t, hex.EncodeToString(sum[:]), got.header.Get("X-Amz-Content-Sha256"))
+		// ... and the upstream signature is the proxy's, not the client's.
+		assert.Contains(t, got.header.Get("Authorization"), "Credential=UPSTREAMKEYID/")
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		rec := do(t, h, clientRequest{
+			method: http.MethodDelete, target: "/bucket/datasets/2026/b.csv",
+			tenant: tenantA, level: "rw",
+		})
+		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, http.MethodDelete, upstream.last(t).method)
+	})
+
+	t.Run("a read-only level cannot write", func(t *testing.T) {
+		before := upstream.count()
+		rec := do(t, h, clientRequest{
+			method: http.MethodPut, target: "/bucket/datasets/2026/c.csv",
+			body: []byte("x"), tenant: tenantA, level: "ro",
+		})
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Contains(t, rec.Body.String(), "AccessDenied")
+		assert.Equal(t, before, upstream.count(), "the request must not reach the upstream")
+	})
 }
 
-func TestStripAwsChunkedEncoding(t *testing.T) {
-	for _, tc := range []struct {
-		in, want string
+func TestMultipartRequiresFullPermission(t *testing.T) {
+	h, upstream := newTestProxy(t)
+
+	steps := []struct {
+		name   string
+		method string
+		target string
+		body   []byte
 	}{
-		{"aws-chunked", ""},
-		{"AWS-CHUNKED", ""},
-		{"aws-chunked,gzip", "gzip"},
-		{"gzip, aws-chunked", "gzip"},
-		{"gzip", "gzip"},
-	} {
-		h := http.Header{}
-		h.Set("Content-Encoding", tc.in)
-		stripAwsChunkedEncoding(h)
-		require.Equal(t, tc.want, h.Get("Content-Encoding"), "input %q", tc.in)
+		{"initiate", http.MethodPost, "/bucket/datasets/big.parquet?uploads", nil},
+		{"upload part", http.MethodPut, "/bucket/datasets/big.parquet?partNumber=1&uploadId=abc", []byte("part")},
+		{"complete", http.MethodPost, "/bucket/datasets/big.parquet?uploadId=abc", []byte("<CompleteMultipartUpload/>")},
+		{"abort", http.MethodDelete, "/bucket/datasets/big.parquet?uploadId=abc", nil},
+		{"list parts", http.MethodGet, "/bucket/datasets/big.parquet?uploadId=abc", nil},
 	}
-}
 
-// The wiring: assembleUpstreamReq must hand the UPSTREAM request a DECODED body
-// (and drop the streaming markers) when the incoming PUT is aws-chunked — so the
-// object stored upstream is the real content, not the framed bytes.
-func TestAssembleUpstreamReqDecodesChunkedBody(t *testing.T) {
-	h := newTestProxy(t)
-	payload := []byte("PAR1-the-real-object-content-PAR1")
-	var framed bytes.Buffer
-	fmt.Fprintf(&framed, "%x\r\n", len(payload))
-	framed.Write(payload)
-	framed.WriteString("\r\n0\r\n\r\n")
-
-	req := httptest.NewRequest(http.MethodPut, "http://foobar.example.com/bucket/key", bytes.NewReader(framed.Bytes()))
-	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
-	req.Header.Set("Content-Encoding", "aws-chunked")
-	req.Header.Set("X-Amz-Decoded-Content-Length", "33")
-
-	var signer *v4.Signer
-	for _, s := range h.Signers {
-		signer = s
+	for _, step := range steps {
+		t.Run(step.name+" is allowed for a full level", func(t *testing.T) {
+			rec := do(t, h, clientRequest{
+				method: step.method, target: step.target, body: step.body,
+				tenant: tenantA, level: "rw",
+			})
+			assert.Equal(t, http.StatusOK, rec.Code)
+			assert.Equal(t, "/bucket/"+tenantA+"/datasets/big.parquet", upstream.last(t).path)
+		})
 	}
-	up, err := h.assembleUpstreamReq(signer, req, "eu-test-1")
-	require.NoError(t, err)
 
-	gotBody, _ := io.ReadAll(up.Body)
-	require.Equal(t, payload, gotBody, "upstream must receive the decoded object, not the chunk-framed body")
-	require.Equal(t, int64(len(payload)), up.ContentLength)
-	require.Empty(t, up.Header.Get("Content-Encoding"), "aws-chunked marker must not be forwarded")
-	require.Empty(t, up.Header.Get("X-Amz-Decoded-Content-Length"))
-}
-
-// The regression: an @aws-sdk/client-s3 PutObject with a stream body sends the
-// checksum in a trailer and announces it with x-amz-trailer. Once the proxy
-// de-chunks the body those trailer bytes are gone, so forwarding x-amz-trailer
-// promises the upstream a checksum it will never receive — MinIO answers "The
-// provided 'x-amz-checksum' header does not match what was computed". The
-// announcement must be dropped and the digest re-attached as a plain header.
-func TestAssembleUpstreamReqPromotesChecksumTrailer(t *testing.T) {
-	h := newTestProxy(t)
-	payload := []byte("PAR1-the-real-object-content-PAR1")
-	var framed bytes.Buffer
-	fmt.Fprintf(&framed, "%x\r\n", len(payload))
-	framed.Write(payload)
-	framed.WriteString("\r\n0\r\n")
-	framed.WriteString("x-amz-checksum-crc32:sOO8/Q==\r\n\r\n")
-
-	req := httptest.NewRequest(http.MethodPut, "http://foobar.example.com/bucket/key", bytes.NewReader(framed.Bytes()))
-	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
-	req.Header.Set("Content-Encoding", "aws-chunked")
-	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(payload)))
-	req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32")
-	req.Header.Set("X-Amz-Sdk-Checksum-Algorithm", "CRC32")
-
-	var signer *v4.Signer
-	for _, s := range h.Signers {
-		signer = s
-	}
-	up, err := h.assembleUpstreamReq(signer, req, "eu-test-1")
-	require.NoError(t, err)
-
-	gotBody, _ := io.ReadAll(up.Body)
-	require.Equal(t, payload, gotBody)
-	require.Empty(t, up.Header.Get("X-Amz-Trailer"), "a trailer that no longer exists must not be announced upstream")
-	require.Equal(t, "sOO8/Q==", up.Header.Get("X-Amz-Checksum-Crc32"), "the client's digest must travel upstream as a header")
-	// Promoted before signing, so the upstream signature covers it.
-	require.Contains(t, up.Header.Get("Authorization"), "x-amz-checksum-crc32")
-	// The payload hash is a real digest of the decoded body now, not a marker.
-	require.NotContains(t, up.Header.Get("X-Amz-Content-Sha256"), "STREAMING-")
-	sum := sha256.Sum256(payload)
-	require.Equal(t, hex.EncodeToString(sum[:]), up.Header.Get("X-Amz-Content-Sha256"))
-}
-
-func TestIsAwsChunkedUpload(t *testing.T) {
-	mk := func(sha, enc string) *http.Request {
-		r := httptest.NewRequest(http.MethodPut, "http://h/bucket/key", nil)
-		if sha != "" {
-			r.Header.Set("X-Amz-Content-Sha256", sha)
+	for _, step := range steps {
+		if step.method == http.MethodGet {
+			continue // ListParts is a read, and `read` grants it
 		}
-		if enc != "" {
-			r.Header.Set("Content-Encoding", enc)
-		}
-		return r
+		t.Run(step.name+" is refused for a read-only level", func(t *testing.T) {
+			before := upstream.count()
+			rec := do(t, h, clientRequest{
+				method: step.method, target: step.target, body: step.body,
+				tenant: tenantA, level: "ro",
+			})
+			assert.Equal(t, http.StatusForbidden, rec.Code)
+			assert.Equal(t, before, upstream.count())
+		})
 	}
-	require.True(t, isAwsChunkedUpload(mk("STREAMING-UNSIGNED-PAYLOAD-TRAILER", "")))
-	require.True(t, isAwsChunkedUpload(mk("STREAMING-AWS4-HMAC-SHA256-PAYLOAD", "")))
-	require.True(t, isAwsChunkedUpload(mk("", "aws-chunked")))
-	require.False(t, isAwsChunkedUpload(mk("e3b0c442…", "")))
-	require.False(t, isAwsChunkedUpload(mk("", "gzip")))
-	require.False(t, isAwsChunkedUpload(mk("", "")))
 }
 
-func TestHandlerReadOnlyRejectsWrites(t *testing.T) {
-	h := newTestProxy(t)
+// Every shape the proxy does not implement has to fail closed, whether or
+// not the caller holds a perfectly valid credential.
+func TestUnsupportedOperationsAreRefused(t *testing.T) {
+	h, upstream := newTestProxy(t)
+
+	cases := []struct {
+		name    string
+		method  string
+		target  string
+		headers http.Header
+	}{
+		{"copy source", http.MethodPut, "/bucket/workspaces/a/copy.txt",
+			http.Header{"X-Amz-Copy-Source": {"/bucket/workspaces/a/orig.txt"}}},
+		{"bucket acl", http.MethodGet, "/bucket?acl", nil},
+		{"bucket policy", http.MethodPut, "/bucket?policy", nil},
+		{"bucket versioning", http.MethodGet, "/bucket?versioning", nil},
+		{"bucket lifecycle", http.MethodGet, "/bucket?lifecycle", nil},
+		{"bucket tagging", http.MethodGet, "/bucket?tagging", nil},
+		{"bucket create", http.MethodPut, "/bucket", nil},
+		{"bucket delete", http.MethodDelete, "/bucket", nil},
+		{"head bucket", http.MethodHead, "/bucket", nil},
+		{"bucket location", http.MethodGet, "/bucket?location", nil},
+		{"list multipart uploads", http.MethodGet, "/bucket?uploads", nil},
+		{"list object versions", http.MethodGet, "/bucket?versions", nil},
+		{"object acl", http.MethodGet, "/bucket/workspaces/a/x.txt?acl", nil},
+		{"object tagging", http.MethodPut, "/bucket/workspaces/a/x.txt?tagging", nil},
+		{"object restore", http.MethodPost, "/bucket/workspaces/a/x.txt?restore", nil},
+		{"select object content", http.MethodPost, "/bucket/workspaces/a/x.txt?select&select-type=2", nil},
+		{"unsupported method", http.MethodPatch, "/bucket/workspaces/a/x.txt", nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := upstream.count()
+			rec := do(t, h, clientRequest{
+				method: tc.method, target: tc.target, headers: tc.headers,
+				tenant: tenantA, level: "rws",
+			})
+			assert.Equal(t, http.StatusForbidden, rec.Code)
+			assert.Equal(t, before, upstream.count(), "the request must not reach the upstream")
+		})
+	}
+}
+
+func TestAuthenticationFailures(t *testing.T) {
+	h, upstream := newTestProxy(t)
+	target := "/bucket/datasets/a.csv"
+
+	t.Run("anonymous", func(t *testing.T) {
+		before := upstream.count()
+		rec := do(t, h, clientRequest{method: http.MethodGet, target: target, unsigned: true})
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Equal(t, before, upstream.count())
+	})
+
+	t.Run("unknown access key id", func(t *testing.T) {
+		before := upstream.count()
+		rec := do(t, h, clientRequest{
+			method: http.MethodGet, target: target,
+			accessKeyID: "NOTATENANTATALL0", secret: "whatever", tenant: tenantA, level: "ro",
+		})
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Equal(t, before, upstream.count())
+	})
+
+	t.Run("wrong secret", func(t *testing.T) {
+		before := upstream.count()
+		rec := do(t, h, clientRequest{
+			method: http.MethodGet, target: target,
+			tenant: tenantA, level: "ro", secret: "guessed-secret",
+		})
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Equal(t, before, upstream.count())
+	})
+
+	t.Run("presigned query-string authentication", func(t *testing.T) {
+		before := upstream.count()
+		rec := do(t, h, clientRequest{
+			method: http.MethodGet,
+			target: target + "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=" +
+				accessKeyFor(tenantA, "ro") + "%2F20260101%2Feu-central-1%2Fs3%2Faws4_request&X-Amz-Signature=deadbeef",
+			tenant: tenantA, level: "ro",
+		})
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Equal(t, before, upstream.count())
+	})
+
+	t.Run("outside the clock skew window", func(t *testing.T) {
+		before := upstream.count()
+		rec := do(t, h, clientRequest{
+			method: http.MethodGet, target: target,
+			tenant: tenantA, level: "ro",
+			signTime: time.Now().Add(-30 * time.Minute),
+		})
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Equal(t, before, upstream.count())
+	})
+
+	t.Run("inside the clock skew window", func(t *testing.T) {
+		rec := do(t, h, clientRequest{
+			method: http.MethodGet, target: target,
+			tenant: tenantA, level: "ro",
+			signTime: time.Now().Add(-5 * time.Minute),
+		})
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	t.Run("source IP outside the allowed subnet", func(t *testing.T) {
+		strict, upstream := newTestProxy(t)
+		strict.AllowedSourceSubnet = testSubnets(t, "127.0.0.1/32")
+
+		req := clientRequest{method: http.MethodGet, target: target, tenant: tenantA, level: "ro"}.build(t)
+		rec := httptest.NewRecorder()
+		strict.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Equal(t, 0, upstream.count())
+	})
+}
+
+func TestReadOnlyKillSwitch(t *testing.T) {
+	h, upstream := newTestProxy(t)
 	h.ReadOnly = true
 
-	for _, method := range []string{http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodPatch} {
-		req := httptest.NewRequest(method, "http://foobar.example.com/bucket/key", nil)
-		signRequest(req) // a fully valid, signed write request
-		resp := httptest.NewRecorder()
-		h.ServeHTTP(resp, req)
-		assert.Equal(t, http.StatusForbidden, resp.Code, "method %s must be rejected", method)
-	}
-}
-
-func TestHandlerReadOnlyAllowsReads(t *testing.T) {
-	h := newTestProxy(t)
-	h.ReadOnly = true
-
-	for _, method := range []string{http.MethodGet, http.MethodHead} {
-		req := httptest.NewRequest(method, "http://foobar.example.com/bucket/key", nil)
-		signRequest(req)
-		resp := httptest.NewRecorder()
-		h.ServeHTTP(resp, req)
-		assert.Equal(t, 200, resp.Code, "method %s must be allowed", method)
-	}
-}
-
-func TestHandlerWritesAllowedWhenNotReadOnly(t *testing.T) {
-	h := newTestProxy(t) // ReadOnly defaults to false
-	req := httptest.NewRequest(http.MethodPut, "http://foobar.example.com/bucket/key", nil)
-	signRequest(req)
-	resp := httptest.NewRecorder()
-	h.ServeHTTP(resp, req)
-	// Not a 403 — the write is proxied (the test upstream answers 200).
-	assert.NotEqual(t, http.StatusForbidden, resp.Code)
-}
-
-func TestHandlerReadOnlyKeyPrefixRejectsProtectedWrites(t *testing.T) {
-	h := newTestProxy(t)
-	h.ReadOnlyKeyPrefixes = []string{"protected/", "locked/"}
-
-	paths := []string{
-		"http://foobar.example.com/bucket/protected/file.txt",
-		"http://foobar.example.com/bucket/protected/nested/deep.txt",
-		"http://foobar.example.com/bucket/locked/file.txt",
-	}
-	for _, path := range paths {
-		for _, method := range []string{http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodPatch} {
-			req := httptest.NewRequest(method, path, nil)
-			signRequest(req) // a fully valid, signed write request
-			resp := httptest.NewRecorder()
-			h.ServeHTTP(resp, req)
-			assert.Equal(t, http.StatusForbidden, resp.Code, "%s %s must be rejected", method, path)
-		}
-	}
-}
-
-func TestHandlerReadOnlyKeyPrefixAllowsUnprotectedWrites(t *testing.T) {
-	h := newTestProxy(t)
-	h.ReadOnlyKeyPrefixes = []string{"protected/"}
-
-	// Object keys outside the protected prefix, and bucket-level paths, are
-	// proxied (the test upstream answers 200) — never a 403.
-	paths := []string{
-		"http://foobar.example.com/bucket/public/file.txt",
-		"http://foobar.example.com/bucket/unprotectedfile.txt",
-		"http://foobar.example.com/bucket", // bucket-level: no object key
-	}
-	for _, path := range paths {
-		req := httptest.NewRequest(http.MethodPut, path, nil)
-		signRequest(req)
-		resp := httptest.NewRecorder()
-		h.ServeHTTP(resp, req)
-		assert.NotEqual(t, http.StatusForbidden, resp.Code, "PUT %s must be allowed", path)
-	}
-}
-
-func TestHandlerReadOnlyKeyPrefixAllowsReadsOnProtectedKeys(t *testing.T) {
-	h := newTestProxy(t)
-	h.ReadOnlyKeyPrefixes = []string{"protected/"}
-
-	for _, method := range []string{http.MethodGet, http.MethodHead} {
-		req := httptest.NewRequest(method, "http://foobar.example.com/bucket/protected/file.txt", nil)
-		signRequest(req)
-		resp := httptest.NewRecorder()
-		h.ServeHTTP(resp, req)
-		assert.Equal(t, 200, resp.Code, "%s on a protected key must be allowed", method)
-	}
-}
-
-// TestHandlerKeyPrefixAndReadOnlyKeyPrefixCombined pins down how the two flags
-// interact: --read-only-key-prefix is evaluated against the CLIENT-FACING key
-// (before --key-prefix is prepended), and only afterwards does --key-prefix
-// rewrite the path sent upstream. This ordering is what lets operators write
-// read-only prefixes in client terms while still confining writes to a fixed
-// upstream prefix.
-func TestHandlerKeyPrefixAndReadOnlyKeyPrefixCombined(t *testing.T) {
-	var upstreamPath string
-	thf := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamPath = r.URL.Path
-		fmt.Fprintln(w, "Hello, client")
+	rec := do(t, h, clientRequest{
+		method: http.MethodPut, target: "/bucket/workspaces/a/x.txt",
+		body: []byte("x"), tenant: tenantA, level: "rws",
 	})
-	h := newTestProxyWithHandler(t, &thf)
-	h.KeyPrefix = "tenants/acme/"
-	h.ReadOnlyKeyPrefixes = []string{"protected/"}
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Equal(t, 0, upstream.count())
 
-	// A write under the protected prefix is rejected — the check matches the
-	// client key "protected/secret.txt", NOT the upstream-rewritten
-	// "tenants/acme/protected/secret.txt" — and never reaches upstream.
-	req := httptest.NewRequest(http.MethodPut, "http://foobar.example.com/bucket/protected/secret.txt", nil)
-	signRequest(req)
-	resp := httptest.NewRecorder()
-	upstreamPath = ""
-	h.ServeHTTP(resp, req)
-	assert.Equal(t, http.StatusForbidden, resp.Code, "protected write must be rejected")
-	assert.Empty(t, upstreamPath, "rejected write must never reach upstream")
-
-	// A write outside the protected prefix is allowed AND arrives upstream with
-	// --key-prefix prepended: read-only check passed on the client key, then
-	// the prefix was injected.
-	req = httptest.NewRequest(http.MethodPut, "http://foobar.example.com/bucket/data/report.csv", nil)
-	signRequest(req)
-	resp = httptest.NewRecorder()
-	upstreamPath = ""
-	h.ServeHTTP(resp, req)
-	assert.NotEqual(t, http.StatusForbidden, resp.Code, "unprotected write must be allowed")
-	assert.Equal(t, "/bucket/tenants/acme/data/report.csv", upstreamPath,
-		"allowed write must reach upstream with the key prefix injected")
-
-	// Read-only prefixes are written in CLIENT terms: a client key that already
-	// starts with the --key-prefix path does not match "protected/", so it is
-	// NOT blocked. (Specifying "tenants/acme/protected/" would be the wrong
-	// mental model.)
-	req = httptest.NewRequest(http.MethodPut, "http://foobar.example.com/bucket/tenants/acme/protected/x.txt", nil)
-	signRequest(req)
-	resp = httptest.NewRecorder()
-	h.ServeHTTP(resp, req)
-	assert.NotEqual(t, http.StatusForbidden, resp.Code,
-		"protection is matched against the client-facing key, not the upstream path")
-}
-
-func TestHandlerDenyKeyPrefixRejectsAllMethods(t *testing.T) {
-	h := newTestProxy(t)
-	h.DenyKeyPrefixes = []string{"hidden/", "secret/"}
-
-	paths := []string{
-		"http://foobar.example.com/bucket/hidden/file.txt",
-		"http://foobar.example.com/bucket/hidden/nested/deep.txt",
-		"http://foobar.example.com/bucket/secret/file.txt",
-	}
-	// Deny blocks reads AND writes — every method is rejected with 403.
-	for _, path := range paths {
-		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodPatch} {
-			req := httptest.NewRequest(method, path, nil)
-			signRequest(req) // a fully valid, signed request
-			resp := httptest.NewRecorder()
-			h.ServeHTTP(resp, req)
-			assert.Equal(t, http.StatusForbidden, resp.Code, "%s %s must be denied", method, path)
-		}
-	}
-}
-
-func TestHandlerDenyKeyPrefixAllowsOtherKeys(t *testing.T) {
-	h := newTestProxy(t)
-	h.DenyKeyPrefixes = []string{"hidden/"}
-
-	// Object keys outside the denied prefix, and bucket-level paths, are
-	// proxied (the test upstream answers 200) — never a 403.
-	paths := []string{
-		"http://foobar.example.com/bucket/public/file.txt",
-		"http://foobar.example.com/bucket/hiddenfile.txt", // shares the bytes but not the "hidden/" boundary
-		"http://foobar.example.com/bucket",                // bucket-level: no object key
-	}
-	for _, path := range paths {
-		for _, method := range []string{http.MethodGet, http.MethodPut} {
-			req := httptest.NewRequest(method, path, nil)
-			signRequest(req)
-			resp := httptest.NewRecorder()
-			h.ServeHTTP(resp, req)
-			assert.NotEqual(t, http.StatusForbidden, resp.Code, "%s %s must be allowed", method, path)
-		}
-	}
-}
-
-// TestHandlerKeyPrefixAndDenyKeyPrefixCombined pins down that --deny-key-prefix,
-// like --read-only-key-prefix, is evaluated against the CLIENT-FACING key — the
-// key exactly as the client sends it, before --key-prefix is prepended. The
-// client never types the --key-prefix itself (the proxy adds it), so deny
-// prefixes are written in client terms. A denied request never reaches
-// upstream; an allowed request still gets --key-prefix injected on the way out.
-func TestHandlerKeyPrefixAndDenyKeyPrefixCombined(t *testing.T) {
-	var upstreamPath string
-	thf := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamPath = r.URL.Path
-		fmt.Fprintln(w, "Hello, client")
+	rec = do(t, h, clientRequest{
+		method: http.MethodGet, target: "/bucket/workspaces/a/x.txt",
+		tenant: tenantA, level: "rws",
 	})
-	h := newTestProxyWithHandler(t, &thf)
-	h.KeyPrefix = "tenants/acme/"
-	h.DenyKeyPrefixes = []string{"hidden/"}
-
-	// The client sends the client-facing key "hidden/secret.txt" (NOT
-	// "tenants/acme/hidden/secret.txt" — the proxy would add that). It matches
-	// the "hidden/" deny prefix, so it is rejected and never reaches upstream.
-	req := httptest.NewRequest(http.MethodGet, "http://foobar.example.com/bucket/hidden/secret.txt", nil)
-	signRequest(req)
-	resp := httptest.NewRecorder()
-	upstreamPath = ""
-	h.ServeHTTP(resp, req)
-	assert.Equal(t, http.StatusForbidden, resp.Code, "denied read must be rejected")
-	assert.Empty(t, upstreamPath, "denied read must never reach upstream")
-
-	// A request outside the denied prefix is allowed AND arrives upstream with
-	// --key-prefix prepended: the deny check passed on the client key, then the
-	// prefix was injected.
-	req = httptest.NewRequest(http.MethodGet, "http://foobar.example.com/bucket/data/report.csv", nil)
-	signRequest(req)
-	resp = httptest.NewRecorder()
-	upstreamPath = ""
-	h.ServeHTTP(resp, req)
-	assert.NotEqual(t, http.StatusForbidden, resp.Code, "unprotected read must be allowed")
-	assert.Equal(t, "/bucket/tenants/acme/data/report.csv", upstreamPath,
-		"allowed read must reach upstream with the key prefix injected")
-
-	// Deny prefixes are written in CLIENT terms: the client sends "hidden/x.txt"
-	// (it never types the --key-prefix — the proxy adds that), which matches the
-	// "hidden/" deny prefix and is rejected even with --key-prefix set.
-	req = httptest.NewRequest(http.MethodGet, "http://foobar.example.com/bucket/hidden/x.txt", nil)
-	signRequest(req)
-	resp = httptest.NewRecorder()
-	h.ServeHTTP(resp, req)
-	assert.Equal(t, http.StatusForbidden, resp.Code,
-		"denial is matched against the client-facing key, with --key-prefix set")
+	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
-func TestHandlerValidSignatureS3cmd(t *testing.T) {
-	h := newTestProxy(t)
+// A client that sends an aws-chunked body (the AWS JS SDK v3 does by
+// default) must work unchanged: the framing is decoded so the upstream
+// stores the real object bytes, and a checksum sent as a trailer is carried
+// over as a header.
+func TestAwsChunkedUpload(t *testing.T) {
+	payload := "PAR1this-is-the-real-object-content"
 
-	req := httptest.NewRequest(http.MethodGet, "http://foobar.example.com", nil)
-	signRequest(req)
-	// get the generated signed authorization header in order to simulate the s3cmd syntax
-	authorizationReq := req.Header.Get("Authorization")
-	// simulating s3cmd syntax and remove the whites space after the comma of the Signature part
-	authorizationReq = strings.Replace(authorizationReq, ", Signature", ",Signature", 1)
-	// simulating s3cmd syntax and remove the whites space before the comma of the SignedHeaders part
-	authorizationReq = strings.Replace(authorizationReq, ", SignedHeaders", ",SignedHeaders", 1)
-	// push the edited authorization header
-	req.Header.Set("Authorization", authorizationReq)
-	resp := httptest.NewRecorder()
-	h.ServeHTTP(resp, req)
-	assert.Equal(t, 200, resp.Code)
-	assert.Contains(t, resp.Body.String(), "Hello, client")
-}
+	t.Run("with a checksum trailer", func(t *testing.T) {
+		h, upstream := newTestProxy(t)
+		framed := fmt.Sprintf("%x\r\n%s\r\n0\r\nx-amz-checksum-crc32:abcd1234\r\n\r\n", len(payload), payload)
+		rec := do(t, h, clientRequest{
+			method: http.MethodPut, target: "/bucket/datasets/big.parquet",
+			body: []byte(framed), tenant: tenantA, level: "rw",
+			headers: http.Header{
+				"X-Amz-Content-Sha256":         {"STREAMING-UNSIGNED-PAYLOAD-TRAILER"},
+				"X-Amz-Decoded-Content-Length": {fmt.Sprint(len(payload))},
+				"X-Amz-Trailer":                {"x-amz-checksum-crc32"},
+				"Content-Encoding":             {"aws-chunked"},
+			},
+		})
+		require.Equal(t, http.StatusOK, rec.Code)
 
-func TestHandlerInvalidCredential(t *testing.T) {
-	h := newTestProxy(t)
-
-	req := httptest.NewRequest(http.MethodGet, "http://foobar.example.com", nil)
-	req.Header.Set("X-Amz-Date", "20060102T150405Z")
-	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=XXXooooooooooooo/20060102/eu-test-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=a0d5e0c0924c1f9298c5f2a3925e202657bf1e239a1d6856235cbe0702855334") // signature computed manually for this test case
-	resp := httptest.NewRecorder()
-	h.ServeHTTP(resp, req)
-	assert.Equal(t, 400, resp.Code)
-	assert.Contains(t, resp.Body.String(), "invalid AccessKeyID in Credential")
-}
-
-func TestHandlerInvalidSourceSubnet(t *testing.T) {
-	h := newTestProxy(t)
-	_, newNet, _ := net.ParseCIDR("172.27.42.0/24")
-	h.AllowedSourceSubnet = []*net.IPNet{newNet}
-
-	req := httptest.NewRequest(http.MethodGet, "http://foobar.example.com", nil)
-	req.Header.Set("X-Amz-Date", "20060102T150405Z")
-	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=XXXooooooooooooo/20060102/eu-test-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=a0d5e0c0924c1f9298c5f2a3925e202657bf1e239a1d6856235cbe0702855334") // signature computed manually for this test case
-	resp := httptest.NewRecorder()
-	h.ServeHTTP(resp, req)
-	assert.Equal(t, 400, resp.Code)
-	assert.Contains(t, resp.Body.String(), "source IP not allowed")
-}
-
-func TestHandlerInvalidAmzDate(t *testing.T) {
-	h := newTestProxy(t)
-
-	req := httptest.NewRequest(http.MethodGet, "http://foobar.example.com", nil)
-	req.Header.Set("X-Amz-Date", "foobar")
-	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=fooooooooooooooo/20060102/eu-test-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=a0d5e0c0924c1f9298c5f2a3925e202657bf1e239a1d6856235cbe0702855334") // signature computed manually for this test case
-	resp := httptest.NewRecorder()
-	h.ServeHTTP(resp, req)
-	assert.Equal(t, 400, resp.Code)
-	assert.Contains(t, resp.Body.String(), "error parsing X-Amz-Date foobar")
-}
-
-func TestHandlerRawPathEncodingMatchingSignature(t *testing.T) {
-	thf := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		verifySignature(w, r)
+		got := upstream.last(t)
+		assert.Equal(t, payload, got.body, "the upstream must receive the de-chunked object")
+		assert.Equal(t, "abcd1234", got.header.Get("X-Amz-Checksum-Crc32"), "the trailer checksum must survive as a header")
+		assert.Empty(t, got.header.Get("X-Amz-Trailer"), "announcing a trailer that is no longer there breaks the upload")
+		assert.NotContains(t, got.header.Get("Content-Encoding"), "aws-chunked")
 	})
-	h := newTestProxyWithHandler(t, &thf)
 
-	urls := []string{
-		"http://foobar.example.com/foo%3Dbar/test.txt",
-		"http://foobar.example.com/foo=bar/test.txt",
-		"http://foobar.example.com/foo%3Dbar/test.txt?marker=1000",
-		"http://foobar.example.com/foo=bar/test.txt?marker=1000",
-	}
+	t.Run("without a trailer the body streams", func(t *testing.T) {
+		h, upstream := newTestProxy(t)
+		framed := fmt.Sprintf("%x;chunk-signature=deadbeef\r\n%s\r\n0;chunk-signature=cafe\r\n\r\n", len(payload), payload)
+		rec := do(t, h, clientRequest{
+			method: http.MethodPut, target: "/bucket/datasets/big.parquet",
+			body: []byte(framed), tenant: tenantA, level: "rw",
+			headers: http.Header{
+				"X-Amz-Content-Sha256":         {"STREAMING-AWS4-HMAC-SHA256-PAYLOAD"},
+				"X-Amz-Decoded-Content-Length": {fmt.Sprint(len(payload))},
+				"Content-Encoding":             {"aws-chunked"},
+			},
+		})
+		require.Equal(t, http.StatusOK, rec.Code)
 
-	for _, url := range urls {
-		req := httptest.NewRequest(http.MethodGet, url, nil)
-		signRequest(req)
-		resp := httptest.NewRecorder()
-		h.ServeHTTP(resp, req)
-		assert.Equal(t, 200, resp.Code)
-		assert.Contains(t, strings.TrimSpace(resp.Body.String()), "ok")
-	}
+		got := upstream.last(t)
+		assert.Equal(t, payload, got.body)
+		// Nothing was buffered, so the payload hash cannot be stated.
+		assert.Equal(t, unsignedPayload, got.header.Get("X-Amz-Content-Sha256"))
+	})
+
+	t.Run("a buffered body larger than the cap is refused", func(t *testing.T) {
+		h, _ := newTestProxy(t)
+		h.MaxChunkedBodySize = 16
+		framed := fmt.Sprintf("%x\r\n%s\r\n0\r\nx-amz-checksum-crc32:abcd\r\n\r\n", len(payload), payload)
+		rec := do(t, h, clientRequest{
+			method: http.MethodPut, target: "/bucket/datasets/big.parquet",
+			body: []byte(framed), tenant: tenantA, level: "rw",
+			headers: http.Header{
+				"X-Amz-Content-Sha256":         {"STREAMING-UNSIGNED-PAYLOAD-TRAILER"},
+				"X-Amz-Decoded-Content-Length": {fmt.Sprint(len(payload))},
+				"X-Amz-Trailer":                {"x-amz-checksum-crc32"},
+			},
+		})
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
 }
 
-func TestHandlerWithQueryArgs(t *testing.T) {
-	thf := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		verifySignature(w, r)
-		if r.URL.Query().Get("marker") == "1000" {
-			fmt.Fprintln(w, "marker-ok")
-		} else {
-			fmt.Fprintln(w, "marker missing")
-		}
+// A large object must not be buffered anywhere: the proxy's memory use has
+// to be independent of the object's size.
+func TestLargeUploadIsNotBuffered(t *testing.T) {
+	h, upstream := newTestProxy(t)
+	h.MaxChunkedBodySize = 1024 // far smaller than the object below
+	h.MaxDeleteBodySize = 1024
+	h.MaxRewriteBodySize = 1024
+
+	payload := bytes.Repeat([]byte("0123456789abcdef"), 64*1024) // 1 MiB
+	rec := do(t, h, clientRequest{
+		method: http.MethodPut, target: "/bucket/datasets/large.bin",
+		body: payload, tenant: tenantA, level: "rw",
 	})
-	h := newTestProxyWithHandler(t, &thf)
-
-	urls := []string{
-		"http://foobar.example.com/foo%3Dbar/test.txt?marker=1000",
-		"http://foobar.example.com/foo=bar/test.txt?marker=1000",
-	}
-
-	for _, url := range urls {
-		req := httptest.NewRequest(http.MethodGet, url, nil)
-		signRequest(req)
-		resp := httptest.NewRecorder()
-		h.ServeHTTP(resp, req)
-		assert.Equal(t, 200, resp.Code)
-		assert.Contains(t, strings.TrimSpace(resp.Body.String()), "marker-ok")
-	}
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Len(t, upstream.last(t).body, len(payload))
 }
 
-func TestHandlerPassCustomHeaders(t *testing.T) {
-	thf := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("x-aws-s3-reverse-proxy") == "testing" {
-			fmt.Fprintln(w, "ok")
-		} else {
-			fmt.Fprintln(w, "header missing")
-		}
-	})
-	h := newTestProxyWithHandler(t, &thf)
-
-	req := httptest.NewRequest(http.MethodGet, "http://foobar.example.com", nil)
-	signRequest(req)
-	req.Header.Set("x-aws-s3-reverse-proxy", "testing")
-	resp := httptest.NewRecorder()
-	h.ServeHTTP(resp, req)
-	assert.Equal(t, 200, resp.Code)
-	assert.Contains(t, strings.TrimSpace(resp.Body.String()), "ok")
+// testSubnets builds the parsed subnet slice the handler expects.
+func testSubnets(t *testing.T, cidrs ...string) []*net.IPNet {
+	t.Helper()
+	var out []*net.IPNet
+	for _, cidr := range cidrs {
+		_, subnet, err := net.ParseCIDR(cidr)
+		require.NoError(t, err)
+		out = append(out, subnet)
+	}
+	return out
 }
