@@ -54,25 +54,38 @@ services:
     ports: ["19443:9000"]
     depends_on:
       certs: {condition: service_completed_successfully}
-    healthcheck:
-      test: ["CMD", "mc", "--insecure", "ready", "local"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
+    # No healthcheck here on purpose. The image's built-in `local` mc alias
+    # points at http://localhost:9000, and this container serves https, so
+    # every probe through it fails no matter how healthy the server is.
+    # createbuckets below waits for the server instead, by doing the thing
+    # it actually needs to do until it works.
 
   createbuckets:
     image: minio/mc:RELEASE.2025-08-13T08-35-41Z
     depends_on:
       minio: {condition: service_healthy}
-      minio-tls: {condition: service_healthy}
+      minio-tls: {condition: service_started}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
-        mc alias set plain http://minio:9000 minioadmin minioadmin123
-        mc alias set tls https://minio-tls:9000 minioadmin minioadmin123 --insecure
+        # Retry rather than probe: reaching the store and creating the
+        # bucket is the readiness condition, so doing it in a loop needs no
+        # separate healthcheck to agree with it.
+        ready() {
+          for i in $$(seq 1 60); do
+            if mc $$3 alias set $$1 $$2 minioadmin minioadmin123 >/dev/null 2>&1; then
+              return 0
+            fi
+            sleep 2
+          done
+          echo "giving up on $$2" >&2
+          return 1
+        }
+        ready plain http://minio:9000
+        ready tls https://minio-tls:9000 --insecure
         mc mb --ignore-existing plain/e2e
-        mc mb --ignore-existing tls/e2e --insecure
+        mc --insecure mb --ignore-existing tls/e2e
 
   # Variant A — http upstream, secrets straight from the environment, and a
   # hard memory limit far below the object the streaming test pushes through

@@ -3,10 +3,9 @@
 package e2e
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -202,41 +201,46 @@ func (e Env) Admin(t *testing.T) *s3.S3 {
 
 func (e Env) clientFor(t *testing.T, endpoint, accessKeyID, secret string) *s3.S3 {
 	t.Helper()
-	sess, err := session.NewSession(&aws.Config{
-		Endpoint:    aws.String(endpoint),
-		Region:      aws.String(e.Region),
-		Credentials: credentials.NewStaticCredentials(accessKeyID, secret, ""),
-		// The proxy addresses buckets by path; virtual-host style would put
-		// the bucket in the Host header, which the endpoint allow-list
-		// rejects.
-		S3ForcePathStyle: aws.Bool(true),
-		// A retry would re-send a request the proxy deliberately refused
-		// and turn one clean 403 into three.
-		MaxRetries: aws.Int(0),
-		HTTPClient: &http.Client{Timeout: 120 * time.Second, Transport: e.transport(t, endpoint)},
-	})
+	opts := session.Options{
+		Config: aws.Config{
+			Endpoint:    aws.String(endpoint),
+			Region:      aws.String(e.Region),
+			Credentials: credentials.NewStaticCredentials(accessKeyID, secret, ""),
+			// The proxy addresses buckets by path; virtual-host style would
+			// put the bucket in the Host header, which the endpoint
+			// allow-list rejects.
+			S3ForcePathStyle: aws.Bool(true),
+			// A retry would re-send a request the proxy deliberately refused
+			// and turn one clean 403 into three.
+			MaxRetries: aws.Int(0),
+			HTTPClient: &http.Client{Timeout: 120 * time.Second},
+		},
+	}
+
+	// The stack's private CA has to be handed to the SDK through
+	// CustomCABundle rather than through a transport of our own. The SDK
+	// applies AWS_CA_BUNDLE from the environment by *overwriting*
+	// TLSClientConfig.RootCAs on whatever transport it is given
+	// (session.loadCustomCABundle), so a pool we set ourselves is silently
+	// discarded wherever that variable happens to be set — and the failure
+	// then looks like an untrusted certificate rather than a clobbered
+	// setting. Passing it here takes precedence over the environment.
+	//
+	// Verification itself stays on: a suite that skipped it would not be
+	// testing the https path it claims to.
+	if e.MinioCA != "" && strings.HasPrefix(endpoint, "https://") {
+		pem, err := os.ReadFile(e.MinioCA)
+		if err != nil {
+			t.Fatalf("reading %s: %v", e.MinioCA, err)
+		}
+		opts.CustomCABundle = bytes.NewReader(pem)
+	}
+
+	sess, err := session.NewSessionWithOptions(opts)
 	if err != nil {
-		t.Fatalf("building S3 client: %v", err)
+		t.Fatalf("building S3 client for %s: %v", endpoint, err)
 	}
 	return s3.New(sess)
-}
-
-// transport trusts the stack's private CA when the target is the object
-// store behind TLS. Verification stays on — a suite that skipped it would
-// not be testing the https path it claims to.
-func (e Env) transport(t *testing.T, endpoint string) http.RoundTripper {
-	if e.MinioCA == "" || !strings.HasPrefix(endpoint, "https://") {
-		return nil
-	}
-	pem, err := os.ReadFile(e.MinioCA)
-	if err != nil {
-		t.Fatalf("reading %s: %v", e.MinioCA, err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		t.Fatalf("%s holds no usable certificate", e.MinioCA)
-	}
-	return &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}
 }
 
 // Signer returns a SigV4 signer for a derived credential, for the handful of

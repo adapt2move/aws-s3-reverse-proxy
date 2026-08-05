@@ -41,9 +41,22 @@ for _ in $(seq 1 60); do
   sleep 0.5
 done
 
+# A port already in use is the one failure that can masquerade as success:
+# whatever is squatting on it answers /readyz perfectly well, and the run
+# then exercises a deployment nobody configured. Refuse to start instead.
+require_free_port() {
+  local port=$1 name=$2
+  if curl -fsS -o /dev/null --max-time 1 "http://127.0.0.1:$port/healthz" 2>/dev/null; then
+    echo "!!! something is already serving on port $port; $name cannot start there" >&2
+    return 1
+  fi
+  return 0
+}
+
 start_proxy() {
   local name=$1 policy=$2 api=$3 admin=$4
   shift 4
+  require_free_port "$admin" "$name"
   cp "$policy" "$work/$name-policy.yaml"
   UPSTREAM_ACCESS_KEY_ID=minioadmin \
   UPSTREAM_SECRET_ACCESS_KEY=minioadmin123 \
@@ -58,8 +71,18 @@ start_proxy() {
       --upstream-endpoint=http://127.0.0.1:19000 \
       --policy-reload-interval=2s \
       "$@" >"$work/$name.log" 2>&1 &
-  pids+=($!)
+  local pid=$!
+  pids+=("$pid")
   for _ in $(seq 1 40); do
+    # Check the process before the port. If it died — most often because
+    # something else already holds the port — that other process will answer
+    # /readyz perfectly happily, and the whole run would then test a
+    # deployment nobody configured.
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "!!! $name exited during startup" >&2
+      cat "$work/$name.log" >&2
+      return 1
+    fi
     curl -fsS -o /dev/null "http://127.0.0.1:$admin/readyz" 2>/dev/null && return 0
     sleep 0.25
   done
@@ -80,10 +103,13 @@ export E2E_BUCKET=e2e
 export E2E_PEPPER=an-e2e-deployment-wide-pepper
 
 status=0
+# Each variant runs in a subshell so its exports cannot leak into the next
+# one — which means the subshell's exit status, not a variable set inside
+# it, is what says whether it passed.
 run_variant() {
   echo
   echo "==> variant: $E2E_NAME"
-  go test -tags e2e -count=1 -timeout 30m "$@" ./e2e/... || status=1
+  go test -tags e2e -count=1 -timeout 30m "$@" ./e2e/...
 }
 
 (
@@ -102,7 +128,7 @@ run_variant() {
   export E2E_RELOAD_INTERVAL=2s
   export E2E_LARGE_OBJECT_SIZE=268435456
   run_variant "$@"
-)
+) || status=1
 
 (
   export E2E_NAME=variant-b
@@ -115,7 +141,7 @@ run_variant() {
   export E2E_TENANT_A=acmecorp1
   export E2E_TENANT_B=globex2000
   run_variant "$@"
-)
+) || status=1
 
 (
   export E2E_NAME=variant-readonly
@@ -129,7 +155,7 @@ run_variant() {
   export E2E_TENANT_B=0f9e8d7c6b5a49382716f5e4d3c2b1a0
   export E2E_READ_ONLY=true
   run_variant "$@"
-)
+) || status=1
 
 echo
 if [[ $status -eq 0 ]]; then

@@ -33,7 +33,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> building and starting the stack"
-"${compose[@]}" up -d --build --wait
+"${compose[@]}" up -d --build
 
 wait_for_health() {
   local url=$1 name=$2
@@ -60,12 +60,13 @@ export E2E_BUCKET=e2e
 export E2E_PEPPER=an-e2e-deployment-wide-pepper
 
 status=0
+# Each variant runs in a subshell so its exports cannot leak into the next
+# one — which means the subshell's exit status, not a variable set inside
+# it, is what says whether it passed.
 run_variant() {
   echo
   echo "==> variant: $E2E_NAME"
-  if ! go test -tags e2e -count=1 -timeout 30m "$@" ./...; then
-    status=1
-  fi
+  go test -tags e2e -count=1 -timeout 30m "$@" ./...
 }
 
 # ---------------------------------------------------------------- variant A
@@ -92,7 +93,7 @@ run_variant() {
   # OOM kill, not a slow test.
   export E2E_LARGE_OBJECT_SIZE=268435456
   run_variant "$@"
-)
+) || status=1
 
 # ---------------------------------------------------------------- variant B
 # https upstream behind a private CA; a different access-key-id layout,
@@ -114,7 +115,7 @@ run_variant() {
   # stack knows about.
   export E2E_MINIO_CA="$PWD/ca/public.crt"
   run_variant "$@"
-)
+) || status=1
 
 # ---------------------------------------------------------------- variant C
 # Variant A's policy with the maintenance kill switch on: every mutation is
@@ -133,7 +134,7 @@ run_variant() {
   export E2E_TENANT_B=0f9e8d7c6b5a49382716f5e4d3c2b1a0
   export E2E_READ_ONLY=true
   run_variant "$@"
-)
+) || status=1
 
 echo
 if [[ $status -eq 0 ]]; then
