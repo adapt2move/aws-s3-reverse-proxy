@@ -1,0 +1,23 @@
+# Variant B agrees with variant A on nothing an operator gets to choose:
+# a different access-key-id layout, different level names, and a key prefix
+# several segments deep. The suite runs against both unchanged, which is
+# what shows that none of it is baked into the proxy.
+#
+# The rule *paths* are deliberately the same in both, so the same
+# authorization assertions apply to each.
+identity:
+  accessKeyIdPattern: '^(?P<tenant>[a-z0-9]{8,32})-(?P<level>reader|writer|admin)$'
+  secretTemplate: 'v1/{level}/{tenant}'
+  keyPrefixTemplate: 'tenants/{tenant}/data/'
+
+levels: [reader, writer, admin]
+
+rules:
+  - pathPattern: 'datasets/**'
+    grant: { reader: read, writer: full, admin: full }
+
+  - pathPattern: 'workspaces/*/inbox/**'
+    grant: { reader: read, writer: read, admin: read }
+
+  - pathPattern: 'workspaces/**'
+    grant: { reader: full, writer: full, admin: full }

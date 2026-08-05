@@ -1,0 +1,154 @@
+# The end-to-end stack: a real MinIO, and three proxies configured to agree
+# on as little as possible.
+#
+# The three variants are the point. They differ in the access-key-id layout,
+# the level names, where a tenant's objects land, whether the upstream is
+# reached over http or https, and where the secrets come from — while the
+# suite that runs against them is identical. Anything the proxy had baked in
+# would fail at least one of them.
+
+services:
+  # The in-cluster case: an S3-compatible store over plain http.
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --address :9000 --console-address :9001
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports: ["19000:9000"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # The hosted-provider case: the same store behind TLS, so one image has to
+  # serve both without a second flag to keep in sync.
+  certs:
+    image: alpine/openssl:3.3.2
+    volumes:
+      - "certs:/certs"
+      # A copy on the host, so the suite can trust the same CA when it
+      # reaches MinIO directly over TLS.
+      - "./ca:/out"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ ! -f /certs/public.crt ]; then
+          openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+            -keyout /certs/private.key -out /certs/public.crt \
+            -subj "/CN=minio-tls" \
+            -addext "subjectAltName=DNS:minio-tls,DNS:localhost,IP:127.0.0.1"
+        fi
+        chmod 0644 /certs/private.key /certs/public.crt
+        cp /certs/public.crt /out/public.crt
+
+  minio-tls:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --address :9000 --certs-dir /certs
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    volumes: ["certs:/certs:ro"]
+    ports: ["19443:9000"]
+    depends_on:
+      certs: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "mc", "--insecure", "ready", "local"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  createbuckets:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio: {condition: service_healthy}
+      minio-tls: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mc alias set plain http://minio:9000 minioadmin minioadmin123
+        mc alias set tls https://minio-tls:9000 minioadmin minioadmin123 --insecure
+        mc mb --ignore-existing plain/e2e
+        mc mb --ignore-existing tls/e2e --insecure
+
+  # Variant A — http upstream, secrets straight from the environment, and a
+  # hard memory limit far below the object the streaming test pushes through
+  # it. A proxy that buffered an upload would be OOM-killed rather than
+  # merely slow, which is a far better test of "memory is independent of
+  # object size" than reading a heap profile.
+  proxy-http:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      createbuckets: {condition: service_completed_successfully}
+    # Bind-mounted read-only: the *host* side is what the hot-reload test
+    # rewrites, and it edits the file in place so the container sees it
+    # through the same inode.
+    volumes: ["./policies/live-a.yaml:/etc/s3proxy/policy.yaml:ro"]
+    environment:
+      POLICY_FILE: /etc/s3proxy/policy.yaml
+      POLICY_RELOAD_INTERVAL: 2s
+      ALLOWED_ENDPOINT: 127.0.0.1:18099
+      ALLOWED_SOURCE_SUBNET: 0.0.0.0/0
+      UPSTREAM_ENDPOINT: http://minio:9000
+      UPSTREAM_ACCESS_KEY_ID: minioadmin
+      UPSTREAM_SECRET_ACCESS_KEY: minioadmin123
+      CREDENTIAL_PEPPER: an-e2e-deployment-wide-pepper
+      METRICS_LISTEN_ADDR: ":8100"
+      METRICS_TENANT_LABEL: "true"
+      VERBOSE: "true"
+    mem_limit: 192m
+    ports: ["18099:8099", "18100:8100"]
+
+  # Variant B — https upstream with a private CA, a completely different
+  # identity scheme, and both secrets arriving as mounted files rather than
+  # environment values.
+  proxy-tls:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      createbuckets: {condition: service_completed_successfully}
+    volumes:
+      - "./policies/policy-b.yaml:/etc/s3proxy/policy.yaml:ro"
+      - "./secrets:/etc/s3proxy/secrets:ro"
+      - "certs:/etc/ssl/private-ca:ro"
+    environment:
+      POLICY_FILE: /etc/s3proxy/policy.yaml
+      ALLOWED_ENDPOINT: 127.0.0.1:18299
+      ALLOWED_SOURCE_SUBNET: 0.0.0.0/0
+      # The scheme follows from the endpoint — no second flag to keep in sync.
+      UPSTREAM_ENDPOINT: https://minio-tls:9000
+      UPSTREAM_CREDENTIALS_FILE: /etc/s3proxy/secrets/upstream-credentials
+      CREDENTIAL_PEPPER_FILE: /etc/s3proxy/secrets/pepper
+      METRICS_LISTEN_ADDR: ":8100"
+      # Trust the private CA that signed minio-tls.
+      SSL_CERT_FILE: /etc/ssl/private-ca/public.crt
+    ports: ["18299:8099", "18300:8100"]
+
+  # Variant C — the maintenance kill switch, on top of variant A's policy.
+  proxy-readonly:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      createbuckets: {condition: service_completed_successfully}
+    volumes: ["./policies/policy-a.yaml:/etc/s3proxy/policy.yaml:ro"]
+    environment:
+      POLICY_FILE: /etc/s3proxy/policy.yaml
+      ALLOWED_ENDPOINT: 127.0.0.1:18399
+      ALLOWED_SOURCE_SUBNET: 0.0.0.0/0
+      UPSTREAM_ENDPOINT: http://minio:9000
+      UPSTREAM_ACCESS_KEY_ID: minioadmin
+      UPSTREAM_SECRET_ACCESS_KEY: minioadmin123
+      CREDENTIAL_PEPPER: an-e2e-deployment-wide-pepper
+      READ_ONLY: "true"
+      METRICS_LISTEN_ADDR: ":8100"
+    ports: ["18399:8099", "18400:8100"]
+
+volumes:
+  certs:

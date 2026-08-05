@@ -1,0 +1,19 @@
+# Variant A with one permission narrowed: `rw` may no longer write under
+# datasets/. Used by the hot-reload test to observe a valid edit taking
+# effect.
+identity:
+  accessKeyIdPattern: '^(?P<tenant>[0-9a-f]{32})(?P<level>ro|rw|rws)$'
+  secretTemplate: '{tenant}:{level}'
+  keyPrefixTemplate: '{tenant}/'
+
+levels: [ro, rw, rws]
+
+rules:
+  - pathPattern: 'datasets/**'
+    grant: { ro: read, rw: read, rws: full }
+
+  - pathPattern: 'workspaces/*/inbox/**'
+    grant: { ro: read, rw: read, rws: read }
+
+  - pathPattern: 'workspaces/**'
+    grant: { ro: full, rw: full, rws: full }

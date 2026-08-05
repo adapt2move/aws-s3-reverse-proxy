@@ -28,9 +28,30 @@ jobs:
       - name: Run Docker image
         run: docker run --rm aws-s3-reverse-proxy --help
 
+  e2e:
+    name: End-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Check out source code
+        uses: actions/checkout@v4
+
+      # Real S3 clients, a real proxy and a real MinIO, across three
+      # deployment variants. See e2e/README.md.
+      - name: Run the end-to-end suite
+        run: ./e2e/run.sh
+
+      - name: Dump stack logs on failure
+        if: failure()
+        run: docker compose -f e2e/docker-compose.yml logs --tail 200
+
   publish:
     name: Publish image
-    needs: build
+    needs: [build, e2e]
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:

@@ -1,0 +1,13 @@
+# Fails validation: the first rule's grant does not cover the declared
+# level `rws`. A reload must refuse this and keep serving whatever was
+# loaded before it.
+identity:
+  accessKeyIdPattern: '^(?P<tenant>[0-9a-f]{32})(?P<level>ro|rw|rws)$'
+  secretTemplate: '{tenant}:{level}'
+  keyPrefixTemplate: '{tenant}/'
+
+levels: [ro, rw, rws]
+
+rules:
+  - pathPattern: 'datasets/**'
+    grant: { ro: read, rw: full }
