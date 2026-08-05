@@ -28,6 +28,36 @@ the security boundary — not a convenience layer in front of one.
 5. Re-sign with the upstream credentials and forward, streaming.
 6. Strip the prefix back out of `ListObjectsV2` and `DeleteObjects` responses.
 
+## Module layout
+
+Each package owns one concern and depends only on packages below it. The
+boundaries are the point: everything about *who* a caller is lives in
+`policy`, everything about *what S3 looks like on the wire* lives in `s3`, and
+neither knows the other exists.
+
+```
+cmd/aws-s3-reverse-proxy   the process: flags, secrets, listeners, shutdown
+  internal/config          Options, flag parsing, secrets from env or a file
+  internal/proxy           the request lifecycle, and only the lifecycle
+    internal/policy        the policy document, identity derivation, hot reload
+    internal/s3            classification, keys, aws-chunked, XML request and
+                           response bodies
+    internal/sigv4         inbound signature verification, upstream re-signing
+    internal/observability access log, metrics, health probes
+```
+
+Three seams keep the arrows pointing one way:
+
+- **`proxy.PolicySource`** — `interface { Current() *policy.Policy }`. The
+  handler asks for the policy in force once per request; `*policy.Store`
+  satisfies it, and so does a fixed policy with no file on disk.
+- **`s3.FilterListEntries(body, readable func(key string) bool)`** — the one
+  place the S3 package needs an authorization answer takes a predicate, so
+  levels and rules stay on the other side of the call.
+- **`policy.Store.OnReload`** — the store reports every reload attempt through
+  a hook instead of reaching for a logger and a metric registry, which is what
+  lets the authorization model be tested without either.
+
 ## Identity and credential derivation
 
 The access-key id carries the identity; the secret is derived, never stored:
@@ -294,6 +324,13 @@ All build dependencies and steps are contained in the `Dockerfile`:
 
 ```
 docker build -t aws-s3-reverse-proxy .
+```
+
+Or directly, with a Go toolchain:
+
+```
+go build ./cmd/aws-s3-reverse-proxy
+go test ./...
 ```
 
 ## Run

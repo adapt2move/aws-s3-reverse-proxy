@@ -28,7 +28,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> building the proxy"
-go build -o "$work/proxy" .
+go build -o "$work/proxy" ./cmd/aws-s3-reverse-proxy
 
 echo "==> starting minio"
 MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin123 \
