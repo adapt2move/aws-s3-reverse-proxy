@@ -96,11 +96,12 @@ Three terms, used strictly in this sense throughout:
 | Term | Meaning |
 | --- | --- |
 | **level** | the identity's access level, parsed out of the access-key id. The names come from the config; the proxy has no built-in notion of how many there are or what they mean. |
-| **permission** | what a rule grants one level for one path: `read` or `full`. |
+| **permission** | what a rule grants one level for one path: `deny`, `read` or `full`. |
 | **HTTP method** | the literal verb of the request. A permission is a set of these. |
 
 A permission expands to a set of methods:
 
+  * `deny` = nothing at all
   * `read` = `GET` / `HEAD` (a LIST is a `GET`)
   * `full` = `read` plus `PUT` / `POST` / `DELETE`, including every multipart step
 
@@ -117,6 +118,10 @@ identity:
 levels: [ro, rw, rws]
 
 rules:
+  # Denied for the two lower levels, untouched for `rws`.
+  - pathPattern: 'datasets/*/private/**'
+    grant: { ro: deny, rw: deny, rws: full }
+
   - pathPattern: 'datasets/**'
     grant: { ro: read, rw: full, rws: full }
 
@@ -132,6 +137,21 @@ rules:
 The nested read-only carve-out inside a writable prefix is the concrete reason
 ordering has to be explicit: a set of prefixes cannot express "writable, except
 this sub-path".
+
+An explicit `deny` is what the implicit one at the end of the list cannot be.
+The implicit deny only applies when *no* rule matched, so on its own it cannot
+express either half of what a carve-out usually needs:
+
+  * a hole **inside** a tree a rule already covers — the covering rule matches
+    first and grants, and moving the carve-out in front of it needs something
+    to put in its `grant` map
+  * a path one level must not touch while **another level may** — a rule has to
+    cover every declared level, so there is no way to withhold it from one of
+    them alone
+
+`deny` is first-match-wins like any other grant: where it matches it decides
+the request, no later rule gets a say, and the access log names the rule that
+refused it rather than reporting a fall-through.
 
 Path patterns are globs over the **client-facing** key — the key as the client
 sent it, before the tenant prefix goes in front of it:
@@ -151,8 +171,9 @@ itself in the error.
 A listing is authorized on its `prefix` parameter, so `GET /bucket?list-type=2`
 with no prefix matches no rule and is denied — add a rule for `**` if a tenant
 should be able to enumerate its whole scope. Entries the caller's level cannot
-read are also removed from the response, so the implicit deny holds for the
-listing that would reveal a key just as much as for a `GET` of it.
+read — whether by an explicit `deny` or by no rule at all — are also removed
+from the response, so a denial holds for the listing that would reveal a key
+just as much as for a `GET` of it.
 
 ## Configuration
 

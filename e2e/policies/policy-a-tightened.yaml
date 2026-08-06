@@ -9,6 +9,9 @@ identity:
 levels: [ro, rw, rws]
 
 rules:
+  - pathPattern: 'datasets/*/private/**'
+    grant: { ro: deny, rw: deny, rws: full }
+
   - pathPattern: 'datasets/**'
     grant: { ro: read, rw: read, rws: full }
 

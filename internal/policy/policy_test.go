@@ -30,6 +30,14 @@ func TestPolicyMatrix(t *testing.T) {
 
 	expectations := []policyExpectation{
 		{
+			// The denied carve-out sits inside the dataset tree and is listed
+			// first, so the levels it denies never reach the rule that would
+			// have granted them — while `rws` keeps full access to the very
+			// same path.
+			key: "datasets/2026/private/salaries.csv", rule: "datasets/*/private/**",
+			perm: map[string]policy.Permission{"ro": policy.PermissionDeny, "rw": policy.PermissionDeny, "rws": policy.PermissionFull},
+		},
+		{
 			key: "datasets/2026/a.csv", rule: "datasets/**",
 			perm: map[string]policy.Permission{"ro": policy.PermissionRead, "rw": policy.PermissionFull, "rws": policy.PermissionFull},
 		},
@@ -118,6 +126,60 @@ rules:
 	assert.Equal(t, "workspaces/**", decision.Rule)
 }
 
+// An explicit `deny` does what the implicit deny at the end of the list
+// cannot: refuse a path *inside* a tree a later rule covers, and refuse it
+// for some levels while another keeps it.
+func TestPolicyExplicitDeny(t *testing.T) {
+	compiled := policytest.Policy()
+	const key = "datasets/2026/private/salaries.csv"
+
+	for _, level := range []string{"ro", "rw"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost, http.MethodDelete} {
+			decision := compiled.Authorize(level, key, method)
+			assert.False(t, decision.Allowed, "%s %s", level, method)
+			// The denying rule is what decided it, rather than the request
+			// falling through to the implicit deny — which is what keeps the
+			// refusal explainable from the access log.
+			assert.Equal(t, "datasets/*/private/**", decision.Rule, "%s %s", level, method)
+		}
+	}
+
+	// The rule after it would have granted `rw` full access to that key, and
+	// still does everywhere the carve-out does not match.
+	assert.True(t, compiled.Authorize("rw", "datasets/2026/a.csv", http.MethodPut).Allowed)
+
+	// The same path stays fully available to the level the carve-out grants
+	// it to: a denial is per level, not per path.
+	assert.True(t, compiled.Authorize("rws", key, http.MethodPut).Allowed)
+	assert.True(t, compiled.Authorize("rws", key, http.MethodGet).Allowed)
+}
+
+// Denying every declared level is a legitimate rule, and the only way to
+// put a subtree out of reach that does not depend on no other rule
+// covering it.
+func TestPolicyDenyForEveryLevel(t *testing.T) {
+	compiled, err := policy.Parse([]byte(`
+identity:
+  accessKeyIdPattern: '^(?P<tenant>[0-9a-f]{32})(?P<level>ro|rws)$'
+  secretTemplate: '{tenant}:{level}'
+  keyPrefixTemplate: '{tenant}/'
+levels: [ro, rws]
+rules:
+  - pathPattern: 'tests/**'
+    grant: { ro: deny, rws: deny }
+  - pathPattern: '**'
+    grant: { ro: read, rws: full }
+`))
+	require.NoError(t, err)
+
+	for _, level := range []string{"ro", "rws"} {
+		decision := compiled.Authorize(level, "tests/fixture.csv", http.MethodGet)
+		assert.False(t, decision.Allowed, level)
+		assert.Equal(t, "tests/**", decision.Rule, level)
+	}
+	assert.True(t, compiled.Authorize("ro", "data/a.csv", http.MethodGet).Allowed)
+}
+
 func TestCompilePathPattern(t *testing.T) {
 	cases := []struct {
 		pattern string
@@ -180,7 +242,7 @@ levels: [ro, rw]
 		{
 			name:    "unknown permission",
 			yaml:    head + "rules:\n  - pathPattern: 'a/**'\n    grant: { ro: write, rw: full }\n",
-			wantErr: `grant for level "ro" is "write"`,
+			wantErr: `grant for level "ro" is "write", want "deny", "read" or "full"`,
 		},
 		{
 			name:    "absolute path pattern",

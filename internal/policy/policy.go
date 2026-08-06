@@ -21,16 +21,29 @@ import (
 // A permission is what a rule grants one level for one path pattern. It
 // expands to a set of HTTP methods:
 //
+//	deny = nothing at all
 //	read = GET / HEAD (a LIST is a GET)
 //	full = read plus PUT / POST / DELETE, including every multipart step
 //
-// These two are the whole vocabulary. There is no permission that grants
-// less than `read`: a path a level must not read at all is simply left
-// unmatched, and the implicit deny at the end of the rule list takes care
-// of it.
+// An explicit `deny` is not the same as leaving a path unmatched. The
+// implicit deny at the end of the rule list only applies when *no* rule
+// matched, so on its own it cannot express either half of what an operator
+// usually wants:
+//
+//   - a hole inside a tree a rule already covers — the covering rule
+//     matches first and grants, and moving the carve-out in front of it
+//     needs something to put in its `grant` map
+//   - a path one level must not touch while another level may — a rule has
+//     to cover every declared level, so there is no way to withhold it from
+//     one of them alone
+//
+// `deny` is first-match-wins like any other grant: it decides the request
+// where it matches, and no later rule gets a say.
 type Permission string
 
 const (
+	// PermissionDeny grants nothing.
+	PermissionDeny Permission = "deny"
 	// PermissionRead grants the non-mutating methods.
 	PermissionRead Permission = "read"
 	// PermissionFull grants the non-mutating methods plus every mutation.
@@ -42,6 +55,9 @@ const (
 // therefore denied — the method set is a whitelist, like everything else on
 // the request path.
 func (p Permission) allows(method string) bool {
+	if p == PermissionDeny {
+		return false
+	}
 	switch method {
 	case http.MethodGet, http.MethodHead:
 		return p == PermissionRead || p == PermissionFull
@@ -138,8 +154,10 @@ var deniedByDefault = Decision{Allowed: false, Rule: ""}
 // Authorize resolves `method` on the client-facing key `subject` for one
 // level against the ordered rule list. The list is first-match-wins: the
 // first rule whose pattern matches decides, even when a later rule would
-// have granted more. That is what makes a read-only carve-out expressible
-// *inside* a writable prefix — the carve-out is simply listed first.
+// have granted more. That is what makes a carve-out expressible *inside* a
+// broader prefix — the carve-out is simply listed first, granting `read`
+// where the tree is writable, or `deny` where it must not be reachable at
+// all.
 //
 // Anything not matched by a rule is denied (the implicit deny at the end).
 func (p *Policy) Authorize(level, subject, method string) Decision {
@@ -301,8 +319,10 @@ func (p *Policy) compileRules(rules []RuleConfig) error {
 			if !ok {
 				return fmt.Errorf("%s: grant is missing level %q", where, level)
 			}
-			if perm != PermissionRead && perm != PermissionFull {
-				return fmt.Errorf("%s: grant for level %q is %q, want %q or %q", where, level, perm, PermissionRead, PermissionFull)
+			switch perm {
+			case PermissionDeny, PermissionRead, PermissionFull:
+			default:
+				return fmt.Errorf("%s: grant for level %q is %q, want %q, %q or %q", where, level, perm, PermissionDeny, PermissionRead, PermissionFull)
 			}
 		}
 		grant := make(map[string]Permission, len(rule.Grant))

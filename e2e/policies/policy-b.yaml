@@ -13,6 +13,9 @@ identity:
 levels: [reader, writer, admin]
 
 rules:
+  - pathPattern: 'datasets/*/private/**'
+    grant: { reader: deny, writer: deny, admin: full }
+
   - pathPattern: 'datasets/**'
     grant: { reader: read, writer: full, admin: full }
 
