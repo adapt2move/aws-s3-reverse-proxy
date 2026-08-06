@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -243,4 +244,51 @@ func TestParseDeleteRequest(t *testing.T) {
 	_, err = ParseDeleteRequest([]byte(many.String()))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "the limit is 1000")
+}
+
+// Malformed aws-chunked framing is reachable after authorization — a client
+// with a perfectly valid signature can still send nonsense in the body — so
+// every way the framing can be wrong has to end in an error rather than a
+// panic, a hang, or a silently truncated object.
+func TestChunkedFramingErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"non-hex size line", "zz\r\npayload\r\n0\r\n\r\n", "invalid chunk size"},
+		{"negative size line", "-5\r\npayload\r\n0\r\n\r\n", "invalid chunk size"},
+		{
+			// Declares 16 bytes and supplies 5. Truncating silently would
+			// store a short object under a name the client believes is whole.
+			"chunk shorter than declared", "10\r\nshort\r\n0\r\n\r\n", "",
+		},
+		{"no terminating chunk", "5\r\nhello\r\n", ""},
+		{"size line past the cap", strings.Repeat("0", maxChunkedSizeLine+1) + "\r\n", "line longer than"},
+		{
+			"too many trailers",
+			"5\r\nhello\r\n0\r\n" + strings.Repeat("x-amz-checksum-crc32:abcd\r\n", maxChunkedTrailers+2) + "\r\n",
+			"more than 16 chunk trailers",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run("buffered/"+tc.name, func(t *testing.T) {
+			_, _, err := DecodeChunked(strings.NewReader(tc.input), 1<<20, "test")
+			require.Error(t, err)
+			if tc.want != "" {
+				assert.Contains(t, err.Error(), tc.want)
+			}
+		})
+
+		t.Run("streamed/"+tc.name, func(t *testing.T) {
+			// The streaming reader drops trailers rather than parsing them,
+			// so that one case is not an error on this path.
+			if tc.name == "too many trailers" {
+				t.Skip("the streaming reader drains trailers instead of parsing them")
+			}
+			_, err := io.ReadAll(NewChunkedReader(strings.NewReader(tc.input)))
+			require.Error(t, err, "a malformed stream must not read back as a clean EOF")
+		})
+	}
 }

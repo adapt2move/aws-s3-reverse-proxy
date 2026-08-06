@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -195,6 +196,71 @@ func TestUndecodableListingFailsClosed(t *testing.T) {
 		w.Header().Set("Content-Encoding", "br")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("\x00\x01not-brotli-either"))
+	}
+
+	rec := do(t, h, clientRequest{
+		method: http.MethodGet, target: "/bucket/?list-type=2&prefix=datasets/",
+		tenant: tenantA, level: "ro",
+	})
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
+	assert.NotContains(t, rec.Body.String(), tenantA)
+}
+
+// A listing is buffered to have the tenant prefix stripped out of it, and
+// that buffer is capped. Past the cap there is no safe answer: forwarding the
+// body unrewritten would hand the client upstream-shaped keys, so the request
+// fails closed instead. An object payload is a different case — it is never
+// rewritten and never buffered, which TestObjectPayloadIsNeverRewritten
+// covers.
+func TestOversizedListingFailsClosed(t *testing.T) {
+	h, upstream := newTestProxy(t, func(c *Config) { c.Limits.RewriteBody = 256 })
+
+	var body strings.Builder
+	body.WriteString("<ListBucketResult>")
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&body, "<Contents><Key>%s/datasets/%d.csv</Key></Contents>", tenantA, i)
+	}
+	body.WriteString("</ListBucketResult>")
+	respondXML(upstream, body.String())
+
+	rec := do(t, h, clientRequest{
+		method: http.MethodGet, target: "/bucket/?list-type=2&prefix=datasets/",
+		tenant: tenantA, level: "ro",
+	})
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
+	assert.NotContains(t, rec.Body.String(), tenantA,
+		"a listing that could not be rewritten must not reach the client at all")
+}
+
+// The same cap has to bound the *decompressed* size, or a small gzip body
+// would expand past it unchecked — the compressed read being under the cap
+// says nothing about what it expands to.
+func TestGzipListingExpandingPastTheCapFailsClosed(t *testing.T) {
+	h, upstream := newTestProxy(t, func(c *Config) { c.Limits.RewriteBody = 4096 })
+
+	// Deliberately repetitive, so the compressed form stays far under the cap
+	// while the decompressed form is far over it — that gap is the whole
+	// point of capping the decompressed read separately.
+	var plain strings.Builder
+	plain.WriteString("<ListBucketResult>")
+	for i := 0; i < 2000; i++ {
+		fmt.Fprintf(&plain, "<Contents><Key>%s/datasets/same.csv</Key></Contents>", tenantA)
+	}
+	plain.WriteString("</ListBucketResult>")
+
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	_, _ = zw.Write([]byte(plain.String()))
+	require.NoError(t, zw.Close())
+	require.Less(t, compressed.Len(), 4096,
+		"the compressed body must be under the cap, or this tests the compressed read instead")
+	require.Greater(t, plain.Len(), 4096, "and the decompressed body must be over it")
+
+	upstream.respond = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(compressed.Bytes())
 	}
 
 	rec := do(t, h, clientRequest{

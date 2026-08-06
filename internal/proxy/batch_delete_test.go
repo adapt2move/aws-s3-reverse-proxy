@@ -206,3 +206,35 @@ func TestDeleteObjectsOverAwsChunked(t *testing.T) {
 	assert.Equal(t, []string{tenantA + "/datasets/a.csv"}, parsedKeys(upstream.last(t)))
 	assert.Contains(t, rec.Body.String(), "<Error><Key>workspaces/w1/inbox/b.txt</Key><Code>AccessDenied</Code>")
 }
+
+// A batch delete arriving in aws-chunked framing is buffered under the
+// DeleteObjects cap rather than the aws-chunked one — the body is a key list
+// to be parsed and rebuilt, not an object to be de-framed and passed on. That
+// switch in prepareBody has its own limit, so it needs its own test.
+func TestDeleteObjectsOverAwsChunkedRespectsTheDeleteCap(t *testing.T) {
+	// Generous room for a framed object body, almost none for a key list: if
+	// the switch picked the wrong limit, this would be accepted.
+	h, upstream := newTestProxy(t, func(c *Config) {
+		c.Limits.ChunkedBody = 1 << 20
+		c.Limits.DeleteBody = 64
+	})
+
+	keys := make([]string, 0, 64)
+	for i := 0; i < 64; i++ {
+		keys = append(keys, fmt.Sprintf("datasets/%d.csv", i))
+	}
+	body := deleteBatchBody(keys...)
+	framed := fmt.Sprintf("%x\r\n%s\r\n0\r\n\r\n", len(body), body)
+
+	rec := do(t, h, clientRequest{
+		method: http.MethodPost, target: "/bucket?delete",
+		body: []byte(framed), tenant: tenantA, level: "rw",
+		headers: http.Header{
+			"X-Amz-Content-Sha256":         {"STREAMING-AWS4-HMAC-SHA256-PAYLOAD"},
+			"X-Amz-Decoded-Content-Length": {fmt.Sprint(len(body))},
+			"Content-Encoding":             {"aws-chunked"},
+		},
+	})
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, 0, upstream.count())
+}
