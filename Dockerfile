@@ -5,7 +5,7 @@ RUN apk add -U --no-cache ca-certificates git bash
 WORKDIR /app
 COPY . .
 
-RUN go build -o aws-s3-reverse-proxy && \
+RUN go build -o aws-s3-reverse-proxy ./cmd/aws-s3-reverse-proxy && \
     mv ./aws-s3-reverse-proxy /go/bin
 
 FROM alpine:3.13

@@ -1,0 +1,18 @@
+# Variant A: the shape from the design — a 32-hex tenant id with the level
+# glued straight onto it, and one prefix segment per tenant.
+identity:
+  accessKeyIdPattern: '^(?P<tenant>[0-9a-f]{32})(?P<level>ro|rw|rws)$'
+  secretTemplate: '{tenant}:{level}'
+  keyPrefixTemplate: '{tenant}/'
+
+levels: [ro, rw, rws]
+
+rules:
+  - pathPattern: 'datasets/**'
+    grant: { ro: read, rw: full, rws: full }
+
+  - pathPattern: 'workspaces/*/inbox/**'
+    grant: { ro: read, rw: read, rws: read }
+
+  - pathPattern: 'workspaces/**'
+    grant: { ro: full, rw: full, rws: full }
