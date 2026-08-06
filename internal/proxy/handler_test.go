@@ -446,6 +446,36 @@ func TestForwardedHeadersAreSigned(t *testing.T) {
 	assert.Equal(t, "text/csv", got.header.Get("Content-Type"))
 }
 
+// The inverse of the refusal below, and the more fragile half: a whitelist
+// that grows teeth against the next client is a whitelist nobody notices
+// until that client 403s on every request. These are headers real SDKs send
+// that carry no instruction to the object store — `x-amz-user-agent` above
+// all, which is `User-Agent` wearing an `x-amz-` prefix because the Fetch
+// spec forbids a browser from setting its own.
+func TestClientTelemetryHeadersAreAccepted(t *testing.T) {
+	for _, header := range []string{
+		"X-Amz-User-Agent",             // AWS JS SDK v3 in a browser
+		"X-Amz-Te",                     // legacy Java SDK v1
+		"X-Amz-Sdk-Request",            // SDK retry counters
+		"X-Amz-Sdk-Invocation-Id",      // SDK retry correlation
+		"X-Amz-Sdk-Checksum-Algorithm", // the algorithm the SDK chose
+	} {
+		t.Run(header, func(t *testing.T) {
+			h, upstream := newTestProxy(t)
+			rec := do(t, h, clientRequest{
+				method: http.MethodPut, target: "/bucket/datasets/x.csv",
+				body: []byte("hello"), tenant: tenantA, level: "rw",
+				headers: http.Header{header: {"anything"}},
+			})
+			require.Equal(t, http.StatusOK, rec.Code, "a client sending %s must not be refused", header)
+			// Accepted, but it describes the caller rather than the object,
+			// and to the object store the caller is this proxy.
+			assert.Empty(t, upstream.last(t).header.Get(header),
+				"%s describes the client, so it must not travel upstream", header)
+		})
+	}
+}
+
 // An `x-amz-` header this proxy does not understand is one it cannot
 // authorize, so it is refused rather than passed through. x-amz-object-lock-*
 // is the case that makes failing closed worth it: it can pin an object beyond

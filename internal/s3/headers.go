@@ -79,16 +79,31 @@ var forwardedHeaders = map[string]bool{
 //     byte, so the end-to-end integrity check survives the re-signing
 var forwardedPrefixes = []string{"X-Amz-Meta-", "X-Amz-Checksum-"}
 
-// consumedHeaders are the `x-amz-` headers this proxy reads itself. They are
-// accepted on the way in and never forwarded: the upstream request carries
-// the proxy's own values instead.
+// consumedHeaders are the `x-amz-` headers this proxy reads itself, or that
+// describe the client rather than the object. They are accepted on the way in
+// and never forwarded: the upstream request carries the proxy's own values
+// instead, and to the object store the proxy *is* the client.
 var consumedHeaders = map[string]bool{
+	// Read by the request path: the signature, the aws-chunked framing.
 	"X-Amz-Date":                   true,
 	"X-Amz-Content-Sha256":         true,
 	"X-Amz-Decoded-Content-Length": true,
 	"X-Amz-Trailer":                true,
-	"X-Amz-Sdk-Checksum-Algorithm": true,
+
+	// Telemetry about the caller. A browser cannot set `User-Agent` — the
+	// Fetch spec forbids it — so the AWS JS SDK v3 sends it under an
+	// `x-amz-` prefix instead. Refusing it would 403 every browser client on
+	// every request, and it instructs the object store to do nothing at all.
+	"X-Amz-User-Agent": true,
+	"X-Amz-Te":         true,
 }
+
+// consumedPrefixes are `x-amz-` families that describe the SDK making the
+// call, not the object: the checksum algorithm it chose, its retry counters
+// (`x-amz-sdk-request`), its invocation id. Newer SDKs also send the same
+// values without the `x-amz-` prefix, where they fall through as ordinary
+// unforwarded headers.
+var consumedPrefixes = []string{"X-Amz-Sdk-"}
 
 // ForwardableHeader reports whether a client request header travels upstream.
 func ForwardableHeader(name string) bool {
@@ -97,6 +112,20 @@ func ForwardableHeader(name string) bool {
 		return forwarded
 	}
 	for _, prefix := range forwardedPrefixes {
+		if strings.HasPrefix(canonical, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// consumed reports whether a header is one the proxy reads itself, rather
+// than one it passes on.
+func consumed(canonical string) bool {
+	if consumedHeaders[canonical] {
+		return true
+	}
+	for _, prefix := range consumedPrefixes {
 		if strings.HasPrefix(canonical, prefix) {
 			return true
 		}
@@ -113,7 +142,7 @@ func CheckRequestHeaders(header http.Header) error {
 		if !strings.HasPrefix(canonical, "X-Amz-") {
 			continue
 		}
-		if consumedHeaders[canonical] || ForwardableHeader(canonical) {
+		if consumed(canonical) || ForwardableHeader(canonical) {
 			continue
 		}
 		return fmt.Errorf("%w: %s header", ErrUnsupportedOperation, canonical)

@@ -252,11 +252,15 @@ never touch the file except when told to.
     its own object — `Content-Type`, `Content-Md5`, `Content-Encoding`,
     `Content-Disposition`, `Content-Language`, `Cache-Control`, `Expires`,
     `Range`, the conditional `If-*` headers, `Accept-Encoding`, and the
-    `x-amz-meta-*` and `x-amz-checksum-*` families. Every other `x-amz-`
-    header is `403`, because one the proxy does not understand is one it
-    cannot authorize: `x-amz-acl`, `x-amz-object-lock-*`, `x-amz-tagging`,
-    `x-amz-storage-class` and `x-amz-server-side-encryption-*` are all
-    decisions that belong to the operator and are made on the bucket.
+    `x-amz-meta-*` and `x-amz-checksum-*` families. Client telemetry that
+    carries no instruction — `x-amz-user-agent` (what a browser SDK sends
+    because the Fetch spec forbids it setting `User-Agent`), `x-amz-te` and
+    the `x-amz-sdk-*` family — is accepted but not forwarded. Every other
+    `x-amz-` header is `403`, because one the proxy does not understand is
+    one it cannot authorize: `x-amz-acl`, `x-amz-object-lock-*`,
+    `x-amz-tagging`, `x-amz-storage-class` and
+    `x-amz-server-side-encryption-*` are all decisions that belong to the
+    operator and are made on the bucket.
   * Whatever is forwarded is also **signed** upstream. Headers are copied onto
     the upstream request before it is signed, never after, so nothing reaches
     the object store outside the proxy's own signature.
