@@ -158,13 +158,15 @@ func TestCompressedListingIsStillStripped(t *testing.T) {
 	h, upstream := newTestProxy(t)
 	body := `<ListBucketResult><Contents><Key>` + tenantA + `/datasets/a.csv</Key></Contents></ListBucketResult>`
 	upstream.respond = func(w http.ResponseWriter, r *http.Request) {
-		// The proxy must not have asked for a compressed body here...
-		if ae := r.Header.Get("Accept-Encoding"); strings.Contains(ae, "gzip") && !strings.Contains(ae, "identity") {
-			// Go's transport adds its own gzip and undoes it transparently;
-			// what matters is that the *client's* header was not forwarded.
-			assert.NotEqual(t, "gzip, deflate, custom-from-client", ae)
-		}
-		// ...but answer compressed anyway, as a stubborn store would.
+		// The client's header must NOT have been forwarded on this path: Go's
+		// transport adds its own `gzip` and undoes it transparently, which is
+		// what lets the body be rewritten. The client's value carries a token
+		// the transport never emits, so seeing it here would mean the strip
+		// did not happen — unconditionally, since a guard that can skip
+		// itself is a guard that reads as more than it is.
+		assert.NotEqual(t, "gzip, deflate, custom-from-client", r.Header.Get("Accept-Encoding"),
+			"the client's Accept-Encoding must not reach the upstream on a rewriting operation")
+		// Answer compressed anyway, as a stubborn store would.
 		var buf bytes.Buffer
 		zw := gzip.NewWriter(&buf)
 		_, _ = zw.Write([]byte(body))
@@ -268,7 +270,14 @@ func TestGzipErrorBodyExpandingPastTheCapFailsClosed(t *testing.T) {
 		// The client's own Accept-Encoding has to have reached the upstream,
 		// or Go's transport would have decompressed the answer for us and
 		// this would be testing the branch next door.
-		require.Equal(t, "gzip", r.Header.Get("Accept-Encoding"))
+		//
+		// The value matters as much as the assertion. When the proxy strips
+		// this header the transport substitutes a bare `gzip`, so a guard
+		// expecting `gzip` is satisfied by the very failure it is watching
+		// for. `gzip, deflate` is a value the transport never emits, so the
+		// two cases are distinguishable.
+		require.Equal(t, "gzip, deflate", r.Header.Get("Accept-Encoding"),
+			"the client's own Accept-Encoding must have been forwarded, not the transport's substitute")
 		w.Header().Set("Content-Type", "application/xml")
 		w.Header().Set("Content-Encoding", "gzip")
 		w.WriteHeader(http.StatusNotFound)
@@ -278,7 +287,7 @@ func TestGzipErrorBodyExpandingPastTheCapFailsClosed(t *testing.T) {
 	rec := do(t, h, clientRequest{
 		method: http.MethodGet, target: "/bucket/datasets/gone.csv",
 		tenant: tenantA, level: "ro",
-		headers: http.Header{"Accept-Encoding": {"gzip"}},
+		headers: http.Header{"Accept-Encoding": {"gzip, deflate"}},
 	})
 	// What the cap buys is a bound on the amplification: this body is ~270x
 	// larger decompressed, and a hostile one is limited only by what gzip can
