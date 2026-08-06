@@ -60,10 +60,11 @@ func TestDeleteObjectsAuthorizesEachKey(t *testing.T) {
 	echoDeleteResult(upstream)
 
 	body := deleteBatchBody(
-		"workspaces/w1/out/keep.txt",   // full for rw
-		"workspaces/w1/inbox/note.txt", // read-only carve-out: delete denied
-		"datasets/2026/old.csv",        // full for rw
-		"nowhere/x.txt",                // matched by no rule: implicit deny
+		"workspaces/w1/out/keep.txt",         // full for rw
+		"workspaces/w1/inbox/note.txt",       // read-only carve-out: delete denied
+		"datasets/2026/old.csv",              // full for rw
+		"datasets/2026/private/salaries.csv", // denied carve-out inside the same tree
+		"nowhere/x.txt",                      // matched by no rule: implicit deny
 	)
 	rec := do(t, h, clientRequest{
 		method: http.MethodPost, target: "/bucket?delete",
@@ -85,6 +86,7 @@ func TestDeleteObjectsAuthorizesEachKey(t *testing.T) {
 	assert.NotContains(t, out, tenantA)
 	// ... and each refused key is reported individually.
 	assert.Contains(t, out, "<Error><Key>workspaces/w1/inbox/note.txt</Key><Code>AccessDenied</Code>")
+	assert.Contains(t, out, "<Error><Key>datasets/2026/private/salaries.csv</Key><Code>AccessDenied</Code>")
 	assert.Contains(t, out, "<Error><Key>nowhere/x.txt</Key><Code>AccessDenied</Code>")
 }
 

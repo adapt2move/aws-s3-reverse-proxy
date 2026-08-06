@@ -94,6 +94,42 @@ func TestListingHidesUnreadableEntries(t *testing.T) {
 	assert.NotContains(t, out, "nowhere/")
 }
 
+// The same holds for a path a rule denies outright: it sits under a prefix
+// the caller may list, so nothing but the per-entry check keeps it out of
+// the answer.
+func TestListingHidesDeniedEntries(t *testing.T) {
+	h, upstream := newTestProxy(t)
+	body := `<ListBucketResult>` +
+		`<Contents><Key>` + tenantA + `/datasets/2026/a.csv</Key></Contents>` +
+		`<Contents><Key>` + tenantA + `/datasets/2026/private/salaries.csv</Key></Contents>` +
+		`<CommonPrefixes><Prefix>` + tenantA + `/datasets/2026/private/</Prefix></CommonPrefixes>` +
+		`</ListBucketResult>`
+
+	t.Run("a denied level does not see them", func(t *testing.T) {
+		respondXML(upstream, body)
+		rec := do(t, h, clientRequest{
+			method: http.MethodGet, target: "/bucket/?list-type=2&prefix=datasets/",
+			tenant: tenantA, level: "rw",
+		})
+		require.Equal(t, http.StatusOK, rec.Code)
+
+		out := rec.Body.String()
+		assert.Contains(t, out, "<Key>datasets/2026/a.csv</Key>")
+		assert.NotContains(t, out, "salaries.csv")
+		assert.NotContains(t, out, "private/")
+	})
+
+	t.Run("the level the rule grants still sees them", func(t *testing.T) {
+		respondXML(upstream, body)
+		rec := do(t, h, clientRequest{
+			method: http.MethodGet, target: "/bucket/?list-type=2&prefix=datasets/",
+			tenant: tenantA, level: "rws",
+		})
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.Contains(t, rec.Body.String(), "<Key>datasets/2026/private/salaries.csv</Key>")
+	})
+}
+
 // A CompleteMultipartUpload result names the key twice — once bare, once
 // inside a URL.
 func TestMultipartResultIsStripped(t *testing.T) {

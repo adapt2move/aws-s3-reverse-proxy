@@ -49,9 +49,17 @@ levels: [ro, rw, rws]
 #   **  matches across `/`      *  stays inside one segment   ?  one character
 #
 # A permission expands to a set of HTTP methods:
+#   deny = nothing at all
 #   read = GET / HEAD (a LIST is a GET)
 #   full = read plus PUT / POST / DELETE, including every multipart step
 rules:
+  # An explicit `deny` is not the implicit one: it refuses a path that a
+  # later rule covers, and it refuses it per level. Leaving the path out of
+  # the rule list could do neither — the rule below would match it, and a
+  # rule has to cover every declared level anyway.
+  - pathPattern: 'datasets/*/private/**'
+    grant: { ro: deny, rw: deny, rws: full }
+
   - pathPattern: 'datasets/**'
     grant: { ro: read, rw: full, rws: full }
 

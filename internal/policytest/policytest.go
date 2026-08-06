@@ -14,10 +14,10 @@ import (
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/policy"
 )
 
-// YAML is the policy from the design, verbatim: a writable dataset area, a
-// read-only carve-out nested *inside* a writable workspace tree, and the
-// broader workspace rule after it. The ordering is the point — see
-// TestPolicyNestedCarveOutDependsOnOrder.
+// YAML is the policy from the design, verbatim: a writable dataset area
+// with a denied carve-out inside it, a read-only carve-out nested *inside*
+// a writable workspace tree, and the broader workspace rule after it. The
+// ordering is the point — see TestPolicyNestedCarveOutDependsOnOrder.
 const YAML = `
 identity:
   accessKeyIdPattern: '^(?P<tenant>[0-9a-f]{32})(?P<level>ro|rw|rws)$'
@@ -27,6 +27,9 @@ identity:
 levels: [ro, rw, rws]
 
 rules:
+  - pathPattern: 'datasets/*/private/**'
+    grant: { ro: deny, rw: deny, rws: full }
+
   - pathPattern: 'datasets/**'
     grant: { ro: read, rw: full, rws: full }
 

@@ -8,6 +8,11 @@ identity:
 levels: [ro, rw, rws]
 
 rules:
+  # An explicit deny: refused for both lower levels even though the rule
+  # after it covers the same tree, and still fully available to `rws`.
+  - pathPattern: 'datasets/*/private/**'
+    grant: { ro: deny, rw: deny, rws: full }
+
   - pathPattern: 'datasets/**'
     grant: { ro: read, rw: full, rws: full }
 

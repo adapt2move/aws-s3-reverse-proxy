@@ -115,6 +115,42 @@ func TestMultipartRequiresFullPermission(t *testing.T) {
 	}
 }
 
+// A path a rule denies is refused for the levels it denies, on every
+// method, and never reaches the object store — even though the rule right
+// after it grants the tree it sits in. The level the same rule grants is
+// unaffected, which is the whole reason the grant is per level.
+func TestDeniedPathIsRefused(t *testing.T) {
+	h, upstream := newTestProxy(t)
+	const target = "/bucket/datasets/2026/private/salaries.csv"
+
+	for _, level := range []string{"ro", "rw"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete} {
+			t.Run(level+" "+method, func(t *testing.T) {
+				before := upstream.count()
+				var body []byte
+				if method == http.MethodPut {
+					body = []byte("x")
+				}
+				rec := do(t, h, clientRequest{
+					method: method, target: target, body: body,
+					tenant: tenantA, level: level,
+				})
+				assert.Equal(t, http.StatusForbidden, rec.Code)
+				assert.Equal(t, before, upstream.count(), "a denied request must never reach the object store")
+			})
+		}
+	}
+
+	t.Run("the level the rule grants still gets through", func(t *testing.T) {
+		rec := do(t, h, clientRequest{
+			method: http.MethodPut, target: target, body: []byte("x"),
+			tenant: tenantA, level: "rws",
+		})
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, "/bucket/"+tenantA+"/datasets/2026/private/salaries.csv", upstream.last(t).path)
+	})
+}
+
 // Every shape the proxy does not implement has to fail closed, whether or
 // not the caller holds a perfectly valid credential.
 func TestUnsupportedOperationsAreRefused(t *testing.T) {

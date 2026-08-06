@@ -198,6 +198,49 @@ func TestPolicyEnforcement(t *testing.T) {
 		requireDenied(t, putObject(t, writer, env.Bucket, "nowhere/secret.csv", []byte("x")), "writing an uncovered path")
 	})
 
+	// The one thing the implicit deny cannot express: a hole inside a tree
+	// the next rule covers, denied to two levels and left whole for the
+	// third.
+	t.Run("an explicitly denied path is unreachable inside a readable tree", func(t *testing.T) {
+		const denied = "datasets/2026/private/salaries.csv"
+		const readable = "datasets/2026/summary.csv"
+
+		// Seed with root credentials: the point is what the proxy lets a
+		// client do to these objects, not how they got there.
+		admin := env.Admin(t)
+		for _, key := range []string{denied, readable} {
+			requireNoError(t, putObject(t, admin, env.Bucket, env.UpstreamKey(env.TenantA, key), []byte("seed")), "seeding "+key)
+		}
+		t.Cleanup(func() {
+			for _, key := range []string{denied, readable} {
+				_, _ = admin.DeleteObject(&s3.DeleteObjectInput{
+					Bucket: aws.String(env.Bucket), Key: aws.String(env.UpstreamKey(env.TenantA, key)),
+				})
+			}
+		})
+
+		for _, client := range []*s3.S3{reader, writer} {
+			_, err := getObject(t, client, env.Bucket, denied)
+			requireDenied(t, err, "reading the denied carve-out")
+		}
+
+		// The tree around it is untouched...
+		_, err := getObject(t, reader, env.Bucket, readable)
+		requireNoError(t, err, "reading the rest of the tree")
+
+		// ...and the denied key is not even visible in a listing of it,
+		// which is where a denial that only covered reads would show.
+		list, err := reader.ListObjectsV2(&s3.ListObjectsV2Input{
+			Bucket: aws.String(env.Bucket), Prefix: aws.String("datasets/2026/"),
+		})
+		requireNoError(t, err, "listing the tree")
+		for _, obj := range list.Contents {
+			if strings.Contains(aws.StringValue(obj.Key), "/private/") {
+				t.Fatalf("a listing revealed a denied key: %q", aws.StringValue(obj.Key))
+			}
+		}
+	})
+
 	if env.ReadOnly {
 		t.Run("the kill switch refuses every mutation", func(t *testing.T) {
 			requireDenied(t, putObject(t, writer, env.Bucket, "datasets/a.csv", []byte("x")), "put under --read-only")

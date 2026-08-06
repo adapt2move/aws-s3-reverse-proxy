@@ -56,10 +56,10 @@ func rewriteUpstreamResponse(resp *http.Response) error {
 	body = s3.StripKeyPrefix(body, st.identity.KeyPrefix)
 	if st.operation.Kind == s3.ListObjects {
 		// A listing is already authorized on its own prefix, so this only
-		// ever removes what the implicit deny at the end of the rule list
-		// covers — the paths inside the tenant's scope that no rule mentions
-		// at all. Without it, "not matched by a rule is denied" would hold
-		// for reads but not for the listing that reveals them.
+		// ever removes what a denial *below* that prefix covers — the paths
+		// inside the tenant's scope that no rule mentions at all, and the
+		// ones a rule denies this level outright. Without it, "denied" would
+		// hold for reads but not for the listing that reveals them.
 		body = s3.FilterListEntries(body, func(key string) bool {
 			return st.policy.Authorize(st.identity.Level, key, http.MethodGet).Allowed
 		})
