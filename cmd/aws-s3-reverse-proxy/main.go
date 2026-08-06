@@ -102,17 +102,12 @@ func buildProxy(opts config.Options) (*proxy.Handler, *policy.Store, error) {
 	}
 	store.OnReload = reportReload(store)
 
-	upstreamRegion := opts.UpstreamRegion
-	if upstreamRegion == "" {
-		upstreamRegion = opts.Region
-	}
-
 	handler, err := proxy.New(proxy.Config{
 		Debug:                 opts.Debug,
 		ReadOnly:              opts.ReadOnly,
 		UpstreamScheme:        scheme,
 		UpstreamEndpoint:      endpoint,
-		UpstreamRegion:        upstreamRegion,
+		UpstreamRegion:        opts.UpstreamRegion,
 		AllowedSourceEndpoint: opts.AllowedSourceEndpoint,
 		AllowedSourceSubnet:   subnets,
 		Policy:                store,

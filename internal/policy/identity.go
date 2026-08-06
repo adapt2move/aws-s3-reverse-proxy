@@ -82,6 +82,13 @@ func (p *Policy) ResolveIdentity(accessKeyID string, pepper []byte) (*Identity, 
 		// of another tenant's shape (or the bucket root). Fail closed.
 		return nil, errUnknownAccessKeyID
 	}
+	// The trailing separator the template is required to end in only keeps
+	// prefixes mutually exclusive while the tenant itself contributes no
+	// separators of its own: with a permissive pattern, tenant "a" and tenant
+	// "a/b" would otherwise land in the same nested key space.
+	if strings.ContainsRune(tenant, '/') {
+		return nil, errUnknownAccessKeyID
+	}
 	if _, ok := p.levelSet[level]; !ok {
 		return nil, errUnknownAccessKeyID
 	}
@@ -110,6 +117,12 @@ func validateRenderedKeyPrefix(prefix string) error {
 	}
 	if strings.HasPrefix(prefix, "/") {
 		return fmt.Errorf("rendered key prefix must not start with %q", "/")
+	}
+	// Enforced on the template at load time too; repeated here because this
+	// is the invariant that actually matters — every tenant's prefix ends at
+	// a separator, so none of them is a prefix of another.
+	if !strings.HasSuffix(prefix, "/") {
+		return fmt.Errorf("rendered key prefix must end in %q", "/")
 	}
 	for _, segment := range strings.Split(prefix, "/") {
 		if segment == ".." || segment == "." {

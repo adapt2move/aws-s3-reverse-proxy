@@ -20,9 +20,9 @@ import (
 // to add (a checksum recovered from a chunk trailer, a recomputed
 // Content-MD5).
 //
-// contentLength is authoritative. A body whose length we cannot state is
-// buffered rather than forwarded with a chunked transfer encoding, which AWS
-// S3 rejects outright on PUT.
+// contentLength is authoritative, and prepareBody refuses any request whose
+// length it cannot state: forwarding one would make Go fall back to a chunked
+// transfer encoding, which AWS S3 rejects outright on PUT.
 type preparedBody struct {
 	reader        io.Reader
 	contentLength int64
@@ -48,6 +48,16 @@ var errAllKeysDenied = errors.New("batch delete: no key survived authorization")
 //     header before the payload
 func (h *Handler) prepareBody(req *http.Request, st *requestState) (*preparedBody, string, error) {
 	chunked := s3.IsChunkedUpload(req)
+
+	// A negative ContentLength means the client sent a plain
+	// `Transfer-Encoding: chunked` body and never said how long it is. There
+	// is nothing to forward it as except another chunked transfer encoding,
+	// which S3 refuses on PUT, so refuse it here where the reason can be
+	// stated. (An aws-chunked body is a different thing: it announces its
+	// decoded length in a header, and is handled below.)
+	if req.Body != nil && req.ContentLength < 0 && !chunked {
+		return nil, "", fmt.Errorf("request body has no Content-Length")
+	}
 
 	if req.Body == nil || (req.ContentLength == 0 && !chunked) {
 		if st.operation.Kind == s3.DeleteObjects {

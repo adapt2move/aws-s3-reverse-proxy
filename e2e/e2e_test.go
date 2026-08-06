@@ -469,6 +469,95 @@ func TestUnsupportedOperationsAreRefused(t *testing.T) {
 	})
 }
 
+// Request headers are a whitelist, and the two halves of that have to be
+// checked against a real object store: what a tenant may set has to survive
+// the re-signing and come back on the read, and what it may not set has to be
+// refused before the store ever sees it.
+//
+// The first half is what a stub upstream cannot verify — user metadata only
+// round-trips if the header was copied onto the upstream request *before* it
+// was signed. Real AWS S3 would answer SignatureDoesNotMatch otherwise; MinIO
+// would accept it, so the assertion here is the round trip itself.
+func TestRequestHeaderWhitelist(t *testing.T) {
+	env := setup(t)
+	if env.ReadOnly {
+		t.Skip("this deployment runs with the mutation kill switch on")
+	}
+	client := env.Client(t, env.TenantA, env.WriteLevel)
+	key := "datasets/headers/object.csv"
+
+	t.Run("metadata a tenant may set survives the round trip", func(t *testing.T) {
+		_, err := client.PutObject(&s3.PutObjectInput{
+			Bucket:             aws.String(env.Bucket),
+			Key:                aws.String(key),
+			Body:               bytes.NewReader([]byte("column,value\n1,2\n")),
+			ContentType:        aws.String("text/csv"),
+			CacheControl:       aws.String("max-age=60"),
+			ContentDisposition: aws.String(`attachment; filename="object.csv"`),
+			Metadata:           map[string]*string{"Owner": aws.String("team-a"), "Pipeline": aws.String("nightly")},
+		})
+		requireNoError(t, err, "put with metadata")
+
+		head, err := client.HeadObject(&s3.HeadObjectInput{
+			Bucket: aws.String(env.Bucket), Key: aws.String(key),
+		})
+		requireNoError(t, err, "head")
+		if got := aws.StringValue(head.ContentType); got != "text/csv" {
+			t.Errorf("Content-Type = %q, want text/csv", got)
+		}
+		if got := aws.StringValue(head.CacheControl); got != "max-age=60" {
+			t.Errorf("Cache-Control = %q, want max-age=60", got)
+		}
+		if got := aws.StringValue(head.Metadata["Owner"]); got != "team-a" {
+			t.Errorf("x-amz-meta-owner = %q, want team-a", got)
+		}
+		if got := aws.StringValue(head.Metadata["Pipeline"]); got != "nightly" {
+			t.Errorf("x-amz-meta-pipeline = %q, want nightly", got)
+		}
+	})
+
+	t.Run("a Range read is served", func(t *testing.T) {
+		out, err := client.GetObject(&s3.GetObjectInput{
+			Bucket: aws.String(env.Bucket), Key: aws.String(key), Range: aws.String("bytes=0-5"),
+		})
+		requireNoError(t, err, "ranged get")
+		defer out.Body.Close()
+		body, err := io.ReadAll(out.Body)
+		requireNoError(t, err, "reading the ranged body")
+		if string(body) != "column" {
+			t.Errorf("ranged read returned %q, want %q", body, "column")
+		}
+	})
+
+	// Each of these would otherwise reach the object store unsigned,
+	// unclassified and unauthorized. Object lock is the one that cannot be
+	// undone: it can pin an object past any deletion, the operator's own
+	// included.
+	for _, header := range []string{
+		"x-amz-acl",
+		"x-amz-object-lock-mode",
+		"x-amz-storage-class",
+		"x-amz-tagging",
+		"x-amz-server-side-encryption",
+		"x-amz-website-redirect-location",
+	} {
+		t.Run("refused: "+header, func(t *testing.T) {
+			body := []byte("x")
+			resp := rawSignedRequest(t, env, http.MethodPut, "/"+env.Bucket+"/datasets/headers/refused.csv",
+				body, http.Header{header: {"anything"}}, env.TenantA, env.WriteLevel)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("%s returned %d, want 403", header, resp.StatusCode)
+			}
+			for _, k := range upstreamKeys(t, env, env.TenantA) {
+				if strings.HasSuffix(k, "datasets/headers/refused.csv") {
+					t.Fatalf("%s reached the object store: %s", header, k)
+				}
+			}
+		})
+	}
+}
+
 func TestHealthAndMetrics(t *testing.T) {
 	env := LoadEnv(t)
 	if env.AdminEndpoint == "" {

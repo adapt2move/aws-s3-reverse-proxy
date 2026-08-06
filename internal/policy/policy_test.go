@@ -228,12 +228,57 @@ rules: []
 			yaml: `
 identity:
   accessKeyIdPattern: '^(?P<tenant>[0-9a-f]{32})(?P<level>ro)$'
-  secretTemplate: '{tenant}'
+  secretTemplate: '{tenant}:{level}'
   keyPrefixTemplate: '{tenant}/'
 levels: []
 rules: []
 `,
 			wantErr: "levels must declare at least one level",
+		},
+		{
+			// A secret bound to the tenant alone is one secret for every
+			// level of that tenant: a read-only holder can sign as
+			// read-write.
+			name: "secret template without the level",
+			yaml: `
+identity:
+  accessKeyIdPattern: '^(?P<tenant>[0-9a-f]{32})(?P<level>ro|rw)$'
+  secretTemplate: '{tenant}'
+  keyPrefixTemplate: '{tenant}/'
+levels: [ro, rw]
+rules: []
+`,
+			wantErr: "identity.secretTemplate must reference {level}",
+		},
+		{
+			// And one bound to the level alone is one secret for every
+			// tenant: anyone can sign as anyone, and the proxy then injects
+			// the impersonated tenant's key prefix.
+			name: "secret template without the tenant",
+			yaml: `
+identity:
+  accessKeyIdPattern: '^(?P<tenant>[0-9a-f]{32})(?P<level>ro|rw)$'
+  secretTemplate: '{level}'
+  keyPrefixTemplate: '{tenant}/'
+levels: [ro, rw]
+rules: []
+`,
+			wantErr: "identity.secretTemplate must reference {tenant}",
+		},
+		{
+			// Without a trailing separator, prefix "a" and prefix "ab" are
+			// not mutually exclusive: tenant a's key "b/x" is tenant ab's
+			// key "x".
+			name: "key prefix template without a trailing separator",
+			yaml: `
+identity:
+  accessKeyIdPattern: '^(?P<tenant>[a-z]+)-(?P<level>ro|rw)$'
+  secretTemplate: '{tenant}:{level}'
+  keyPrefixTemplate: '{tenant}'
+levels: [ro, rw]
+rules: []
+`,
+			wantErr: `identity.keyPrefixTemplate must end in "/"`,
 		},
 		{
 			name:    "typo'd key",

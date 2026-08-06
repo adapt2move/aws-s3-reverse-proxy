@@ -2,6 +2,7 @@ package policy_test
 
 import (
 	"encoding/hex"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -149,4 +150,56 @@ rules:
 	identity, err := compiled.ResolveIdentity("plain-tenant-ro", policytest.Pepper)
 	require.NoError(t, err)
 	assert.Equal(t, "plain-tenant/", identity.KeyPrefix)
+}
+
+// The trailing separator the template must end in only keeps key prefixes
+// mutually exclusive while the tenant capture contributes no separators of
+// its own — otherwise tenant "a" and tenant "a/b" share a nested key space
+// again, by a different route.
+func TestResolveIdentityRejectsSeparatorInTenant(t *testing.T) {
+	compiled, err := policy.Parse([]byte(`
+identity:
+  accessKeyIdPattern: '^(?P<tenant>[^-]+)-(?P<level>ro|rw)$'
+  secretTemplate: '{tenant}:{level}'
+  keyPrefixTemplate: '{tenant}/'
+levels: [ro, rw]
+rules:
+  - pathPattern: '**'
+    grant: { ro: read, rw: full }
+`))
+	require.NoError(t, err)
+
+	_, err = compiled.ResolveIdentity("a/b-ro", policytest.Pepper)
+	assert.Error(t, err, "a tenant containing a separator must not resolve")
+
+	identity, err := compiled.ResolveIdentity("a-ro", policytest.Pepper)
+	require.NoError(t, err)
+	assert.Equal(t, "a/", identity.KeyPrefix)
+}
+
+// Two tenants whose ids differ in length must never share a key space: the
+// shorter one's prefix is not a prefix of the longer one's.
+func TestKeyPrefixesAreMutuallyExclusive(t *testing.T) {
+	compiled, err := policy.Parse([]byte(`
+identity:
+  accessKeyIdPattern: '^(?P<tenant>[a-z]+)-(?P<level>ro|rw)$'
+  secretTemplate: '{tenant}:{level}'
+  keyPrefixTemplate: '{tenant}/'
+levels: [ro, rw]
+rules:
+  - pathPattern: '**'
+    grant: { ro: read, rw: full }
+`))
+	require.NoError(t, err)
+
+	short, err := compiled.ResolveIdentity("a-rw", policytest.Pepper)
+	require.NoError(t, err)
+	long, err := compiled.ResolveIdentity("ab-rw", policytest.Pepper)
+	require.NoError(t, err)
+
+	// The escape this closes: prefix "a" + key "b/secret.csv" would have
+	// addressed the same object as prefix "ab" + key "secret.csv".
+	assert.NotEqual(t, short.KeyPrefix+"b/secret.csv", long.KeyPrefix+"secret.csv")
+	assert.False(t, strings.HasPrefix(long.KeyPrefix, short.KeyPrefix+"b"),
+		"one tenant's prefix must not extend into another's")
 }

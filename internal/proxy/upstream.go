@@ -13,13 +13,10 @@ import (
 // re-signs the request with the upstream credentials.
 func (h *Handler) buildUpstreamRequest(req *http.Request, st *requestState) (*http.Request, error) {
 	region := h.cfg.UpstreamRegion
-	if region == "" {
-		region = st.clientRegion
-	}
 	endpoint := h.cfg.UpstreamEndpoint
 	if endpoint == "" {
-		// No configured endpoint: fall back to AWS S3 for the region the
-		// request is signed for, as the single-tenant proxy always did.
+		// No configured endpoint: address AWS S3 for the region this
+		// deployment signs for, as the single-tenant proxy always did.
 		endpoint = fmt.Sprintf("s3.%s.amazonaws.com", region)
 	}
 
@@ -38,12 +35,32 @@ func (h *Handler) buildUpstreamRequest(req *http.Request, st *requestState) (*ht
 		return nil, err
 	}
 	proxyReq.ContentLength = body.contentLength
-	if val, ok := req.Header["Content-Type"]; ok {
-		proxyReq.Header["Content-Type"] = val
+
+	// Client headers are copied BEFORE signing, so everything forwarded is
+	// also covered by the upstream signature. Copying them afterwards would
+	// leave `SignedHeaders` at `host;x-amz-content-sha256;x-amz-date` while
+	// `x-amz-` headers travelled alongside it: AWS S3 refuses that outright,
+	// and a store that does not (MinIO, Ceph, R2) would act on a header no
+	// signature, no classification and no policy rule ever covered.
+	//
+	// Which headers those are is s3.ForwardableHeader's business — the
+	// whitelist lives next to the operation whitelist rather than here.
+	for name, values := range req.Header {
+		if s3.ForwardableHeader(name) {
+			proxyReq.Header[http.CanonicalHeaderKey(name)] = values
+		}
 	}
-	if val, ok := req.Header["Content-Md5"]; ok {
-		proxyReq.Header["Content-Md5"] = val
+	if st.operation.RewritesXML {
+		// This response has to be read to strip the tenant prefix back out of
+		// it. Forwarding the client's Accept-Encoding would let the upstream
+		// compress it *and* stop Go's transport from undoing that
+		// automatically — leaving a body we would have to pass through
+		// unrewritten. Dropping the header hands the negotiation to the
+		// transport, which decompresses transparently.
+		proxyReq.Header.Del("Accept-Encoding")
 	}
+	// The body preparation has the last word: it rebuilt or de-framed the
+	// body, so its digests describe what actually goes upstream.
 	for name, values := range body.extraHeaders {
 		proxyReq.Header[name] = values
 	}
@@ -55,21 +72,6 @@ func (h *Handler) buildUpstreamRequest(req *http.Request, st *requestState) (*ht
 	if err := h.cfg.UpstreamSigner.Sign(proxyReq, region, time.Now()); err != nil {
 		return nil, err
 	}
-
-	// Add origin headers after the request is signed (no overwrite).
-	copyHeaderWithoutOverwrite(proxyReq.Header, req.Header)
-	if st.operation.RewritesXML {
-		// This response has to be read to strip the tenant prefix back out
-		// of it. Forwarding the client's Accept-Encoding would let the
-		// upstream compress it *and* stop Go's transport from undoing that
-		// automatically — leaving a body we would have to pass through
-		// unrewritten. Dropping the header hands the negotiation to the
-		// transport, which decompresses transparently.
-		proxyReq.Header.Del("Accept-Encoding")
-	}
-	// The client's own credential must never travel upstream — the upstream
-	// signature replaced it.
-	proxyReq.Header.Del("X-Amz-Decoded-Content-Length")
 
 	return proxyReq, nil
 }
@@ -108,14 +110,4 @@ func scopeToTenant(u *url.URL, keyPrefix string, op *s3.Operation) {
 	// path stay in agreement.
 	u.Path = "/" + op.Bucket + "/" + keyPrefix + op.Key
 	u.RawPath = "/" + op.Bucket + "/" + keyPrefix + op.EscapedKey
-}
-
-func copyHeaderWithoutOverwrite(dst http.Header, src http.Header) {
-	for k, v := range src {
-		if _, ok := dst[k]; !ok {
-			for _, vv := range v {
-				dst.Add(k, vv)
-			}
-		}
-	}
 }

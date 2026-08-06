@@ -18,10 +18,24 @@ identity:
   # Both the issuer and the proxy derive it independently, so there is no
   # credential store and no distribution problem — and rotating the pepper
   # rotates every client credential at once.
+  #
+  # It must reference BOTH {tenant} and {level}, and startup fails if it does
+  # not: a secret bound to only one of them is a single secret shared by every
+  # identity that differs in the other, and the tenant and level a request
+  # acts as come from the access-key id rather than from the secret.
+  #
+  # Use an unambiguous delimiter between the two, as below. With a
+  # variable-length tenant capture, '{tenant}{level}' would derive the same
+  # secret for (tenant=ab, level=c) and (tenant=a, level=bc).
   secretTemplate: '{tenant}:{level}'
 
   # Prepended by the proxy to every object key and to every listing
   # prefix/marker. Clients never send it and never see it.
+  #
+  # It must reference {tenant} and end in '/', and startup fails if it does
+  # not. The trailing separator is what makes two tenants' prefixes mutually
+  # exclusive: with a bare '{tenant}' and a variable-length capture, tenant
+  # "a" asking for the key "b/x.csv" would address tenant "ab"'s "x.csv".
   keyPrefixTemplate: '{tenant}/'
 
 # The level names. Every rule's `grant` map must cover exactly these — a

@@ -212,6 +212,23 @@ func (p *Policy) compileIdentity(cfg IdentityConfig) error {
 	if err := validateTemplate(cfg.SecretTemplate, groups); err != nil {
 		return fmt.Errorf("policy: identity.secretTemplate: %v", err)
 	}
+	// A secret that is not bound to BOTH captures collapses the identity
+	// model, because the tenant and level a request acts as come from the
+	// access-key id rather than from whatever the secret was derived over:
+	//
+	//	secretTemplate: '{tenant}'  — every level of one tenant shares a
+	//	                              secret, so a read-only holder can sign
+	//	                              as read-write
+	//	secretTemplate: '{level}'   — every tenant at one level shares a
+	//	                              secret, so anyone can sign as anyone
+	//	                              and the proxy injects *their* prefix
+	//
+	// Both are silent: the policy loads, and every signature verifies.
+	for _, required := range []string{"tenant", "level"} {
+		if !strings.Contains(cfg.SecretTemplate, "{"+required+"}") {
+			return fmt.Errorf("policy: identity.secretTemplate must reference {%s}, otherwise one derived secret is valid for more than one identity", required)
+		}
+	}
 
 	if cfg.KeyPrefixTemplate == "" {
 		return fmt.Errorf("policy: identity.keyPrefixTemplate is required")
@@ -227,6 +244,15 @@ func (p *Policy) compileIdentity(cfg IdentityConfig) error {
 	}
 	if strings.HasPrefix(cfg.KeyPrefixTemplate, "/") {
 		return fmt.Errorf("policy: identity.keyPrefixTemplate must not start with %q", "/")
+	}
+	// A trailing separator is what makes two tenants' prefixes mutually
+	// exclusive. Without it, and with a variable-length tenant capture, one
+	// tenant's scope contains another's: prefix "a" plus the key "b/x.csv"
+	// addresses the same object as prefix "ab" plus "x.csv" — a cross-tenant
+	// read that looks entirely ordinary on the way back out, because the
+	// response rewrite strips by bytes and finds its own prefix there.
+	if !strings.HasSuffix(cfg.KeyPrefixTemplate, "/") {
+		return fmt.Errorf("policy: identity.keyPrefixTemplate must end in %q, otherwise one tenant's key prefix can be a prefix of another's", "/")
 	}
 	if strings.Contains(cfg.KeyPrefixTemplate, "..") {
 		return fmt.Errorf("policy: identity.keyPrefixTemplate must not contain %q", "..")

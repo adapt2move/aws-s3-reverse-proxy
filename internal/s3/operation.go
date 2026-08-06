@@ -122,6 +122,14 @@ func Classify(req *http.Request) (*Operation, error) {
 		return nil, fmt.Errorf("%w: x-amz-copy-source", ErrUnsupportedOperation)
 	}
 
+	// Every other `x-amz-` header is checked against the same kind of
+	// whitelist, for the same reason: one this proxy does not understand is
+	// one it cannot authorize, and forwarding it would hand the object store
+	// an instruction no policy rule ever saw.
+	if err := CheckRequestHeaders(req.Header); err != nil {
+		return nil, err
+	}
+
 	query := req.URL.Query()
 	// Query-string (presigned) authentication is out of scope: the
 	// signature would cover a URL we are about to rewrite, and a presigned

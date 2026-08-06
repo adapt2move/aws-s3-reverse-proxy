@@ -27,7 +27,7 @@ func baseOptions(t *testing.T) config.Options {
 	return config.Options{
 		AllowedSourceEndpoint:   "foobar.endpoint.example.com",
 		AllowedSourceSubnet:     []string{"127.0.0.1/32", "192.168.1.0/24"},
-		Region:                  "eu-test-1",
+		UpstreamRegion:          "eu-test-1",
 		PolicyFile:              writePolicyFile(t, policytest.YAML),
 		Pepper:                  policytest.Pepper,
 		UpstreamAccessKeyID:     "UPSTREAMKEYID",

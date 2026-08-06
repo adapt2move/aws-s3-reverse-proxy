@@ -190,8 +190,8 @@ a mounted secret, which is what a Kubernetes Secret volume gives you.
 | `--listen-addr` (`LISTEN_ADDR`) | `:8099` | S3 API listener |
 | `--health-listen-addr` (`HEALTH_LISTEN_ADDR`) | `:8100` | serves `/healthz` and `/readyz` |
 | `--metrics-listen-addr` (`METRICS_LISTEN_ADDR`) | *off* | serves `/metrics` |
-| `--upstream-endpoint` (`UPSTREAM_ENDPOINT`) | AWS S3 for the request's region | `http://…` or `https://…`; a bare host follows `--upstream-insecure` |
-| `--upstream-region` (`UPSTREAM_REGION`) | `--aws-region` | region to sign upstream requests for |
+| `--upstream-endpoint` (`UPSTREAM_ENDPOINT`) | AWS S3 for `--upstream-region` | `http://…` or `https://…`; a bare host follows `--upstream-insecure` |
+| `--upstream-region` (`UPSTREAM_REGION`, or `AWS_REGION`) | `eu-central-1` | region to sign upstream requests for, and to auto-detect the AWS S3 endpoint from |
 | `--max-clock-skew` (`MAX_CLOCK_SKEW`) | `15m` | accepted `X-Amz-Date` deviation |
 | `--max-chunked-body-size` (`MAX_CHUNKED_BODY_SIZE`) | 64 MiB | cap on a buffered `aws-chunked` body |
 | `--max-delete-body-size` (`MAX_DELETE_BODY_SIZE`) | 2 MiB | cap on a `DeleteObjects` body |
@@ -248,6 +248,18 @@ never touch the file except when told to.
     that would otherwise bypass authorization) and every bucket-level
     administrative call (`?acl`, `?policy`, `?versioning`, `?lifecycle`,
     `?tagging`, bucket create/delete, …) are refused without enumerating them.
+  * Request **headers** are a whitelist too. A tenant may set what describes
+    its own object — `Content-Type`, `Content-Md5`, `Content-Encoding`,
+    `Content-Disposition`, `Content-Language`, `Cache-Control`, `Expires`,
+    `Range`, the conditional `If-*` headers, `Accept-Encoding`, and the
+    `x-amz-meta-*` and `x-amz-checksum-*` families. Every other `x-amz-`
+    header is `403`, because one the proxy does not understand is one it
+    cannot authorize: `x-amz-acl`, `x-amz-object-lock-*`, `x-amz-tagging`,
+    `x-amz-storage-class` and `x-amz-server-side-encryption-*` are all
+    decisions that belong to the operator and are made on the bucket.
+  * Whatever is forwarded is also **signed** upstream. Headers are copied onto
+    the upstream request before it is signed, never after, so nothing reaches
+    the object store outside the proxy's own signature.
   * Anonymous requests, unknown access-key ids, wrong signatures and
     query-string (presigned) requests are `403`.
   * `X-Amz-Date` skew tolerance is bounded and configurable, which is what

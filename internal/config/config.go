@@ -30,7 +30,6 @@ type Options struct {
 	PprofListenAddr       string
 	AllowedSourceEndpoint string
 	AllowedSourceSubnet   []string
-	Region                string
 	UpstreamInsecure      bool
 	UpstreamEndpoint      string
 	UpstreamRegion        string
@@ -68,10 +67,14 @@ func Parse() Options {
 	kingpin.Flag("allowed-source-subnet", "allowed source IP addresses with netmask (env - ALLOWED_SOURCE_SUBNET)").Default("127.0.0.1/32").Envar("ALLOWED_SOURCE_SUBNET").StringsVar(&opts.AllowedSourceSubnet)
 	kingpin.Flag("policy-file", "path to the policy file that defines identity, levels and the ordered rule list (env - POLICY_FILE)").Envar("POLICY_FILE").Required().PlaceHolder("/etc/s3proxy/policy.yaml").StringVar(&opts.PolicyFile)
 	kingpin.Flag("policy-reload-interval", "how often to re-read the policy file, 0 to disable (SIGHUP always reloads) (env - POLICY_RELOAD_INTERVAL)").Envar("POLICY_RELOAD_INTERVAL").Default("30s").DurationVar(&opts.PolicyReloadInterval)
-	kingpin.Flag("aws-region", "region to sign upstream requests for when the client does not name one (env - AWS_REGION)").Envar("AWS_REGION").Default("eu-central-1").StringVar(&opts.Region)
 	kingpin.Flag("upstream-insecure", "use insecure HTTP for upstream connections when the endpoint carries no scheme (env - UPSTREAM_INSECURE)").Envar("UPSTREAM_INSECURE").BoolVar(&opts.UpstreamInsecure)
 	kingpin.Flag("upstream-endpoint", "S3 endpoint for upstream connections; an http:// or https:// prefix selects the scheme (env - UPSTREAM_ENDPOINT)").Envar("UPSTREAM_ENDPOINT").PlaceHolder("http://minio.storage.svc:9000").StringVar(&opts.UpstreamEndpoint)
-	kingpin.Flag("upstream-region", "region to sign upstream requests for, instead of the region from the client's request (env - UPSTREAM_REGION)").Envar("UPSTREAM_REGION").Default("").StringVar(&opts.UpstreamRegion)
+	// One knob, not two. The region a request is signed for upstream has
+	// nothing to do with the region scope the client signed with — that one
+	// is the client's business and is only ever used to verify its
+	// signature. AWS_REGION is still honoured as the default so existing
+	// deployments keep working.
+	kingpin.Flag("upstream-region", "region to sign upstream requests for, and to auto-detect the AWS S3 endpoint from (env - UPSTREAM_REGION, falling back to AWS_REGION)").Envar("UPSTREAM_REGION").Default(envOr("AWS_REGION", "eu-central-1")).StringVar(&opts.UpstreamRegion)
 	kingpin.Flag("cert-file", "path to the certificate file (env - CERT_FILE)").Envar("CERT_FILE").Default("").StringVar(&opts.CertFile)
 	kingpin.Flag("key-file", "path to the private key file (env - KEY_FILE)").Envar("KEY_FILE").Default("").StringVar(&opts.KeyFile)
 	kingpin.Flag("read-only", "reject every mutating request regardless of policy (env - READ_ONLY)").Envar("READ_ONLY").Default("false").BoolVar(&opts.ReadOnly)
@@ -84,6 +87,15 @@ func Parse() Options {
 	kingpin.Flag("shutdown-delay", "how long to keep serving after /readyz starts failing, so a load balancer can stop routing first (env - SHUTDOWN_DELAY)").Envar("SHUTDOWN_DELAY").Default("0s").DurationVar(&opts.ShutdownDelay)
 	kingpin.Parse()
 	return opts
+}
+
+// envOr is the default for a flag that has an older environment variable to
+// stay compatible with.
+func envOr(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // Where each secret may come from. Both a direct variable and a `…_FILE`

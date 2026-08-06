@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -415,3 +416,115 @@ rules:
 type swappablePolicy struct{ current *policy.Policy }
 
 func (s *swappablePolicy) Current() *policy.Policy { return s.current }
+
+// Whatever the proxy forwards, it also signs. Copying client headers onto the
+// upstream request after signing would leave SignedHeaders at
+// `host;x-amz-content-sha256;x-amz-date` — which AWS S3 refuses outright, and
+// which on a store that does not refuse it means an `x-amz-` header took
+// effect while covered by no signature, no classification and no policy rule.
+func TestForwardedHeadersAreSigned(t *testing.T) {
+	h, upstream := newTestProxy(t)
+
+	rec := do(t, h, clientRequest{
+		method: http.MethodPut, target: "/bucket/datasets/x.csv",
+		body: []byte("hello"), tenant: tenantA, level: "rw",
+		headers: http.Header{
+			"Content-Type":        {"text/csv"},
+			"Cache-Control":       {"max-age=60"},
+			"X-Amz-Meta-Owner":    {"team-a"},
+			"Content-Disposition": {`attachment; filename="x.csv"`},
+		},
+	})
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	got := upstream.last(t)
+	signed := signedHeaders(t, got.header.Get("Authorization"))
+	for _, name := range []string{"content-type", "cache-control", "x-amz-meta-owner", "content-disposition"} {
+		assert.Contains(t, signed, name, "a forwarded header must be covered by the upstream signature")
+	}
+	assert.Equal(t, "team-a", got.header.Get("X-Amz-Meta-Owner"))
+	assert.Equal(t, "text/csv", got.header.Get("Content-Type"))
+}
+
+// An `x-amz-` header this proxy does not understand is one it cannot
+// authorize, so it is refused rather than passed through. x-amz-object-lock-*
+// is the case that makes failing closed worth it: it can pin an object beyond
+// any deletion, the operator's own included.
+func TestUnknownAmzHeadersAreRefused(t *testing.T) {
+	for _, header := range []string{
+		"X-Amz-Acl", "X-Amz-Object-Lock-Mode", "X-Amz-Object-Lock-Retain-Until-Date",
+		"X-Amz-Storage-Class", "X-Amz-Tagging", "X-Amz-Server-Side-Encryption",
+		"X-Amz-Grant-Read", "X-Amz-Security-Token", "X-Amz-Expected-Bucket-Owner",
+		"X-Amz-Website-Redirect-Location",
+	} {
+		t.Run(header, func(t *testing.T) {
+			h, upstream := newTestProxy(t)
+			rec := do(t, h, clientRequest{
+				method: http.MethodPut, target: "/bucket/datasets/x.csv",
+				body: []byte("hello"), tenant: tenantA, level: "rw",
+				headers: http.Header{header: {"anything"}},
+			})
+			assert.Equal(t, http.StatusForbidden, rec.Code)
+			assert.Equal(t, 0, upstream.count(), "the request must not reach the object store")
+		})
+	}
+}
+
+// The headers the proxy consumes itself describe the request to the proxy,
+// not to the object store: they are accepted on the way in and replaced on
+// the way out.
+func TestConsumedHeadersDoNotTravelUpstream(t *testing.T) {
+	h, upstream := newTestProxy(t)
+	payload := "PAR1this-is-the-real-object-content"
+	framed := fmt.Sprintf("%x\r\n%s\r\n0\r\n\r\n", len(payload), payload)
+
+	rec := do(t, h, clientRequest{
+		method: http.MethodPut, target: "/bucket/datasets/big.parquet",
+		body: []byte(framed), tenant: tenantA, level: "rw",
+		headers: http.Header{
+			"X-Amz-Content-Sha256":         {"STREAMING-AWS4-HMAC-SHA256-PAYLOAD"},
+			"X-Amz-Decoded-Content-Length": {fmt.Sprint(len(payload))},
+			"X-Amz-Sdk-Checksum-Algorithm": {"CRC32"},
+			"Content-Encoding":             {"aws-chunked"},
+		},
+	})
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	got := upstream.last(t)
+	assert.Equal(t, payload, got.body)
+	assert.Empty(t, got.header.Get("X-Amz-Decoded-Content-Length"))
+	assert.Empty(t, got.header.Get("X-Amz-Sdk-Checksum-Algorithm"))
+	assert.NotContains(t, got.header.Get("Content-Encoding"), "aws-chunked")
+	// The client's own credential never travels upstream either.
+	assert.Contains(t, got.header.Get("Authorization"), "Credential=UPSTREAMKEYID/")
+}
+
+// A body with no stated length can only be forwarded as another chunked
+// transfer encoding, which S3 refuses on PUT — so it is refused here, where
+// the reason can be given.
+func TestBodyWithoutContentLengthIsRefused(t *testing.T) {
+	h, upstream := newTestProxy(t)
+
+	req := clientRequest{
+		method: http.MethodPut, target: "/bucket/datasets/x.csv",
+		body: []byte("hello"), tenant: tenantA, level: "rw",
+	}.build(t)
+	req.ContentLength = -1
+
+	rec := doRequest(t, h, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, 0, upstream.count())
+}
+
+// signedHeaders pulls the SignedHeaders list out of an Authorization header.
+func signedHeaders(t *testing.T, authorization string) []string {
+	t.Helper()
+	for _, part := range strings.Split(authorization, ",") {
+		part = strings.TrimSpace(part)
+		if rest, ok := strings.CutPrefix(part, "SignedHeaders="); ok {
+			return strings.Split(rest, ";")
+		}
+	}
+	t.Fatalf("no SignedHeaders in %q", authorization)
+	return nil
+}

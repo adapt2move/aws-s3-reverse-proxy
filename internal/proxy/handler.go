@@ -67,12 +67,17 @@ type Config struct {
 	UpstreamScheme string
 
 	// UpstreamEndpoint is the object store's host[:port]; empty auto-detects
-	// AWS S3 from the region the request was signed for.
+	// AWS S3 from UpstreamRegion.
 	UpstreamEndpoint string
 
-	// UpstreamRegion signs upstream requests for this region instead of the
-	// one from the client's request. Useful when the client signs with a
-	// placeholder (or empty) region but the backend expects a real one.
+	// UpstreamRegion is the region upstream requests are signed for, and the
+	// one an auto-detected AWS S3 endpoint is built from.
+	//
+	// It is deliberately unrelated to the region scope the client signed
+	// with: that one only ever verifies the client's own signature, and
+	// clients differ on it (DuckDB's httpfs leaves it empty). Deriving the
+	// upstream signature from it would make one tenant's SDK configuration
+	// decide how this proxy talks to the object store.
 	UpstreamRegion string
 
 	// AllowedSourceEndpoint is the Host header incoming requests must carry,
@@ -224,7 +229,7 @@ func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, entry *observa
 	}
 
 	current := h.cfg.Policy.Current()
-	identity, region, err := h.authenticate(current, r)
+	identity, err := h.authenticate(current, r)
 	if err != nil {
 		h.reject(w, entry, http.StatusForbidden, "AccessDenied", err)
 		return nil, nil, err
@@ -235,7 +240,6 @@ func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, entry *observa
 		policy:         current,
 		identity:       identity,
 		operation:      op,
-		clientRegion:   region,
 		maxRewriteSize: h.cfg.Limits.RewriteBody,
 	}
 
@@ -306,19 +310,19 @@ func (h *Handler) reject(w http.ResponseWriter, entry *observability.AccessLog, 
 // request has no Authorization header and fails at the first step; an unknown
 // access-key id fails at resolution; a forged signature fails at the
 // comparison. All three are the same 403 to the client.
-func (h *Handler) authenticate(current *policy.Policy, r *http.Request) (*policy.Identity, string, error) {
+func (h *Handler) authenticate(current *policy.Policy, r *http.Request) (*policy.Identity, error) {
 	cred, err := h.verifier.ReadCredential(r)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	identity, err := current.ResolveIdentity(cred.AccessKeyID, h.cfg.Pepper)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if err := h.verifier.Verify(r, cred, identity.SecretAccessKey); err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	return identity, cred.Region, nil
+	return identity, nil
 }
 
 func (h *Handler) validateSourceIP(req *http.Request) error {
@@ -354,11 +358,6 @@ type requestState struct {
 	// rule is the policy rule a body-level authorization matched, for the
 	// access log — the URL-level path records it directly on the entry.
 	rule string
-
-	// clientRegion is the region scope the client signed with. It is only
-	// used when no upstream region is configured, and it may legitimately be
-	// empty (DuckDB's httpfs signs that way).
-	clientRegion string
 
 	// maxRewriteSize mirrors Limits.RewriteBody so the response rewrite
 	// needs nothing but this struct.
