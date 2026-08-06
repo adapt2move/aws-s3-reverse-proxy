@@ -1,6 +1,8 @@
 package s3
 
 import (
+	"bytes"
+	"compress/gzip"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -291,4 +293,31 @@ func TestChunkedFramingErrors(t *testing.T) {
 			require.Error(t, err, "a malformed stream must not read back as a clean EOF")
 		})
 	}
+}
+
+// The cap on a decompressed body is separate from the cap on the compressed
+// read, and has to be: a few hundred bytes on the wire expand to hundreds of
+// kilobytes here, and a body chosen for the purpose does far better. Checking
+// only what arrived says nothing about what it becomes.
+func TestDecodeContentEncodingCapsTheDecompressedSize(t *testing.T) {
+	var plain strings.Builder
+	for i := 0; i < 2000; i++ {
+		plain.WriteString("<Resource>/bucket/tenant/datasets/gone.csv</Resource>")
+	}
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	_, _ = zw.Write([]byte(plain.String()))
+	require.NoError(t, zw.Close())
+
+	require.Less(t, compressed.Len(), 4096, "the compressed body must be under the cap")
+	require.Greater(t, plain.Len(), 4096, "and the decompressed body must be over it")
+
+	_, err := DecodeContentEncoding(compressed.Bytes(), "gzip", 4096)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds 4096 bytes")
+
+	// The same body under a cap that fits comes back whole.
+	out, err := DecodeContentEncoding(compressed.Bytes(), "gzip", int64(plain.Len()))
+	require.NoError(t, err)
+	assert.Equal(t, plain.String(), string(out))
 }

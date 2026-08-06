@@ -235,38 +235,57 @@ func TestOversizedListingFailsClosed(t *testing.T) {
 // The same cap has to bound the *decompressed* size, or a small gzip body
 // would expand past it unchecked — the compressed read being under the cap
 // says nothing about what it expands to.
-func TestGzipListingExpandingPastTheCapFailsClosed(t *testing.T) {
+//
+// Reaching that branch takes some care, and the obvious test does not. On the
+// RewritesXML path the proxy deletes the client's Accept-Encoding, so Go's
+// transport supplies its own and decompresses the response transparently:
+// ModifyResponse then sees an already-expanded body with no Content-Encoding
+// at all, and the compressed-read cap next door is what fires. The gzip
+// branch is only entered when the *client* sent Accept-Encoding — which the
+// proxy forwards — and that, on the rewrite path, means a non-RewritesXML
+// operation answering >= 300. An error body, in other words, which is exactly
+// the response that names the upstream-prefixed key.
+func TestGzipErrorBodyExpandingPastTheCapFailsClosed(t *testing.T) {
 	h, upstream := newTestProxy(t, func(c *Config) { c.Limits.RewriteBody = 4096 })
 
-	// Deliberately repetitive, so the compressed form stays far under the cap
-	// while the decompressed form is far over it — that gap is the whole
-	// point of capping the decompressed read separately.
+	// Highly repetitive, so it compresses to a few hundred bytes and expands
+	// to far more than the cap.
 	var plain strings.Builder
-	plain.WriteString("<ListBucketResult>")
+	plain.WriteString("<Error><Code>NoSuchKey</Code>")
 	for i := 0; i < 2000; i++ {
-		fmt.Fprintf(&plain, "<Contents><Key>%s/datasets/same.csv</Key></Contents>", tenantA)
+		fmt.Fprintf(&plain, "<Resource>/bucket/%s/datasets/gone.csv</Resource>", tenantA)
 	}
-	plain.WriteString("</ListBucketResult>")
+	plain.WriteString("</Error>")
 
 	var compressed bytes.Buffer
 	zw := gzip.NewWriter(&compressed)
 	_, _ = zw.Write([]byte(plain.String()))
 	require.NoError(t, zw.Close())
-	require.Less(t, compressed.Len(), 4096,
-		"the compressed body must be under the cap, or this tests the compressed read instead")
+	require.Less(t, compressed.Len(), 4096, "the compressed body must be under the cap")
 	require.Greater(t, plain.Len(), 4096, "and the decompressed body must be over it")
 
 	upstream.respond = func(w http.ResponseWriter, r *http.Request) {
+		// The client's own Accept-Encoding has to have reached the upstream,
+		// or Go's transport would have decompressed the answer for us and
+		// this would be testing the branch next door.
+		require.Equal(t, "gzip", r.Header.Get("Accept-Encoding"))
 		w.Header().Set("Content-Type", "application/xml")
 		w.Header().Set("Content-Encoding", "gzip")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write(compressed.Bytes())
 	}
 
 	rec := do(t, h, clientRequest{
-		method: http.MethodGet, target: "/bucket/?list-type=2&prefix=datasets/",
+		method: http.MethodGet, target: "/bucket/datasets/gone.csv",
 		tenant: tenantA, level: "ro",
+		headers: http.Header{"Accept-Encoding": {"gzip"}},
 	})
+	// What the cap buys is a bound on the amplification: this body is ~270x
+	// larger decompressed, and a hostile one is limited only by what gzip can
+	// do. Without it the whole expansion is held in memory before anything
+	// looks at its size. (The prefix strip itself still works on an
+	// over-large body — the risk here is the allocation, not a leak — but a
+	// refused response must carry nothing either way.)
 	assert.Equal(t, http.StatusBadGateway, rec.Code)
 	assert.NotContains(t, rec.Body.String(), tenantA)
 }
