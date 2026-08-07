@@ -131,6 +131,14 @@ func Classify(req *http.Request) (*Operation, error) {
 	}
 
 	query := req.URL.Query()
+	// The AWS SDKs tag a request with the operation they think they are
+	// issuing (`?x-id=PutObject`). It names nothing and grants nothing, and
+	// every check below derives the operation from the method, the path and
+	// the remaining parameters — so drop it rather than let a marker decide
+	// whether a request is classifiable. `req.URL` keeps it, so the upstream
+	// signature is still computed over the URL the client signed.
+	query.Del("x-id")
+
 	// Query-string (presigned) authentication is out of scope: the
 	// signature would cover a URL we are about to rewrite, and a presigned
 	// URL is a bearer token that outlives the request. Any `X-Amz-…` query
