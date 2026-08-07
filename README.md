@@ -269,6 +269,11 @@ never touch the file except when told to.
     that would otherwise bypass authorization) and every bucket-level
     administrative call (`?acl`, `?policy`, `?versioning`, `?lifecycle`,
     `?tagging`, bucket create/delete, …) are refused without enumerating them.
+  * The AWS SDKs' `?x-id=<Operation>` marker is dropped before a request is
+    classified. It is the query-string twin of the telemetry headers below —
+    it describes what the SDK believes it is sending, instructs nothing, and
+    is never what decides the operation. The URL forwarded upstream keeps it,
+    so the signature still covers what the client signed.
   * Request **headers** are a whitelist too. A tenant may set what describes
     its own object — `Content-Type`, `Content-Md5`, `Content-Encoding`,
     `Content-Disposition`, `Content-Language`, `Cache-Control`, `Expires`,

@@ -92,6 +92,19 @@ func TestClassify(t *testing.T) {
 		{name: "abort multipart", method: http.MethodDelete, target: "/b/a/x.csv?uploadId=u", want: AbortMultipartUpload},
 		{name: "list parts", method: http.MethodGet, target: "/b/a/x.csv?uploadId=u", want: ListParts},
 
+		// The AWS SDKs append `?x-id=<Operation>`; it must not change what a
+		// request is classified as, on any verb.
+		{name: "get object with the SDK marker", method: http.MethodGet, target: "/b/a/x.csv?x-id=GetObject", want: GetObject},
+		{name: "put object with the SDK marker", method: http.MethodPut, target: "/b/a/x.csv?x-id=PutObject", want: PutObject},
+		{name: "delete object with the SDK marker", method: http.MethodDelete, target: "/b/a/x.csv?x-id=DeleteObject", want: DeleteObject},
+		{name: "upload part with the SDK marker", method: http.MethodPut, target: "/b/a/x.csv?partNumber=1&uploadId=u&x-id=UploadPart", want: UploadPart},
+		{name: "abort multipart with the SDK marker", method: http.MethodDelete, target: "/b/a/x.csv?uploadId=u&x-id=AbortMultipartUpload", want: AbortMultipartUpload},
+		{name: "list parts with the SDK marker", method: http.MethodGet, target: "/b/a/x.csv?uploadId=u&x-id=ListParts", want: ListParts},
+		{name: "list with the SDK marker", method: http.MethodGet, target: "/b/?list-type=2&x-id=ListObjectsV2", want: ListObjects},
+		// The marker is descriptive only: a lying one must not promote a
+		// request into an operation it is not.
+		{name: "the marker never decides the operation", method: http.MethodPatch, target: "/b/a/x.csv?x-id=PutObject", wantErr: ErrUnsupportedOperation},
+
 		{name: "copy source", method: http.MethodPut, target: "/b/a/x.csv",
 			headers: http.Header{"X-Amz-Copy-Source": {"/b/a/y.csv"}}, wantErr: ErrUnsupportedOperation},
 		{name: "presigned", method: http.MethodGet, target: "/b/a/x.csv?X-Amz-Signature=deadbeef", wantErr: ErrUnsupportedOperation},
