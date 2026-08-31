@@ -44,6 +44,9 @@ cmd/aws-s3-reverse-proxy   the process: flags, secrets, listeners, shutdown
                            response bodies
     internal/sigv4         inbound signature verification, upstream re-signing
     internal/observability access log, metrics, health probes
+
+  internal/blobcache       a bounded blob store on local disk (standalone;
+                           nothing in the request path uses it yet)
 ```
 
 Three seams keep the arrows pointing one way:
@@ -57,6 +60,10 @@ Three seams keep the arrows pointing one way:
 - **`policy.Store.OnReload`** — the store reports every reload attempt through
   a hook instead of reaching for a logger and a metric registry, which is what
   lets the authorization model be tested without either.
+
+`internal/blobcache` is deliberately outside that stack. It stores opaque
+payloads under opaque keys and knows nothing about HTTP, S3, tenants or
+policy — see [Local blob store](#local-blob-store).
 
 ## Identity and credential derivation
 
@@ -319,6 +326,53 @@ rolling restart of a multi-replica deployment drops nothing.
 Client compatibility: clients that sign a real payload hash (e.g. DuckDB's
 `httpfs`, which also signs with an empty region scope) and clients that send
 `aws-chunked` bodies (e.g. the AWS JS SDK v3) both work unchanged.
+
+## Local blob store
+
+`internal/blobcache` is a size-bounded store for opaque payloads on local
+disk. Nothing in the request path uses it yet; it exists so that the caching
+layer it is meant to carry can be designed against something real.
+
+It is built for a network-attached volume, where an fsync is a round trip and
+so is a file create, and every decision follows from that:
+
+  * Payloads up to `InlineMaxSize` are **appended to shared segment files**
+    rather than stored one file per key. A write is one buffered append, not
+    create + write + rename with an inode update behind each. Concurrent
+    commits fold into a single `write()`.
+  * Larger payloads get **a file of their own**, streamed rather than
+    buffered, because a single big object would otherwise monopolise the
+    append point and make its segment unreclaimable.
+  * **Nothing on the hot path is fsynced.** A cache does not need durability,
+    it needs to never be wrong, and only the second one is free. Correctness
+    after a crash comes from per-record checksums: a record that was torn, or
+    that the filesystem zero-filled — the shape ext4's delayed allocation
+    leaves behind — is a miss, and a miss is always safe because the truth
+    lives upstream.
+  * The two fsyncs that remain are amortised past noticing: sealing a full
+    segment, and committing one large payload alongside its own megabytes.
+    Deletions are synced too, because a resurrected key is the one kind of
+    staleness the store can prevent on its own.
+  * Reclaim is **segment-granular** — records are never rewritten, so write
+    amplification is exactly 1.0 and one `unlink` returns a whole segment.
+    Victims are chosen from a bounded sample, so eviction costs the same
+    whether the store holds a thousand files or a million.
+
+Measured against the obvious alternative on the same volume
+(`go test ./internal/blobcache -bench Put`):
+
+| payload | blobcache | file per entry | file per entry + fsync |
+| --- | --- | --- | --- |
+| 512 B | 6.5 µs | 367 µs | 746 µs |
+| 4 KiB | 18 µs | 276 µs | 790 µs |
+| 64 KiB | 125 µs | 459 µs | 1069 µs |
+
+The durability contract is written down where it cannot be missed: a crash may
+lose any subset of recent entries, and the store must never return a payload
+that is not byte-for-byte what was written under that key. The recovery tests
+exist to hold the second half of that sentence — each one damages a store the
+way a particular failure would and checks that what comes back is a subset of
+what went in.
 
 ## Observability
 
