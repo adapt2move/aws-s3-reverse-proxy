@@ -495,18 +495,22 @@ It lives on the admin listener and nowhere else. On the S3 port,
 `/cache/purge` is indistinguishable from a request for an object called that,
 and a bucket named `cache` would put it within reach of any tenant.
 
-Being on a separate listener is not the same as being protected, though. That
-listener also serves `/metrics` and `/healthz`, so without
-`--cache-purge-token` anything that can scrape metrics can also empty the
-cache — in a loop, which is a cheap way to force full re-fetches from the
-object store and spend exactly the egress this feature exists to save. Set the
-token, or make sure the network policy on that port really does scope it to
-the scraper:
+Being on a separate listener is not the same as being protected, though.
+**Setting `--cache-dir` turns the health listener into a mutating one**: every
+other route on it is a read-only probe, and this one empties the cache. Without
+a token, anything that can reach that port can empty it in a loop, which is a
+cheap way to force full re-fetches from the object store and spend exactly the
+egress this feature exists to save. Set the token, or make sure the network
+policy on that port really does scope it to whatever is meant to reach it:
 
 ```
 CACHE_PURGE_TOKEN=…              # or CACHE_PURGE_TOKEN_FILE, like the other secrets
 curl -X POST -H 'Authorization: Bearer …' http://<health-listen-addr>/cache/purge
 ```
+
+(It is on `--health-listen-addr`. That address shares a mux with
+`--metrics-listen-addr` when the two are set to the same thing, which is the
+usual arrangement.)
 
 With no token set, the endpoint is open to whatever can reach the port, and
 the startup log says so.
@@ -551,6 +555,17 @@ see its siblings — so it is stated here rather than at startup.
 The cache directory holds tenant object data at rest, which the proxy
 otherwise never does. It is created `0700`; encryption at rest is the
 operator's to arrange, and it wants a volume of its own.
+
+**Size the volume above `--cache-max-bytes`, not at it.** Three things sit
+outside that budget: the segment being appended to is preallocated at its full
+`--cache-segment-size` (256 MiB by default) the moment the process starts, so
+the volume is that much occupied before anything is cached; writes in flight
+claim disk they have not committed, up to half the budget or one
+`--cache-max-object-size`, whichever is larger; and eviction runs after a
+write rather than before one. Budgeting the volume at roughly
+`--cache-max-bytes` plus a segment plus that allowance leaves "the volume
+filled up" as an eviction that happens slightly late rather than a write that
+fails.
 
 **It also has to belong to the user the proxy runs as.** The container image
 runs as `proxyuser`, and both a Kubernetes PVC and a Docker volume are handed
