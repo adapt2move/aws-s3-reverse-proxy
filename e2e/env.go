@@ -83,7 +83,30 @@ type Env struct {
 	// streaming test uploads. It is meant to be set far above the memory
 	// limit of the proxy container.
 	LargeObjectSize int64
+
+	// CacheMaxAge, when non-zero, marks a deployment running with the local
+	// object cache on, and says how long an entry is served before the
+	// proxy checks it against the object store. The variant sets it to a
+	// few seconds so expiry is testable without a long sleep.
+	CacheMaxAge time.Duration
+
+	// CacheMaxObjectSize is what that deployment refuses to cache, so a
+	// test can pick a size on either side of it.
+	CacheMaxObjectSize int64
+
+	// CachePurgeToken is what the deployment requires on POST
+	// /cache/purge. Empty means it accepts an unauthenticated purge.
+	CachePurgeToken string
+
+	// CacheRestartCmd, when set, restarts the proxy under test with its
+	// cache directory intact. It is what lets the suite check that a cache
+	// survives a restart, which is the one part of recovery a unit test can
+	// only simulate.
+	CacheRestartCmd string
 }
+
+// Caches reports whether this deployment has the object cache on.
+func (e Env) Caches() bool { return e.CacheMaxAge > 0 }
 
 // LoadEnv reads the deployment description, skipping the whole suite when
 // no stack is configured — so `go test -tags e2e ./...` on a laptop with
@@ -129,6 +152,22 @@ func LoadEnv(t *testing.T) Env {
 		}
 		env.LargeObjectSize = n
 	}
+	if v := os.Getenv("E2E_CACHE_MAX_AGE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			t.Fatalf("E2E_CACHE_MAX_AGE: %v", err)
+		}
+		env.CacheMaxAge = d
+	}
+	if v := os.Getenv("E2E_CACHE_MAX_OBJECT_SIZE"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			t.Fatalf("E2E_CACHE_MAX_OBJECT_SIZE: %v", err)
+		}
+		env.CacheMaxObjectSize = n
+	}
+	env.CachePurgeToken = os.Getenv("E2E_CACHE_PURGE_TOKEN")
+	env.CacheRestartCmd = os.Getenv("E2E_CACHE_RESTART_CMD")
 	return env
 }
 

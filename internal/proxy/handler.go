@@ -19,6 +19,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/cache"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/observability"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/policy"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/s3"
@@ -109,6 +110,27 @@ type Config struct {
 	// default: tenant count is unbounded and each one would mint a new time
 	// series.
 	TenantMetricLabel bool
+
+	// Cache holds object reads on local disk. Nil — the default — disables
+	// every cache path in this package, and the proxy behaves exactly as it
+	// did before there was one.
+	//
+	// It is consulted only after a request has been authenticated and
+	// authorized, and keyed by the upstream object rather than by what the
+	// client asked for, so it can neither answer a request that policy would
+	// refuse nor hand one tenant another tenant's object. See
+	// internal/proxy/cache.go.
+	Cache *cache.Cache
+
+	// CacheWrites tees an accepted upload into the cache, so that writing an
+	// object leaves it cached rather than merely uncached.
+	CacheWrites bool
+
+	// CacheRangeFills fetches the whole object in the background after a
+	// ranged read missed. Without it a client that only ever reads ranges —
+	// DuckDB's httpfs over Parquet is the case in mind — would never fill
+	// the cache at all.
+	CacheRangeFills bool
 }
 
 // Handler is a multi-tenant S3 reverse proxy. Every request carries its own
@@ -125,6 +147,14 @@ type Handler struct {
 	// proxy is built once and shared: it carries the connection pool, so
 	// re-creating it per request would throw away every keep-alive.
 	proxy *httputil.ReverseProxy
+
+	// transport is the same one the reverse proxy uses, kept for the
+	// background cache fills, which are upstream requests nobody made.
+	transport *http.Transport
+
+	// fillSlots bounds those fills. Work nobody asked for must not crowd out
+	// work somebody did.
+	fillSlots chan struct{}
 }
 
 // New validates the configuration and wires up the shared reverse proxy.
@@ -154,7 +184,9 @@ func New(cfg Config) (*Handler, error) {
 			Host:         cfg.AllowedSourceEndpoint,
 			MaxClockSkew: cfg.MaxClockSkew,
 		},
-		access: &observability.Recorder{TenantLabel: cfg.TenantMetricLabel},
+		access:    &observability.Recorder{TenantLabel: cfg.TenantMetricLabel},
+		transport: transport,
+		fillSlots: make(chan struct{}, maxConcurrentFills),
 	}
 	h.proxy = &httputil.ReverseProxy{
 		// The request handed to ServeHTTP already carries the absolute
@@ -162,7 +194,7 @@ func New(cfg Config) (*Handler, error) {
 		Director:       func(*http.Request) {},
 		Transport:      transport,
 		FlushInterval:  -1, // flush every write: object downloads stream
-		ModifyResponse: rewriteUpstreamResponse,
+		ModifyResponse: h.modifyResponse,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.WithError(err).Warn("upstream request failed")
 			s3.WriteError(w, http.StatusBadGateway, "InternalError", "The proxy could not reach the object store.")
@@ -187,8 +219,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.access.Finish(entry, rec.Status(), time.Since(start))
 		return
 	}
+	// The claim a write puts on its key is released here rather than in the
+	// response hook, because this is the one place that runs whatever
+	// happened to the request — including the upstream being unreachable.
+	if st.mutation != nil {
+		defer st.mutation.End()
+	}
+
+	if h.serveCachedRead(rec, r, proxyReq, st) {
+		entry.Cache = st.cacheResult
+		h.access.Finish(entry, rec.Status(), time.Since(start))
+		return
+	}
 
 	h.proxy.ServeHTTP(rec, proxyReq.WithContext(withRequestState(r.Context(), st)))
+	entry.Cache = st.cacheResult
 	h.access.Finish(entry, rec.Status(), time.Since(start))
 }
 
@@ -260,7 +305,15 @@ func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, entry *observa
 		}
 	}
 
+	h.beginCaching(st)
+
 	proxyReq, err := h.buildUpstreamRequest(r, st)
+	if h.cfg.Cache != nil && op.Kind == s3.DeleteObjects && len(st.deletedKeys) > 0 {
+		// A batch delete's keys only become known while its body is being
+		// authorized, which is why this one claim happens after the request
+		// has been built rather than before.
+		st.mutation = h.cfg.Cache.BeginMutation(st.deletedKeys...)
+	}
 	if op.Kind == s3.DeleteObjects {
 		// A batch delete is authorized inside the body preparation, so its
 		// outcome only becomes known here.
@@ -269,6 +322,12 @@ func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, entry *observa
 		entry.Allowed = err == nil
 	}
 	if err != nil {
+		if st.mutation != nil {
+			// Nothing is going upstream, so nothing is going to release
+			// this claim later.
+			st.mutation.End()
+			st.mutation = nil
+		}
 		if errors.Is(err, errAllKeysDenied) {
 			// Nothing survived authorization, so there is no upstream call
 			// to make — answer with the per-key AccessDenied entries S3
@@ -362,6 +421,25 @@ type requestState struct {
 	// maxRewriteSize mirrors Limits.RewriteBody so the response rewrite
 	// needs nothing but this struct.
 	maxRewriteSize int64
+
+	// cacheKey names the upstream object this request addresses, empty when
+	// the operation addresses no single object or there is no cache.
+	cacheKey string
+
+	// cacheResult is what the lookup found, for the access log and the
+	// X-Cache header.
+	cacheResult string
+
+	// mutation is this request's claim on its key while it writes to the
+	// object store. It is released in ServeHTTP.
+	mutation *cache.Mutation
+
+	// uploadHeader is what the client said about the object it is uploading,
+	// which is what a later read of it should report back.
+	uploadHeader http.Header
+
+	// deletedKeys are the upstream keys a batch delete is about to remove.
+	deletedKeys []string
 }
 
 type requestStateKey struct{}

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -29,6 +30,12 @@ func (h *Handler) buildUpstreamRequest(req *http.Request, st *requestState) (*ht
 	if err != nil {
 		return nil, err
 	}
+	// An accepted upload is the cheapest cache fill there is: the bytes are
+	// already passing through. Teeing them costs a copy into a buffer the
+	// cache would otherwise have had to fetch the whole object to fill.
+	if capture := h.captureUpload(st, body.contentLength); capture != nil && body.reader != nil {
+		body.reader = io.TeeReader(body.reader, capture)
+	}
 
 	proxyReq, err := http.NewRequest(req.Method, proxyURL.String(), body.reader)
 	if err != nil {
@@ -49,6 +56,13 @@ func (h *Handler) buildUpstreamRequest(req *http.Request, st *requestState) (*ht
 		if s3.ForwardableHeader(name) {
 			proxyReq.Header[http.CanonicalHeaderKey(name)] = values
 		}
+	}
+	if st.mutation != nil {
+		// What the client says about the object it is uploading is what a
+		// later read of it should report back, so it is kept from the
+		// request the upstream is about to be sent — which is the version
+		// that has already been through the header whitelist.
+		st.uploadHeader = s3.CacheableResponseHeaders(proxyReq.Header)
 	}
 	if st.operation.RewritesXML {
 		// This response has to be read to strip the tenant prefix back out of

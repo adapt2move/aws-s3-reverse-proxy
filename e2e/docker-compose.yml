@@ -1,11 +1,11 @@
 # The end-to-end stack: a real MinIO, and three proxies configured to agree
 # on as little as possible.
 #
-# The three variants are the point. They differ in the access-key-id layout,
+# The four variants are the point. They differ in the access-key-id layout,
 # the level names, where a tenant's objects land, whether the upstream is
-# reached over http or https, and where the secrets come from — while the
-# suite that runs against them is identical. Anything the proxy had baked in
-# would fail at least one of them.
+# reached over http or https, where the secrets come from, and whether reads
+# are cached on local disk — while the suite that runs against them is
+# identical. Anything the proxy had baked in would fail at least one of them.
 
 services:
   # The in-cluster case: an S3-compatible store over plain http.
@@ -163,5 +163,71 @@ services:
       METRICS_LISTEN_ADDR: ":8100"
     ports: ["18399:8099", "18400:8100"]
 
+  # The image runs as a non-root user and a Docker volume is created owned by
+  # root, so the proxy cannot create its cache directory inside one. This is
+  # not a quirk of the test stack: an operator mounting a PVC or a host
+  # directory into this image hits exactly the same thing, and the answer
+  # there is the same as here — hand the volume to the user the process runs
+  # as before the process starts. On Kubernetes that is `fsGroup`; in compose
+  # it is this.
+  cache-dir:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    user: root
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["chown -R proxyuser:proxygroup /var/cache/s3proxy"]
+    volumes: ["cache:/var/cache/s3proxy"]
+
+  # Variant D — variant A's identity scheme with the local object cache on.
+  #
+  # Running the whole suite against it is most of the point: a cache that
+  # answers a request policy would have refused, or hands one tenant another
+  # tenant's object, fails the isolation and authorization tests that were
+  # already there rather than a test written to look for it.
+  #
+  # It is under the same memory cap as variant A, and its cache refuses
+  # anything over 8 MiB — so the 256 MiB streaming test also proves that an
+  # object the cache declines still streams rather than being buffered on its
+  # way past.
+  proxy-cache:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      createbuckets: {condition: service_completed_successfully}
+      cache-dir: {condition: service_completed_successfully}
+    volumes:
+      - "./policies/policy-a.yaml:/etc/s3proxy/policy.yaml:ro"
+      # A named volume rather than a container path, so the cache is still
+      # there after `docker compose restart` — which is how the suite checks
+      # that a restart recovers rather than starts cold.
+      - "cache:/var/cache/s3proxy"
+    environment:
+      POLICY_FILE: /etc/s3proxy/policy.yaml
+      ALLOWED_ENDPOINT: 127.0.0.1:18499
+      ALLOWED_SOURCE_SUBNET: 0.0.0.0/0
+      UPSTREAM_ENDPOINT: http://minio:9000
+      UPSTREAM_ACCESS_KEY_ID: minioadmin
+      UPSTREAM_SECRET_ACCESS_KEY: minioadmin123
+      CREDENTIAL_PEPPER: an-e2e-deployment-wide-pepper
+      METRICS_LISTEN_ADDR: ":8100"
+      CACHE_DIR: /var/cache/s3proxy
+      CACHE_MAX_BYTES: "67108864"
+      CACHE_MAX_OBJECT_SIZE: "8388608"
+      # Seconds rather than the 10m default, so expiry and revalidation are
+      # testable without the suite sleeping through a coffee break.
+      CACHE_MAX_AGE: 3s
+      CACHE_WRITES: "true"
+      CACHE_RANGE_FILLS: "true"
+      # The purge endpoint shares a listener with metrics and health, so the
+      # variant runs it closed — which is also the only way the suite gets to
+      # check that it refuses anything else.
+      CACHE_PURGE_TOKEN: an-e2e-purge-token
+      VERBOSE: "true"
+    mem_limit: 192m
+    ports: ["18499:8099", "18500:8100"]
+
 volumes:
   certs:
+  cache:

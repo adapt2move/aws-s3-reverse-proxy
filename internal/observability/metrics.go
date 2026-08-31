@@ -40,6 +40,13 @@ var (
 		},
 		[]string{"operation", "decision"},
 	)
+	cacheLookups = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "s3proxy_cache_lookups_total",
+			Help: "Local cache lookups by operation and outcome (hit, miss, stale, bypass).",
+		},
+		[]string{"operation", "result"},
+	)
 	policyReloads = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "s3proxy_policy_reloads_total",
@@ -50,7 +57,7 @@ var (
 )
 
 func init() {
-	prometheus.MustRegister(authzDecisions, deniedBatchKeys, proxiedRequestDuration, policyReloads)
+	prometheus.MustRegister(authzDecisions, deniedBatchKeys, proxiedRequestDuration, cacheLookups, policyReloads)
 	// Create the reload series up front. A counter that only appears after
 	// the event it counts is one an alert cannot be written against — the
 	// first rejected reload would look like a gap rather than a spike.
@@ -64,6 +71,59 @@ func init() {
 // — the caller that owns the store is the one that names the outcome.
 func RecordPolicyReload(outcome string) {
 	policyReloads.WithLabelValues(outcome).Inc()
+}
+
+// CacheStats is what the cache knows about itself, reported through a
+// function rather than by having the cache reach for a metrics registry. It
+// is the same seam as policy.Store.OnReload: the package that owns the state
+// stays testable without a Prometheus registry in the room.
+type CacheStats struct {
+	Entries       int
+	Bytes         int64
+	Capacity      int64
+	Stored        uint64
+	Dropped       uint64
+	Invalidations uint64
+	Evictions     uint64
+	EvictedBytes  uint64
+	WritesDropped uint64
+}
+
+// RegisterCacheStats publishes the cache's gauges and counters. It is called
+// once, at startup, and only when a cache is configured — a deployment
+// without one exports no cache series at all rather than a set of zeros that
+// look like an idle cache.
+func RegisterCacheStats(read func() CacheStats) {
+	gauge := func(name, help string, value func(CacheStats) float64) prometheus.Collector {
+		return prometheus.NewGaugeFunc(
+			prometheus.GaugeOpts{Name: name, Help: help},
+			func() float64 { return value(read()) },
+		)
+	}
+	counter := func(name, help string, value func(CacheStats) float64) prometheus.Collector {
+		return prometheus.NewCounterFunc(
+			prometheus.CounterOpts{Name: name, Help: help},
+			func() float64 { return value(read()) },
+		)
+	}
+	prometheus.MustRegister(
+		gauge("s3proxy_cache_entries", "Objects currently held in the local cache.",
+			func(s CacheStats) float64 { return float64(s.Entries) }),
+		gauge("s3proxy_cache_bytes", "Bytes the local cache occupies on disk.",
+			func(s CacheStats) float64 { return float64(s.Bytes) }),
+		gauge("s3proxy_cache_capacity_bytes", "Configured size limit of the local cache.",
+			func(s CacheStats) float64 { return float64(s.Capacity) }),
+		counter("s3proxy_cache_stores_total", "Upstream responses written into the local cache.",
+			func(s CacheStats) float64 { return float64(s.Stored) }),
+		counter("s3proxy_cache_store_failures_total", "Responses that could not be cached: truncated, superseded, or refused by the store.",
+			func(s CacheStats) float64 { return float64(s.Dropped + s.WritesDropped) }),
+		counter("s3proxy_cache_invalidations_total", "Cache keys dropped because the object behind them was written.",
+			func(s CacheStats) float64 { return float64(s.Invalidations) }),
+		counter("s3proxy_cache_evictions_total", "Cache files reclaimed to stay within the size limit.",
+			func(s CacheStats) float64 { return float64(s.Evictions) }),
+		counter("s3proxy_cache_evicted_bytes_total", "Bytes reclaimed from the local cache.",
+			func(s CacheStats) float64 { return float64(s.EvictedBytes) }),
+	)
 }
 
 // InstrumentHandler wraps the S3 API handler in the standard HTTP-level

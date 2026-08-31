@@ -52,6 +52,7 @@ wait_for_health() {
 wait_for_health http://127.0.0.1:18100/readyz proxy-http
 wait_for_health http://127.0.0.1:18300/readyz proxy-tls
 wait_for_health http://127.0.0.1:18400/readyz proxy-readonly
+wait_for_health http://127.0.0.1:18500/readyz proxy-cache
 
 # Shared by every variant.
 export E2E_MINIO_ACCESS_KEY=minioadmin
@@ -133,6 +134,33 @@ run_variant() {
   export E2E_TENANT_A=a1b2c3d4e5f60718293a4b5c6d7e8f90
   export E2E_TENANT_B=0f9e8d7c6b5a49382716f5e4d3c2b1a0
   export E2E_READ_ONLY=true
+  run_variant "$@"
+) || status=1
+
+# ---------------------------------------------------------------- variant D
+# Variant A's policy with the local object cache on. The whole suite runs
+# against it, which is most of the point: a cache that answered a request
+# policy would have refused would fail the tests that were already here.
+(
+  export E2E_NAME=proxy-cache
+  export E2E_PROXY_ENDPOINT=http://127.0.0.1:18499
+  export E2E_ADMIN_ENDPOINT=http://127.0.0.1:18500
+  export E2E_MINIO_ENDPOINT=http://127.0.0.1:19000
+  export E2E_ACCESS_KEY_TEMPLATE='{tenant}{level}'
+  export E2E_SECRET_TEMPLATE='{tenant}:{level}'
+  export E2E_KEY_PREFIX_TEMPLATE='{tenant}/'
+  export E2E_READ_LEVEL=ro
+  export E2E_WRITE_LEVEL=rw
+  export E2E_TENANT_A=a1b2c3d4e5f60718293a4b5c6d7e8f90
+  export E2E_TENANT_B=0f9e8d7c6b5a49382716f5e4d3c2b1a0
+  export E2E_CACHE_MAX_AGE=3s
+  export E2E_CACHE_PURGE_TOKEN=an-e2e-purge-token
+  export E2E_CACHE_MAX_OBJECT_SIZE=8388608
+  # An object well past what the cache accepts, through a container with less
+  # memory than it: the cache declining an object must not make the proxy
+  # buffer it.
+  export E2E_LARGE_OBJECT_SIZE=268435456
+  export E2E_CACHE_RESTART_CMD="docker compose -f $PWD/docker-compose.yml restart proxy-cache"
   run_variant "$@"
 ) || status=1
 
