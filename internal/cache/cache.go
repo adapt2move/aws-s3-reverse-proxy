@@ -118,6 +118,12 @@ type pending struct {
 	// cache — see Mutation.
 	mutating int
 
+	// contested records that more than one write to this key has been in
+	// flight at once since the last time the key was quiet. Which of them
+	// the object store keeps is the object store's business and is not
+	// visible from here, so none of their bodies may be cached.
+	contested bool
+
 	// poisoned records that the object behind this key changed while a
 	// response for it was being written. Committing that response would put
 	// a version into the cache that was already out of date when it
@@ -347,22 +353,61 @@ func (c *Cache) Has(key string) bool {
 // response headers, or Abort. Abort after Commit does nothing, so it is safe
 // to defer.
 func (c *Cache) Put(key string, size int64) (*Writer, error) {
-	if c.busy(key) {
-		return nil, ErrBusyKey
+	if err := c.claim(key); err != nil {
+		return nil, err
 	}
 	w, err := c.store.Put(key, size)
 	if err != nil {
+		c.unclaim(key)
 		return nil, err
 	}
+	return &Writer{c: c, key: key, w: w, expect: size}, nil
+}
+
+// claim reserves the right to capture a response for this key.
+//
+// One capture per key at a time. Concurrent readers of the same cold object
+// each get their own response and each stream it to their own client — none
+// of them is made to wait, which is the rule — but only the first of them
+// writes it down. The others would append a second copy that the index would
+// immediately supersede, so the store would carry the cost of writing bytes
+// it was always going to reclaim, and each of them would hold its own
+// preallocated file while doing it.
+func (c *Cache) claim(key string) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	p, ok := c.pending[key]
 	if !ok {
 		p = &pending{}
 		c.pending[key] = p
 	}
+	if p.mutating > 0 {
+		return ErrBusyKey
+	}
+	if p.writers > 0 {
+		c.forgetLocked(key, p)
+		return ErrAlreadyCapturing
+	}
 	p.writers++
-	c.mu.Unlock()
-	return &Writer{c: c, key: key, w: w, expect: size}, nil
+	return nil
+}
+
+func (c *Cache) unclaim(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if p := c.pending[key]; p != nil {
+		p.writers--
+		c.forgetLocked(key, p)
+	}
+}
+
+// contested reports whether more than one write to this key has been in
+// flight at once since the key was last quiet.
+func (c *Cache) contested(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p := c.pending[key]
+	return p == nil || p.contested
 }
 
 // busy reports whether a write to this key is in flight upstream.
@@ -538,4 +583,9 @@ var (
 	// flight. It is not a failure: the response is simply not cached, and
 	// the caller carries on serving it.
 	ErrBusyKey = errors.New("cache: a write to this key is in flight")
+
+	// ErrAlreadyCapturing is returned by Put when another response for the
+	// same key is already being captured. Also not a failure: one of the
+	// concurrent readers stores the object and the rest simply serve it.
+	ErrAlreadyCapturing = errors.New("cache: this key is already being captured")
 )

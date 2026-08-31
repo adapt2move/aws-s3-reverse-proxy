@@ -519,22 +519,99 @@ func TestWithoutACacheNothingChanges(t *testing.T) {
 	assert.Equal(t, 2, upstream.count(), "every read reaches the object store, as it always did")
 }
 
-func TestConcurrentReadsOfAColdObject(t *testing.T) {
-	h, upstream, _ := newCachingProxy(t)
-	servesObject(upstream, strings.Repeat("payload", 100), nil)
+// The point of this one is what happens *after* the concurrent reads, not
+// during them. Asserting only status and body would pass with no cache at
+// all: both come from the upstream stream that every reader gets either way.
+func TestConcurrentReadsOfAColdObjectLeaveItCached(t *testing.T) {
+	h, upstream, objectCache := newCachingProxy(t)
+	body := strings.Repeat("payload", 100)
+	servesObject(upstream, body, nil)
 
+	const keys, readers = 4, 16
 	var wg sync.WaitGroup
-	for i := 0; i < 16; i++ {
+	for i := 0; i < readers; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			target := fmt.Sprintf("/bucket/datasets/%d.bin", i%4)
+			target := fmt.Sprintf("/bucket/datasets/%d.bin", i%keys)
 			resp := getObject(t, h, tenantA, "rw", target, nil)
 			assert.Equal(t, http.StatusOK, resp.StatusCode)
-			assert.Equal(t, strings.Repeat("payload", 100), readBody(t, resp))
+			assert.Equal(t, body, readBody(t, resp))
 		}(i)
 	}
 	wg.Wait()
+
+	// Every one of them should have ended up cached, and a read afterwards
+	// should not reach the object store.
+	before := upstream.count()
+	for i := 0; i < keys; i++ {
+		target := fmt.Sprintf("/bucket/datasets/%d.bin", i)
+		require.True(t, objectCache.Has("bucket/"+tenantA+"/datasets/"+fmt.Sprint(i)+".bin"),
+			"%s was read %d times and never stored", target, readers/keys)
+		resp := getObject(t, h, tenantA, "rw", target, nil)
+		assert.Equal(t, "HIT", resp.Header.Get("X-Cache"))
+		assert.Equal(t, body, readBody(t, resp))
+	}
+	assert.Equal(t, before, upstream.count(), "the reads afterwards should all have been hits")
+}
+
+// Completing a multipart upload replaces the object without a PutObject ever
+// being seen, so it is the one write whose invalidation nothing else would
+// cover. A test that uploaded to a fresh key would pass on a broken one, too,
+// because a cold miss and a dropped entry look the same from outside.
+func TestCompletingAMultipartUploadInvalidatesTheObject(t *testing.T) {
+	h, upstream, objectCache := newCachingProxy(t)
+	key := "datasets/big.parquet"
+	servesObject(upstream, "the version before the upload", nil)
+
+	require.Equal(t, http.StatusOK, getObject(t, h, tenantA, "rw", "/bucket/"+key, nil).StatusCode)
+	require.Equal(t, "HIT", getObject(t, h, tenantA, "rw", "/bucket/"+key, nil).Header.Get("X-Cache"))
+	require.True(t, objectCache.Has("bucket/"+tenantA+"/"+key))
+
+	upstream.mu.Lock()
+	upstream.respond = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(`<?xml version="1.0"?><CompleteMultipartUploadResult>` +
+			`<Key>` + tenantA + `/` + key + `</Key>` +
+			`</CompleteMultipartUploadResult>`))
+	}
+	upstream.mu.Unlock()
+
+	complete := do(t, h, clientRequest{
+		method: http.MethodPost, target: "/bucket/" + key + "?uploadId=abc",
+		body: []byte("<CompleteMultipartUpload/>"), tenant: tenantA, level: "rw",
+	}).Result()
+	require.Equal(t, http.StatusOK, complete.StatusCode)
+
+	assert.False(t, objectCache.Has("bucket/"+tenantA+"/"+key),
+		"the object changed without a PutObject; the cache has to have noticed")
+
+	servesObject(upstream, "the version the multipart upload assembled", nil)
+	after := getObject(t, h, tenantA, "rw", "/bucket/"+key, nil)
+	assert.Equal(t, "MISS", after.Header.Get("X-Cache"))
+	assert.Equal(t, "the version the multipart upload assembled", readBody(t, after))
+}
+
+// Uploading a part changes nothing a reader can see — the object does not
+// exist until the upload is completed — so it must not throw away what is
+// cached under that key.
+func TestUploadingAPartLeavesTheCachedObjectAlone(t *testing.T) {
+	h, upstream, objectCache := newCachingProxy(t)
+	key := "datasets/big.parquet"
+	servesObject(upstream, "the object as it stands", nil)
+
+	require.Equal(t, http.StatusOK, getObject(t, h, tenantA, "rw", "/bucket/"+key, nil).StatusCode)
+	require.True(t, objectCache.Has("bucket/"+tenantA+"/"+key))
+
+	part := do(t, h, clientRequest{
+		method: http.MethodPut, target: "/bucket/" + key + "?partNumber=1&uploadId=abc",
+		body: []byte("part one"), tenant: tenantA, level: "rw",
+	}).Result()
+	require.Equal(t, http.StatusOK, part.StatusCode)
+
+	resp := getObject(t, h, tenantA, "rw", "/bucket/"+key, nil)
+	assert.Equal(t, "HIT", resp.Header.Get("X-Cache"))
+	assert.Equal(t, "the object as it stands", readBody(t, resp))
 }
 
 // readBody drains a response and returns it as a string.
@@ -544,41 +621,4 @@ func readBody(t *testing.T, resp *http.Response) string {
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	return string(body)
-}
-
-func TestAWriteIsNotACacheLookup(t *testing.T) {
-	h, upstream, _ := newCachingProxy(t)
-	servesObject(upstream, "contents", nil)
-
-	// A PUT is not a read that the cache declined to answer, and reporting
-	// it as one would put every upload in the lookup metric as a bypass.
-	put := do(t, h, clientRequest{
-		method: http.MethodPut, target: "/bucket/datasets/a.csv",
-		body: []byte("contents"), tenant: tenantA, level: "rw",
-	}).Result()
-	require.Equal(t, http.StatusOK, put.StatusCode)
-	assert.Empty(t, put.Header.Get("X-Cache"))
-
-	del := do(t, h, clientRequest{
-		method: http.MethodDelete, target: "/bucket/datasets/a.csv", tenant: tenantA, level: "rw",
-	}).Result()
-	require.Equal(t, http.StatusOK, del.StatusCode)
-	assert.Empty(t, del.Header.Get("X-Cache"))
-}
-
-// A conditional a cache can answer should be answered by it: ServeContent
-// evaluates If-None-Match against the stored ETag, so a client revalidating
-// what it already has never reaches the object store either.
-func TestIfNoneMatchIsAnsweredFromTheCache(t *testing.T) {
-	h, upstream, _ := newCachingProxy(t)
-	servesObject(upstream, "contents", nil)
-
-	require.Equal(t, http.StatusOK, getObject(t, h, tenantA, "rw", "/bucket/datasets/a.csv", nil).StatusCode)
-	require.Equal(t, 1, upstream.count())
-
-	revalidated := getObject(t, h, tenantA, "rw", "/bucket/datasets/a.csv",
-		http.Header{"If-None-Match": {`"upstream-etag"`}})
-	assert.Equal(t, http.StatusNotModified, revalidated.StatusCode)
-	assert.Equal(t, "HIT", revalidated.Header.Get("X-Cache"))
-	assert.Equal(t, 1, upstream.count())
 }

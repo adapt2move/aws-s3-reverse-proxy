@@ -64,6 +64,12 @@ var (
 	// the request that feeds it has stopped being a cache.
 	ErrBusy = errors.New("blobcache: write queue full")
 
+	// ErrNoRoom is returned when a write would put the store past MaxBytes
+	// counting what other writes have already reserved. Eviction cannot
+	// help: it reclaims bytes that were written, and these are bytes that
+	// are spoken for. Like ErrBusy, the answer is to not cache this one.
+	ErrNoRoom = errors.New("blobcache: no room within the size limit")
+
 	// ErrTooLarge is returned when a payload exceeds Options.MaxObjectSize,
 	// either up front from the size hint or partway through a write whose
 	// length was not known in advance.
@@ -84,8 +90,15 @@ type Options struct {
 
 	// MaxBytes caps the payload bytes held on disk. Default 1 GiB.
 	//
-	// It is a budget, not a hard ceiling: eviction runs after a write, so
-	// the store transiently exceeds it by at most one object.
+	// It is a budget, not a hard ceiling, in two ways. Eviction runs after a
+	// write, so the store transiently exceeds it by at most one object. And
+	// writes in flight have already claimed disk they have not committed —
+	// a payload large enough for its own file has that file's whole length
+	// allocated the moment the write starts — which eviction cannot reclaim
+	// because it is spoken for rather than written. Those are bounded
+	// separately, at half this budget or one MaxObjectSize if that is more,
+	// so peak usage is MaxBytes plus that allowance and not MaxBytes times
+	// however many writes overlap.
 	MaxBytes int64
 
 	// MaxEntries caps the number of live keys, which is what bounds the

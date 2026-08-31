@@ -118,6 +118,19 @@ func (s *activeSegment) seal(verify bool) error {
 	if err := s.flush(-1); err != nil {
 		return err
 	}
+	// Cut the file back to what was actually written before the index goes
+	// on the end.
+	//
+	// Preallocation extends the file to the full segment size, so a segment
+	// sealed before it filled up — which is what closing the store does to
+	// the one being appended to — is longer than its records. The index
+	// would then land in the middle of it, and the reader that looks for a
+	// trailer at the end of the file would find preallocated zeroes and
+	// replay the whole segment instead. Correct, but it quietly undoes the
+	// reason for writing an index at all.
+	if err := s.wf.Truncate(s.end); err != nil {
+		return err
+	}
 	var entries []footerEntry
 	_, err := replayRecords(s.c.rf, s.end, verify, func(off int64, h recordHeader, key string) error {
 		entries = append(entries, footerEntry{Offset: off, Header: h, Key: key})

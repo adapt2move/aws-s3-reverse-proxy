@@ -317,3 +317,97 @@ func TestAnEntryIsNeverVisibleBeforeItsBytesAre(t *testing.T) {
 	close(stop)
 	readers.Wait()
 }
+
+// A payload large enough for its own file has that file's whole length
+// allocated the moment the write starts, and the write may not commit for
+// minutes. Counting only committed bytes would make the real ceiling however
+// many writes happen to overlap: with a 1 GiB budget and 64 MiB objects, 64
+// concurrent misses would reserve 4 GiB on a volume sized for one.
+//
+// Eviction cannot help, either — it reclaims what is counted, and these bytes
+// are spoken for rather than written.
+func TestWritesInFlightCountAgainstTheBudget(t *testing.T) {
+	// Half of an 8 MiB budget is what writes in flight may claim between
+	// them, so four megabyte writers fill it exactly.
+	s := open(t, t.TempDir(), func(o *Options) {
+		o.MaxBytes = 8 << 20
+		o.SegmentSize = 256 << 10
+		o.InlineMaxSize = 64 << 10
+		o.MaxObjectSize = 1 << 20
+	})
+	defer s.Close()
+
+	// Four writers of a megabyte each fill the allowance without a single
+	// one of them having committed.
+	var inFlight []*Writer
+	for i := 0; i < 4; i++ {
+		w, err := s.Put(fmt.Sprintf("big-%d", i), 1<<20)
+		require.NoError(t, err, "writer %d should still fit in the allowance", i)
+		inFlight = append(inFlight, w)
+	}
+	_, err := s.Put("one-too-many", 1<<20)
+	assert.ErrorIs(t, err, ErrNoRoom,
+		"disk claimed by writes in flight has to be counted, not only what has landed")
+
+	// Nothing has been committed, so nothing is on the books yet — the point
+	// is that the disk is already spoken for.
+	assert.Equal(t, int64(0), s.Stats().Bytes)
+
+	// A write gives its reservation back whichever way it ends: aborted,
+	// committed, or failed.
+	inFlight[0].Abort()
+	_, err = inFlight[1].Write(payload(1<<20, 3))
+	require.NoError(t, err)
+	require.NoError(t, inFlight[1].Commit([]byte("m")))
+	inFlight[2].Abort()
+	inFlight[3].Abort()
+
+	assert.Equal(t, int64(0), s.reserved.Load(), "every reservation has to be given back")
+	assert.Greater(t, s.Stats().Bytes, int64(1<<20), "and the one that committed is now on the books")
+
+	// With the reservations gone there is room again.
+	w, err := s.Put("room-again", 1<<20)
+	require.NoError(t, err)
+	w.Abort()
+}
+
+// A write whose length nobody announced cannot reserve up front, so it claims
+// the allowance as the payload arrives — otherwise the accounting would have
+// a hole exactly where the size hint is missing, and a client that declines
+// to say how much it is sending would be the way around the bound.
+func TestAWriteOfUnknownLengthAlsoClaimsTheAllowance(t *testing.T) {
+	s := open(t, t.TempDir(), func(o *Options) {
+		o.MaxBytes = 8 << 20 // allowance: 4 MiB
+		o.SegmentSize = 256 << 10
+		o.InlineMaxSize = 32 << 10
+		o.MaxObjectSize = 2 << 20
+	})
+	defer s.Close()
+
+	// Fill the allowance with two writes that did announce their size.
+	for i := 0; i < 2; i++ {
+		w, err := s.Put(fmt.Sprintf("announced-%d", i), 2<<20)
+		require.NoError(t, err)
+		defer w.Abort()
+	}
+
+	// This one says nothing, so it is only refused once it has grown out of
+	// the staging buffer and asks for disk.
+	w, err := s.Put("unannounced", -1)
+	require.NoError(t, err, "a write of unknown length costs nothing until it needs disk")
+	defer w.Abort()
+
+	var wrote int64
+	var failure error
+	for i := 0; i < 8; i++ {
+		n, err := w.Write(payload(32<<10, byte(i)))
+		wrote += int64(n)
+		if err != nil {
+			failure = err
+			break
+		}
+	}
+	assert.ErrorIs(t, failure, ErrNoRoom)
+	assert.LessOrEqual(t, wrote, int64(64<<10),
+		"it should stop as soon as it needs disk the allowance cannot give it")
+}

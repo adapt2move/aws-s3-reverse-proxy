@@ -52,6 +52,7 @@ type Options struct {
 	CacheRangeFills    bool
 	CacheSegmentSize   int64
 	CacheInlineMaxSize int64
+	CachePurgeToken    string
 
 	MaxClockSkew       time.Duration
 	MaxChunkedBodySize int64
@@ -135,6 +136,7 @@ const (
 	envUpstreamAccessKey    = "UPSTREAM_ACCESS_KEY_ID"
 	envUpstreamSecretKey    = "UPSTREAM_SECRET_ACCESS_KEY"
 	envCredentialPepper     = "CREDENTIAL_PEPPER"
+	envCachePurgeToken      = "CACHE_PURGE_TOKEN"
 	minCredentialPepperSize = 16
 )
 
@@ -178,6 +180,13 @@ func LoadSecrets(opts *Options) error {
 		return fmt.Errorf("%s must be at least %d bytes", envCredentialPepper, minCredentialPepperSize)
 	}
 	opts.Pepper = []byte(pepper)
+
+	// A secret like the others: environment or mounted file, never a flag,
+	// because a flag shows up in `ps`. Unset is allowed and means the purge
+	// endpoint is open to whatever can reach the admin listener.
+	if opts.CachePurgeToken, err = readSecretEnv(envCachePurgeToken); err != nil {
+		return err
+	}
 	return nil
 }
 

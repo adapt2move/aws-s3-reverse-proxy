@@ -63,10 +63,18 @@ type Store struct {
 	// the store has.
 	reclaimable []*container
 
-	nextID   atomic.Uint64
-	crashed  atomic.Bool
-	entries  atomic.Int64
-	disk     atomic.Int64
+	nextID  atomic.Uint64
+	crashed atomic.Bool
+	entries atomic.Int64
+	disk    atomic.Int64
+
+	// reserved is disk that writes in flight have claimed but not yet
+	// committed. Without it MaxBytes would not be a bound at all: a payload
+	// large enough for its own file has that file's whole length allocated
+	// the moment the write starts, and nothing counted it until the commit
+	// that may be minutes away. The real ceiling would then be however many
+	// writes happen to overlap.
+	reserved atomic.Int64
 	segments atomic.Int64
 	blobs    atomic.Int64
 	failed   atomic.Pointer[error]
@@ -211,16 +219,59 @@ func (s *Store) Put(key string, sizeHint int64) (*Writer, error) {
 	}
 
 	w := &Writer{s: s, key: key}
+	if sizeHint > 0 {
+		if !s.reserve(sizeHint) {
+			return nil, ErrNoRoom
+		}
+		w.reserved = sizeHint
+	}
 	if sizeHint > s.opts.InlineMaxSize {
 		// The size is known and it is large, so skip the staging buffer
 		// entirely and stream straight into a file of its own.
 		blob, err := newBlobWriter(s.opts.Dir, s.nextID.Add(1), sizeHint)
 		if err != nil {
+			s.release(w.reserved)
 			return nil, err
 		}
 		w.blob = blob
 	}
 	return w, nil
+}
+
+// reserve claims disk for a write that has not happened yet, and reports
+// whether the store can afford it.
+//
+// What it bounds is the writes in flight, not the store as a whole. Committed
+// bytes are eviction's problem and eviction handles them; these are bytes
+// that are spoken for and that eviction therefore cannot reclaim — so
+// checking them against the whole budget would turn a full cache into one
+// that refuses everything instead of one that makes room, which is the
+// opposite of what a cache is for.
+//
+// The allowance is half the budget, or one largest object if that is more, so
+// that a single object of the maximum size can always start. Peak disk is
+// therefore MaxBytes plus this allowance rather than MaxBytes times however
+// many writes happen to overlap.
+func (s *Store) reserve(n int64) bool {
+	budget := s.opts.MaxBytes / 2
+	if budget < s.opts.MaxObjectSize {
+		budget = s.opts.MaxObjectSize
+	}
+	for {
+		held := s.reserved.Load()
+		if held+n > budget {
+			return false
+		}
+		if s.reserved.CompareAndSwap(held, held+n) {
+			return true
+		}
+	}
+}
+
+func (s *Store) release(n int64) {
+	if n > 0 {
+		s.reserved.Add(-n)
+	}
 }
 
 // Delete removes key. It is not an error for the key to be absent.

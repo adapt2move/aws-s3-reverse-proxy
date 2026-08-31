@@ -94,6 +94,10 @@ type Env struct {
 	// test can pick a size on either side of it.
 	CacheMaxObjectSize int64
 
+	// CachePurgeToken is what the deployment requires on POST
+	// /cache/purge. Empty means it accepts an unauthenticated purge.
+	CachePurgeToken string
+
 	// CacheRestartCmd, when set, restarts the proxy under test with its
 	// cache directory intact. It is what lets the suite check that a cache
 	// survives a restart, which is the one part of recovery a unit test can
@@ -162,6 +166,7 @@ func LoadEnv(t *testing.T) Env {
 		}
 		env.CacheMaxObjectSize = n
 	}
+	env.CachePurgeToken = os.Getenv("E2E_CACHE_PURGE_TOKEN")
 	env.CacheRestartCmd = os.Getenv("E2E_CACHE_RESTART_CMD")
 	return env
 }

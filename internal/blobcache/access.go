@@ -86,6 +86,10 @@ type Writer struct {
 	written int64
 	err     error
 	done    bool
+
+	// reserved is how much disk this write has claimed against the store's
+	// budget. It is given back when the write ends, whichever way it ends.
+	reserved int64
 }
 
 // beginInline lays out the fixed part of the record so the payload can be
@@ -117,6 +121,17 @@ func (w *Writer) Write(p []byte) (int, error) {
 		}
 	}
 	if w.blob != nil {
+		// A write whose length was announced claimed its disk up front. One
+		// whose length is not known claims it as it arrives, because that is
+		// the only point at which anybody knows how much there is.
+		if w.reserved < w.written+int64(len(p)) {
+			want := w.written + int64(len(p)) - w.reserved
+			if !w.s.reserve(want) {
+				w.fail(ErrNoRoom)
+				return 0, w.err
+			}
+			w.reserved += want
+		}
 		n, err := w.blob.Write(p)
 		w.written += int64(n)
 		if err != nil {
@@ -157,6 +172,9 @@ func (w *Writer) ReadFrom(r io.Reader) (int64, error) {
 
 // spill moves a payload that outgrew the staging buffer into its own file,
 // carrying over what has been written so far.
+//
+// Nothing is preallocated here — the length is exactly what is not known — so
+// the budget is claimed as the payload arrives instead, in Write.
 func (w *Writer) spill() error {
 	blob, err := newBlobWriter(w.s.opts.Dir, w.s.nextID.Add(1), 0)
 	if err != nil {
@@ -206,6 +224,14 @@ func (w *Writer) Commit(meta []byte) error {
 		return w.err
 	}
 	w.done = true
+	// Whatever this write reserved goes back here. A commit moves those
+	// bytes onto the books rather than adding to them, so holding both
+	// would count the same disk twice and shrink the budget every time
+	// something was cached.
+	defer func() {
+		w.s.release(w.reserved)
+		w.reserved = 0
+	}()
 
 	if w.blob != nil {
 		c, err := w.blob.commit()
@@ -276,6 +302,8 @@ func (w *Writer) release() {
 	}
 	returnStaging(w.buf)
 	w.buf = nil
+	w.s.release(w.reserved)
+	w.reserved = 0
 }
 
 // Reader streams one cached payload.

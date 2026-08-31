@@ -73,7 +73,7 @@ func (w *Writer) Commit(header http.Header) error {
 		w.c.dropped.Add(1)
 		return fmt.Errorf("%w: %d of %d bytes", errShortWrite, w.written, w.expect)
 	}
-	if !w.exempt && w.poisoned() {
+	if w.superseded() {
 		w.w.Abort()
 		w.c.dropped.Add(1)
 		return nil
@@ -129,13 +129,26 @@ func canonical(header http.Header) http.Header {
 	return out
 }
 
-// poisoned reports whether the object was invalidated while this response was
-// being written, and clears the flag if this was the last writer for the key.
-func (w *Writer) poisoned() bool {
+// superseded reports whether what this writer holds is known not to be the
+// current version of the object.
+//
+// For an ordinary capture of a response, that means the object was
+// invalidated while the response was being written. For the body of an upload
+// — which is exempt from that, being the write everything else is kept away
+// from — it means a second upload of the same key overlapped this one, so
+// which body the object store ended up with is not something this process can
+// know.
+func (w *Writer) superseded() bool {
 	w.c.mu.Lock()
 	defer w.c.mu.Unlock()
 	p := w.c.pending[w.key]
-	return p != nil && p.poisoned
+	if p == nil {
+		return false
+	}
+	if w.exempt {
+		return p.contested
+	}
+	return p.poisoned
 }
 
 func (w *Writer) finish() {

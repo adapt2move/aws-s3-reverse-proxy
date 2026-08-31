@@ -50,13 +50,24 @@ func purgeCache(t *testing.T, env Env) {
 	if env.AdminEndpoint == "" {
 		t.Skip("E2E_ADMIN_ENDPOINT is not set; the purge endpoint is unreachable")
 	}
-	resp, err := http.Post(env.AdminEndpoint+"/cache/purge", "", nil)
-	requireNoError(t, err, "POST /cache/purge")
+	resp := postPurge(t, env, env.CachePurgeToken)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("POST /cache/purge returned %d: %s", resp.StatusCode, body)
 	}
+}
+
+func postPurge(t *testing.T, env Env, token string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, env.AdminEndpoint+"/cache/purge", nil)
+	requireNoError(t, err, "building the purge request")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	requireNoError(t, err, "POST /cache/purge")
+	return resp
 }
 
 // read fetches an object through the proxy as a raw request, so the test can
@@ -238,6 +249,33 @@ func TestPurgeMakesTheCacheForgetEverything(t *testing.T) {
 
 	resp, _ = read(t, env, env.TenantA, env.ReadLevel, key, nil)
 	requireCache(t, resp, "MISS", "a read after a purge")
+}
+
+// Emptying the cache in a loop is a cheap way to force full re-fetches from
+// the object store, on a listener that also serves metrics. Where the
+// deployment sets a token, the endpoint has to actually want it.
+func TestPurgeNeedsItsToken(t *testing.T) {
+	env := cacheSetup(t)
+	if env.CachePurgeToken == "" {
+		t.Skip("this deployment leaves the purge endpoint open")
+	}
+	key := "datasets/cache/purge-token.csv"
+	putDirectly(t, env, env.TenantA, key, []byte("contents\n"))
+	read(t, env, env.TenantA, env.ReadLevel, key, nil)
+	resp, _ := read(t, env, env.TenantA, env.ReadLevel, key, nil)
+	requireCache(t, resp, "HIT", "a warm read")
+
+	for _, token := range []string{"", "not-the-token"} {
+		refused := postPurge(t, env, token)
+		refused.Body.Close()
+		if refused.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("a purge with %q returned %d, want 401", token, refused.StatusCode)
+		}
+	}
+
+	// And nothing was emptied by the attempts.
+	resp, _ = read(t, env, env.TenantA, env.ReadLevel, key, nil)
+	requireCache(t, resp, "HIT", "a read after two refused purges")
 }
 
 func TestARangedReadIsAnsweredFromTheCache(t *testing.T) {

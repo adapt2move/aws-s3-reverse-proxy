@@ -211,6 +211,7 @@ a mounted secret, which is what a Kubernetes Secret volume gives you.
 | `UPSTREAM_ACCESS_KEY_ID`, `UPSTREAM_SECRET_ACCESS_KEY` | credentials used to re-sign every upstream request |
 | `UPSTREAM_CREDENTIALS` | the same pair as `"ACCESS_KEY_ID,SECRET_ACCESS_KEY"` |
 | `CREDENTIAL_PEPPER` | keys the HMAC that derives every client secret (minimum 16 bytes) |
+| `CACHE_PURGE_TOKEN` | bearer token required by `POST /cache/purge`; unset leaves that endpoint open |
 
 ### Flags
 
@@ -489,9 +490,26 @@ proxy and cannot wait for expiry:
 curl -X POST http://<health-listen-addr>/cache/purge
 ```
 
+
 It lives on the admin listener and nowhere else. On the S3 port,
 `/cache/purge` is indistinguishable from a request for an object called that,
 and a bucket named `cache` would put it within reach of any tenant.
+
+Being on a separate listener is not the same as being protected, though. That
+listener also serves `/metrics` and `/healthz`, so without
+`--cache-purge-token` anything that can scrape metrics can also empty the
+cache — in a loop, which is a cheap way to force full re-fetches from the
+object store and spend exactly the egress this feature exists to save. Set the
+token, or make sure the network policy on that port really does scope it to
+the scraper:
+
+```
+CACHE_PURGE_TOKEN=…              # or CACHE_PURGE_TOKEN_FILE, like the other secrets
+curl -X POST -H 'Authorization: Bearer …' http://<health-listen-addr>/cache/purge
+```
+
+With no token set, the endpoint is open to whatever can reach the port, and
+the startup log says so.
 
 All of the above is exercised end to end against a real MinIO, by a fourth
 proxy variant in `e2e/` that runs the whole suite with the cache on — so a
@@ -508,9 +526,27 @@ revalidated and invalidated atomically, so this cannot happen within the
 proxy; it is a reason to take an external writer seriously rather than to set
 `--cache-max-age` loosely.
 
-Running more than one replica means one cache per replica: the hit rate
-divides by the replica count and each cache is independently stale. Route by
-key if that matters.
+### More than one replica
+
+Each replica has its own cache, and neither the writes nor the invalidations
+that pass through one reach the other. The hit rate divides by the replica
+count, which is the small half of it. The large half is that **read-after-write
+stops being guaranteed**: write an object through replica A and read it back
+through replica B, and B answers from whatever it last cached — for up to
+`--cache-max-age`, without asking the object store at all.
+
+Two ways to be correct about that, and a cache-enabled deployment wants one of
+them:
+
+  * **Route by key**, or run a single replica. Then an object is only ever
+    cached by the replica that also sees its writes, and read-after-write
+    holds as it does without a cache. A plain round-robin Service is not this.
+  * **Accept the window and bound it deliberately** with `--cache-max-age`,
+    knowing that a client which writes through the proxy and immediately reads
+    back may get the previous version until it expires.
+
+This is not something the proxy can detect or warn about — a replica cannot
+see its siblings — so it is stated here rather than at startup.
 
 The cache directory holds tenant object data at rest, which the proxy
 otherwise never does. It is created `0700`; encryption at rest is the
@@ -603,9 +639,11 @@ an unbounded label is an unbounded number of time series.
 
 The cache series appear only when a cache is configured: a deployment without
 one exports nothing rather than a set of zeros that read like an idle cache.
-Every served request also carries an `X-Cache` header — `HIT`, `REVALIDATED`,
+Every object **read** also carries an `X-Cache` header — `HIT`, `REVALIDATED`,
 `STALE`, `MISS`, `BYPASS` — so a hit rate is answerable from one request and
-not only from a dashboard. `REVALIDATED` against `STALE` is the pair worth
+not only from a dashboard. Writes and listings carry none: they are not
+lookups, and counting them as one would put every upload in the metric as a
+bypass. `REVALIDATED` against `STALE` is the pair worth
 watching when tuning `--cache-max-age`: the first cost a round trip, the
 second cost a transfer.
 

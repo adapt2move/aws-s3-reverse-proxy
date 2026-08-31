@@ -220,6 +220,10 @@ services:
       CACHE_MAX_AGE: 3s
       CACHE_WRITES: "true"
       CACHE_RANGE_FILLS: "true"
+      # The purge endpoint shares a listener with metrics and health, so the
+      # variant runs it closed — which is also the only way the suite gets to
+      # check that it refuses anything else.
+      CACHE_PURGE_TOKEN: an-e2e-purge-token
       VERBOSE: "true"
     mem_limit: 192m
     ports: ["18499:8099", "18500:8100"]

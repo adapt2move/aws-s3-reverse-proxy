@@ -16,11 +16,18 @@ import (
 //
 // The order is deliberate. A write's outcome is recorded first, because
 // whether the upload was accepted decides what the cache should hold. The
-// rewriting comes next, because it is what the client is owed. The read
-// capture comes last, so that what is stored is the upstream's response and
-// not the rewritten one: a listing filtered for one access level, or a body
+// read capture comes next, so that what is stored is the upstream's response
+// and not a rewritten one: a listing filtered for one access level, or a body
 // with the tenant prefix stripped out, is an answer to one request rather
-// than a copy of an object.
+// than a copy of an object. Rewriting comes last, because it is what the
+// client is owed and nothing after it needs the original.
+//
+// Capturing before rewriting rather than after is what makes that a property
+// of this function instead of a coincidence. It costs nothing — a capture
+// only ever acts on a 200 or a 206, which are exactly the responses the
+// rewrite passes through untouched — and without it, anyone who later teaches
+// the rewrite to touch object reads would start caching rewritten bodies with
+// no sign that anything had changed.
 func (h *Handler) modifyResponse(resp *http.Response) error {
 	if resp == nil || resp.Request == nil {
 		return nil
@@ -30,10 +37,10 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 		return rewriteUpstreamResponse(resp)
 	}
 	h.finishMutation(resp, st)
+	h.captureRead(resp, st)
 	if err := rewriteUpstreamResponse(resp); err != nil {
 		return err
 	}
-	h.captureRead(resp, st)
 	if st.cacheResult != "" {
 		// The client asked for something the cache could have answered and
 		// did not. Saying so is what makes a hit rate debuggable from one

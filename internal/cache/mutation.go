@@ -39,6 +39,12 @@ func (c *Cache) BeginMutation(keys ...string) *Mutation {
 			p = &pending{}
 			c.pending[key] = p
 		}
+		if p.mutating > 0 {
+			// A second write to a key that is already being written. From
+			// here there is no way to tell which one the object store will
+			// keep, so neither body may be cached — see Capture.
+			p.contested = true
+		}
 		p.mutating++
 		p.poisoned = true
 	}
@@ -56,10 +62,21 @@ func (c *Cache) BeginMutation(keys ...string) *Mutation {
 // when the store will not take it — too large, too busy, no room — and a nil
 // writer is not an error the caller has to handle.
 //
+// It also returns nil when another write to the same key is already in
+// flight. The exemption below is what makes capturing a body safe at all, and
+// it holds only while this mutation is the only one: with two of them, both
+// bodies would be exempt and both would commit, and the one left in the cache
+// would be whichever finished writing here last — which has nothing to do
+// with which one the object store kept. Declining leaves plain invalidation,
+// which is the right answer when nobody can say what the object now is.
+//
 // Only a single-key mutation can capture a body; a batch delete has no body
 // that describes any one object.
 func (m *Mutation) Capture(size int64) *Writer {
 	if m == nil || len(m.keys) != 1 || m.capture != nil {
+		return nil
+	}
+	if m.c.contested(m.keys[0]) {
 		return nil
 	}
 	w, err := m.c.store.Put(m.keys[0], size)
@@ -72,7 +89,9 @@ func (m *Mutation) Capture(size int64) *Writer {
 	}
 	m.c.mu.Unlock()
 	// exempt: this writer *is* the write everything else is being kept away
-	// from, so the poison the mutation set does not apply to it.
+	// from, so the poison the mutation set does not apply to it. It is still
+	// checked against contested when it commits, because a rival write can
+	// start after this point.
 	m.capture = &Writer{c: m.c, key: m.keys[0], w: w, expect: size, exempt: true}
 	return m.capture
 }
@@ -119,6 +138,8 @@ func (m *Mutation) End() {
 		p.mutating--
 		if p.mutating == 0 && p.writers == 0 {
 			p.poisoned = false
+			// The key is quiet again, so a later write starts uncontested.
+			p.contested = false
 		}
 		m.c.forgetLocked(key, p)
 	}

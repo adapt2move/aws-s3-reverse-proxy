@@ -321,3 +321,37 @@ func TestBlobPayloadChecksumIsVerifiable(t *testing.T) {
 	assert.Equal(t, want, got)
 	c.retire()
 }
+
+// A segment sealed before it filled up is the ordinary case, not an edge one:
+// it is what closing the store does to the segment being appended to. If its
+// index is not where a reader looks for it, every clean restart pays to read
+// that segment back — silently, because replaying it gives the same answer.
+func TestASegmentSealedBelowItsFullSizeKeepsItsIndex(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir, func(o *Options) {
+		o.SegmentSize = 64 << 10
+		o.InlineMaxSize = 8 << 10
+		o.MaxBytes = 16 << 20
+	})
+	// Nowhere near enough to fill a segment.
+	for i := 0; i < 8; i++ {
+		put(t, s, fmt.Sprintf("key-%02d", i), []byte("m"), payload(512, byte(i)))
+	}
+	require.NoError(t, s.Close())
+
+	segments, err := filepath.Glob(filepath.Join(dir, "seg-*.log"))
+	require.NoError(t, err)
+	require.Len(t, segments, 1)
+
+	info, err := os.Stat(segments[0])
+	require.NoError(t, err)
+	assert.Less(t, info.Size(), int64(64<<10),
+		"a segment holding 4 KiB of records should not still be its preallocated size")
+
+	f, err := os.Open(segments[0])
+	require.NoError(t, err)
+	defer f.Close()
+	entries, _, ok := readFooter(f, info.Size())
+	require.True(t, ok, "the index has to be where a reader looks for it: at the end of the file")
+	assert.Len(t, entries, 8)
+}

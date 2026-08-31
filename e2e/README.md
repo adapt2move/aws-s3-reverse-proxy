@@ -85,6 +85,7 @@ declines still streams rather than being buffered on its way past.
 | `TestCacheRevalidatesAnExpiredEntry` | expiry checks rather than re-transfers |
 | `TestAnExternalWriteIsPickedUpAfterTheMaximumAge` | a write behind the proxy's back is served stale, and only until then |
 | `TestPurgeMakesTheCacheForgetEverything` | the escape hatch for that write |
+| `TestPurgeNeedsItsToken` | and that the escape hatch is not open to whatever can scrape metrics |
 | `TestARangedReadIsAnsweredFromTheCache` | a 206 out of a cached object, byte for byte |
 | `TestARangedMissFillsTheCacheInTheBackground` | a client that only reads ranges still fills the cache |
 | `TestAnObjectTooLargeForTheCacheIsStillServed` | the cache declining an object changes nothing else |
@@ -124,6 +125,7 @@ Every variable the suite reads:
 | `E2E_LARGE_OBJECT_SIZE` | enables the streaming test |
 | `E2E_CACHE_MAX_AGE` | marks a caching deployment and enables every cache test; must match its `--cache-max-age` |
 | `E2E_CACHE_MAX_OBJECT_SIZE` | its `--cache-max-object-size`, so a test can pick a size on either side of it |
+| `E2E_CACHE_PURGE_TOKEN` | the deployment's `CACHE_PURGE_TOKEN`; empty means it accepts an unauthenticated purge |
 | `E2E_CACHE_RESTART_CMD` | restarts the proxy with its cache intact; without it the restart test skips |
 
 The suite is behind the `e2e` build tag, so `go test ./...` never picks it up.

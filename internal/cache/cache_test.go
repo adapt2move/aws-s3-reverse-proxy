@@ -555,3 +555,81 @@ func TestMutationsOnTheSameKeyNest(t *testing.T) {
 	defer c.mu.Unlock()
 	assert.Empty(t, c.pending, "a finished write leaves nothing behind")
 }
+
+// Two uploads of one key overlapping is the case the exemption cannot cover.
+// Both bodies are the write everything else is kept away from, so both would
+// commit, and the one left behind would be whichever finished writing here
+// last — which says nothing about which one the object store kept.
+func TestTwoOverlappingUploadsCacheNeither(t *testing.T) {
+	c, _ := newCache(t)
+	store(t, c, "k", objectHeader(), []byte("original"))
+
+	first := c.BeginMutation("k")
+	firstBody := first.Capture(5)
+	require.NotNil(t, firstBody, "the first upload of a quiet key may capture its body")
+
+	// A second upload of the same key starts while the first is in flight.
+	second := c.BeginMutation("k")
+	assert.Nil(t, second.Capture(5), "the second may not: nobody here can say which one wins")
+
+	// The first one's object store call succeeds, so it tries to store what
+	// it captured. It must not: the second upload may still land after it.
+	_, err := firstBody.Write([]byte("alpha"))
+	require.NoError(t, err)
+	first.Store(objectHeader())
+	first.End()
+
+	second.Store(objectHeader())
+	second.End()
+
+	_, result := c.Get("k")
+	assert.Equal(t, Miss, result,
+		"neither body may be cached; the next read has to ask the object store")
+	assert.False(t, c.Has("k"))
+
+	// And once the key is quiet again, an ordinary upload caches normally.
+	third := c.BeginMutation("k")
+	body := third.Capture(5)
+	require.NotNil(t, body, "a later, uncontested upload is not punished for the earlier clash")
+	_, err = body.Write([]byte("gamma"))
+	require.NoError(t, err)
+	third.Store(objectHeader())
+	third.End()
+
+	entry, result := c.Get("k")
+	require.Equal(t, Hit, result)
+	defer entry.Close()
+	got, err := io.ReadAll(entry.Body())
+	require.NoError(t, err)
+	assert.Equal(t, "gamma", string(got))
+}
+
+// The same clash the other way round: the rival starts after this upload has
+// already captured its body, so declining at Capture cannot catch it. The
+// rival then finishes first, which means its own End is not there to clean up
+// afterwards either — only the check at commit stands between the cache and a
+// body the object store may well have discarded.
+func TestAnUploadThatGetsARivalMidwayIsNotCached(t *testing.T) {
+	c, _ := newCache(t)
+
+	first := c.BeginMutation("k")
+	body := first.Capture(5)
+	require.NotNil(t, body)
+	_, err := body.Write([]byte("alpha"))
+	require.NoError(t, err)
+
+	// A second upload of the same key begins and finishes while the first
+	// is still in flight.
+	second := c.BeginMutation("k")
+	second.Store(objectHeader())
+	second.End()
+
+	// Now the first one comes back. Its body was current when it started
+	// and need not be any more.
+	first.Store(objectHeader())
+	first.End()
+
+	_, result := c.Get("k")
+	assert.Equal(t, Miss, result,
+		"a body whose upload overlapped another must not be what the cache holds")
+}

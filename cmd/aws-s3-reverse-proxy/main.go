@@ -225,7 +225,7 @@ func listeners(opts config.Options, handler http.Handler, objectCache *cache.Cac
 		observability.RegisterHealth(adminMux(addr), ready)
 		log.Infof("Serving /healthz and /readyz on %s", addr)
 		if objectCache != nil {
-			adminMux(addr).Handle("/cache/purge", cache.PurgeHandler(objectCache))
+			adminMux(addr).Handle("/cache/purge", cache.PurgeHandler(objectCache, opts.CachePurgeToken))
 			log.Infof("Serving POST %s/cache/purge to empty the object cache", addr)
 		}
 	}
@@ -298,6 +298,11 @@ func logCacheStartup(opts config.Options) {
 	}
 	if opts.CacheRangeFills {
 		log.Infof("A ranged read that misses fetches the whole object in the background.")
+	}
+	if opts.CachePurgeToken == "" {
+		log.Warnf("POST /cache/purge is unauthenticated (CACHE_PURGE_TOKEN is unset): anything that " +
+			"can reach the admin listener can empty the cache, and repeatedly doing so forces full " +
+			"re-fetches from the object store.")
 	}
 }
 

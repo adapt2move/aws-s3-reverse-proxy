@@ -154,6 +154,7 @@ run_variant() {
   export E2E_TENANT_A=a1b2c3d4e5f60718293a4b5c6d7e8f90
   export E2E_TENANT_B=0f9e8d7c6b5a49382716f5e4d3c2b1a0
   export E2E_CACHE_MAX_AGE=3s
+  export E2E_CACHE_PURGE_TOKEN=an-e2e-purge-token
   export E2E_CACHE_MAX_OBJECT_SIZE=8388608
   # An object well past what the cache accepts, through a container with less
   # memory than it: the cache declining an object must not make the proxy
