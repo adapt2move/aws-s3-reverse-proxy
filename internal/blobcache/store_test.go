@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -362,4 +365,77 @@ func TestPurgeEmptiesTheStore(t *testing.T) {
 	mustMiss(t, s, "small")
 	_, data = mustGet(t, s, "after")
 	assert.Equal(t, payload(64, 3), data)
+}
+
+func TestServeContentServesRangesFromTheStore(t *testing.T) {
+	s := open(t, t.TempDir())
+	defer s.Close()
+
+	// A workload of many ranged reads over the same object — DuckDB's httpfs
+	// reading a Parquet footer and then row groups is the case in mind — only
+	// benefits from a cache if a range can be answered out of it. The Reader
+	// is a ReadSeeker precisely so http.ServeContent can do that, conditional
+	// requests and 416s included, without this package knowing what HTTP is.
+	want := payload(8192, 11)
+	put(t, s, "object.parquet", []byte(`{"etag":"\"abc123\""}`), want)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reader, err := s.Get("object.parquet")
+		if err != nil {
+			http.Error(w, "miss", http.StatusNotFound)
+			return
+		}
+		defer reader.Close()
+		w.Header().Set("ETag", `"abc123"`)
+		http.ServeContent(w, r, "object.parquet", time.Time{}, reader)
+	})
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	get := func(t *testing.T, rangeHeader string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+		require.NoError(t, err)
+		if rangeHeader != "" {
+			req.Header.Set("Range", rangeHeader)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		return resp
+	}
+
+	t.Run("a range in the middle", func(t *testing.T) {
+		resp := get(t, "bytes=1000-1099")
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusPartialContent, resp.StatusCode)
+		assert.Equal(t, "bytes 1000-1099/8192", resp.Header.Get("Content-Range"))
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, want[1000:1100], body)
+	})
+
+	t.Run("a suffix range, which is how a footer is read", func(t *testing.T) {
+		resp := get(t, "bytes=-64")
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusPartialContent, resp.StatusCode)
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, want[len(want)-64:], body)
+	})
+
+	t.Run("no range at all", func(t *testing.T) {
+		resp := get(t, "")
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "8192", resp.Header.Get("Content-Length"))
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, want, body)
+	})
+
+	t.Run("a range past the end", func(t *testing.T) {
+		resp := get(t, "bytes=99999-")
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusRequestedRangeNotSatisfiable, resp.StatusCode)
+	})
 }
