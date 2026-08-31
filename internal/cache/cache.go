@@ -67,9 +67,16 @@ const (
 	Hit Result = "hit"
 	// Miss means there is no entry for this key.
 	Miss Result = "miss"
-	// Stale means an entry exists but has outlived MaxAge. It is treated as
-	// a miss and replaced by whatever the upstream returns.
+	// Stale means an entry exists but has outlived MaxAge. The entry is
+	// still returned, because there is something useful to do with it: ask
+	// the upstream whether it is still current, which costs a round trip
+	// rather than a transfer.
 	Stale Result = "stale"
+	// Revalidated means a stale entry was checked against the upstream and
+	// found unchanged. It is reported separately from a hit because the two
+	// cost different things, and a deployment tuning MaxAge wants to see
+	// which one it is getting.
+	Revalidated Result = "revalidated"
 	// Bypass means the cache declined to answer: an upload for this key is
 	// in flight, so neither what is cached nor what the upstream would
 	// return right now is settled.
@@ -89,6 +96,11 @@ type Cache struct {
 	// fill in flight — never the cache's contents.
 	mu      sync.Mutex
 	pending map[string]*pending
+
+	// revalMu guards revalidated: when each key was last confirmed current
+	// against the upstream. See Refresh.
+	revalMu     sync.Mutex
+	revalidated map[string]revalidation
 
 	stored        atomic.Uint64
 	dropped       atomic.Uint64
@@ -136,12 +148,13 @@ func New(opts Options) (*Cache, error) {
 		logf = func(string, ...any) {}
 	}
 	return &Cache{
-		store:   store,
-		maxAge:  opts.MaxAge,
-		maxObj:  store.MaxObjectSize(),
-		now:     opts.Now,
-		logf:    logf,
-		pending: make(map[string]*pending),
+		store:       store,
+		maxAge:      opts.MaxAge,
+		maxObj:      store.MaxObjectSize(),
+		now:         opts.Now,
+		logf:        logf,
+		pending:     make(map[string]*pending),
+		revalidated: make(map[string]revalidation),
 	}, nil
 }
 
@@ -162,6 +175,10 @@ type Entry struct {
 	// sent them.
 	Header http.Header
 
+	// key and storedAt identify which version of the object this is, so
+	// that a revalidation can be tied to the entry it actually checked.
+	key string
+
 	// Size is the payload length in bytes.
 	Size int64
 
@@ -171,6 +188,17 @@ type Entry struct {
 	Age      time.Duration
 
 	body *blobcache.Reader
+}
+
+// revalidation is one entry having been confirmed current: when that was, and
+// which version of the object it was about.
+//
+// The version matters. A revalidation that starts before a write and finishes
+// after it confirmed the version the write replaced, and without pinning it to
+// a version it would make the new entry look fresher than it is.
+type revalidation struct {
+	storedAt int64
+	at       int64
 }
 
 // Body is the payload.
@@ -185,9 +213,12 @@ func (e *Entry) Close() error { return e.body.Close() }
 
 // Get looks up a cached response.
 //
-// The entry is non-nil only for Hit. A Stale entry is not returned at all:
-// without conditional revalidation there is nothing useful to do with one,
-// and handing it back would invite a caller to serve it.
+// The entry is returned for both Hit and Stale. A stale one is not useless:
+// its ETag is what lets the caller ask the upstream whether the object has
+// changed, which costs a round trip instead of a transfer. Only Miss and
+// Bypass come back without one.
+//
+// Close the entry.
 func (c *Cache) Get(key string) (*Entry, Result) {
 	if c.busy(key) {
 		return nil, Bypass
@@ -207,19 +238,97 @@ func (c *Cache) Get(key string) (*Entry, Result) {
 		return nil, Miss
 	}
 
-	storedAt := time.Unix(0, meta.StoredAt)
-	age := c.now().Sub(storedAt)
-	if c.maxAge > 0 && age > c.maxAge {
-		_ = reader.Close()
-		return nil, Stale
+	// Freshness runs from whenever the object was last known to be current,
+	// which is the later of when it was fetched and when it was last
+	// confirmed unchanged.
+	knownCurrent := meta.StoredAt
+	if at := c.revalidatedAt(key, meta.StoredAt); at > knownCurrent {
+		knownCurrent = at
 	}
-	return &Entry{
+	entry := &Entry{
 		Header:   meta.Header,
+		key:      key,
 		Size:     meta.Size,
-		StoredAt: storedAt,
-		Age:      age,
+		StoredAt: time.Unix(0, meta.StoredAt),
+		Age:      c.now().Sub(time.Unix(0, knownCurrent)),
 		body:     reader,
-	}, Hit
+	}
+	if c.maxAge > 0 && entry.Age > c.maxAge {
+		return entry, Stale
+	}
+	return entry, Hit
+}
+
+// Refresh records that this entry was checked against the upstream just now
+// and found unchanged, so it is current again without having been fetched
+// again.
+//
+// It takes the entry rather than a key so that the record is tied to the
+// version it was about: a revalidation of the object a write is in the middle
+// of replacing must not make the replacement look fresher than it is, and
+// there is no ordering between the two that the caller could arrange instead.
+//
+// It is kept in memory rather than written back into the entry, because the
+// payload and its metadata are one record on disk and restamping it would
+// mean rewriting the object. Losing these timestamps on restart costs one
+// revalidation per object, which is what a restart costs anyway.
+func (c *Cache) Refresh(entry *Entry) {
+	if c.maxAge <= 0 || entry == nil || entry.key == "" {
+		return
+	}
+	now := c.now().UnixNano()
+	c.revalMu.Lock()
+	defer c.revalMu.Unlock()
+	if len(c.revalidated) >= maxRevalidationRecords {
+		c.pruneRevalidatedLocked(now)
+	}
+	c.revalidated[entry.key] = revalidation{storedAt: entry.StoredAt.UnixNano(), at: now}
+}
+
+// maxRevalidationRecords bounds the table above. It holds one small entry per
+// object that has outlived MaxAge and been confirmed current since, which is
+// far fewer than the cache holds — but it is memory the store does not
+// account for, so it gets a ceiling.
+const maxRevalidationRecords = 1 << 16
+
+func (c *Cache) pruneRevalidatedLocked(now int64) {
+	cutoff := now - int64(c.maxAge)
+	for key, record := range c.revalidated {
+		if record.at < cutoff {
+			delete(c.revalidated, key)
+		}
+	}
+	if len(c.revalidated) >= maxRevalidationRecords {
+		// All of it is recent, so there is nothing stale to drop. Throwing
+		// the table away costs revalidations and never correctness.
+		clear(c.revalidated)
+	}
+}
+
+// revalidatedAt reports when this exact version of the object was last
+// confirmed current, and zero when the record on file is about another one.
+func (c *Cache) revalidatedAt(key string, storedAt int64) int64 {
+	if c.maxAge <= 0 {
+		return 0
+	}
+	c.revalMu.Lock()
+	defer c.revalMu.Unlock()
+	record, ok := c.revalidated[key]
+	if !ok || record.storedAt != storedAt {
+		return 0
+	}
+	return record.at
+}
+
+func (c *Cache) forgetRevalidation(keys ...string) {
+	if c.maxAge <= 0 {
+		return
+	}
+	c.revalMu.Lock()
+	defer c.revalMu.Unlock()
+	for _, key := range keys {
+		delete(c.revalidated, key)
+	}
 }
 
 // Has reports whether a fresh entry exists, without opening it.
@@ -287,6 +396,7 @@ func (c *Cache) Invalidate(keys ...string) {
 	for _, key := range keys {
 		_ = c.store.Delete(key)
 	}
+	c.forgetRevalidation(keys...)
 	c.invalidations.Add(uint64(len(keys)))
 }
 
@@ -299,6 +409,9 @@ func (c *Cache) Purge() error {
 		p.poisoned = true
 	}
 	c.mu.Unlock()
+	c.revalMu.Lock()
+	clear(c.revalidated)
+	c.revalMu.Unlock()
 	return c.store.Purge()
 }
 

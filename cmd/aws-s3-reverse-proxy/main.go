@@ -273,10 +273,11 @@ func logStartup(opts config.Options, handler *proxy.Handler, store *policy.Store
 // logCacheStartup states what the cache will and will not do, in the terms an
 // operator would have to reason about otherwise.
 //
-// The expiry line is the one that matters. With no maximum age the cache is
-// only ever wrong if something outside this proxy changes an object, which is
-// a statement about the deployment rather than about the software — so it is
-// said out loud at startup instead of being left in the flag help.
+// The expiry line is the one that matters. Turning expiry off makes the cache
+// correct only for as long as nothing outside this proxy writes to the
+// bucket, which is a statement about the deployment rather than about the
+// software — so it is said out loud at startup rather than left in the flag
+// help for somebody to find afterwards.
 func logCacheStartup(opts config.Options) {
 	if !opts.CacheEnabled() {
 		log.Infof("Object cache disabled; every read goes to the object store.")
@@ -285,10 +286,12 @@ func logCacheStartup(opts config.Options) {
 	log.Infof("Caching object reads in %s: up to %d bytes, objects up to %d bytes.",
 		opts.CacheDir, opts.CacheMaxBytes, opts.CacheMaxObjectSize)
 	if opts.CacheMaxAge > 0 {
-		log.Infof("Cached objects are re-fetched after %s.", opts.CacheMaxAge)
+		log.Infof("After %s a cached object is checked against the object store, and only re-fetched if it changed.",
+			opts.CacheMaxAge)
 	} else {
-		log.Infof("Cached objects never expire: only writes through this proxy invalidate them. " +
-			"If anything else writes to the bucket, set --cache-max-age or purge the cache when it does.")
+		log.Warnf("Cached objects never expire (--cache-max-age=0): only writes through this proxy invalidate them. " +
+			"If anything else writes to the bucket, an object can be served stale indefinitely — " +
+			"set --cache-max-age, or POST /cache/purge when it happens.")
 	}
 	if opts.CacheWrites {
 		log.Infof("Uploads are cached as they are accepted.")

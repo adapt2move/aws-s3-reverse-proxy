@@ -26,7 +26,9 @@ the security boundary — not a convenience layer in front of one.
 3. Inject the tenant key prefix into the object key and into listing parameters.
 4. Authorize the HTTP method + key against the policy for that level.
 5. Answer object reads from the local cache if one is configured and holds
-   the object — after step 4, never before it.
+   the object — after step 4, never before it. An entry past
+   `--cache-max-age` is checked against the object store first, and re-served
+   if it has not changed.
 6. Otherwise re-sign with the upstream credentials and forward, streaming.
 7. Strip the prefix back out of `ListObjectsV2` and `DeleteObjects` responses.
 
@@ -247,7 +249,7 @@ practice.
 | `--cache-dir` (`CACHE_DIR`) | *off* | directory to cache object reads in; empty disables caching entirely |
 | `--cache-max-bytes` (`CACHE_MAX_BYTES`) | 1 GiB | how much disk the cache may use |
 | `--cache-max-object-size` (`CACHE_MAX_OBJECT_SIZE`) | 64 MiB | largest object accepted; bigger ones are proxied without being stored |
-| `--cache-max-age` (`CACHE_MAX_AGE`) | `0s` | how long an object may be served before it is fetched again; `0` means never |
+| `--cache-max-age` (`CACHE_MAX_AGE`) | `10m` | how long an object is served before it is checked against the object store; `0s` disables expiry entirely |
 | `--cache-writes` (`CACHE_WRITES`) | `true` | also cache the body of an accepted upload |
 | `--cache-range-fills` (`CACHE_RANGE_FILLS`) | `true` | fetch the whole object in the background when a ranged read misses |
 | `--cache-max-entries` (`CACHE_MAX_ENTRIES`) | `0` | object count limit; `0` for none. Budget ~100 bytes of memory each |
@@ -371,7 +373,7 @@ to the bucket.
 | | |
 | --- | --- |
 | `GetObject`, `HeadObject` | served from the cache, and stored on the way past. A `HEAD` is answered out of a cached `GET`. |
-| Ranged reads | answered from a cached object, Range arithmetic and all. A ranged **miss** is proxied straight through and the whole object is fetched in the background — see below. |
+| Ranged reads | answered from a cached object, Range arithmetic and all — including after a revalidation. A ranged **miss** is proxied straight through and the whole object is fetched in the background, see below. |
 | `PutObject` | invalidates the object, and with `--cache-writes` the uploaded body is kept, so writing an object leaves it cached. |
 | `DeleteObject`, `DeleteObjects`, `CompleteMultipartUpload` | invalidate every key they touch. |
 | `ListObjectsV2` | **never cached.** A listing's body is filtered per access level on the way out, so a cached one would be an answer to one caller rather than a copy of anything. |
@@ -439,26 +441,64 @@ Every write **through this proxy** invalidates what it touched, so the only
 way an entry can go stale is a write that did not go through it: another
 client, a lifecycle rule, replication, the console.
 
-The default `--cache-max-age=0` means entries never expire, which is correct
-exactly when this proxy is the only writer — and that assumption is stated out
-loud in the startup log rather than left in the flag help. If anything else
-writes to the bucket, either set `--cache-max-age` to bound how long a stale
-object can be served, or empty the cache when it happens:
+`--cache-max-age` bounds how long that can last. After it, the next read does
+not throw the entry away — it asks the object store whether the object has
+changed, with a `HEAD`, and compares the ETag:
+
+  * **unchanged** — the object is served from disk and the entry is current
+    again. One round trip, no body over the network. Reported as
+    `X-Cache: REVALIDATED`.
+  * **changed, or nothing to compare** — the object is fetched normally and
+    replaces the entry. `X-Cache: STALE`.
+
+A `HEAD` rather than a conditional `GET`, deliberately. Both cost one round
+trip when the object is unchanged, which is the case worth optimising — but a
+conditional `GET` that comes back `200` carries the whole object, and the
+request that issued it is in no position to stream that anywhere. Discarding
+the body would spend exactly the egress the revalidation was there to save.
+Anything the check cannot answer for certain — no ETag on either side, an
+error, an unexpected status — falls through to an ordinary fetch: being wrong
+in that direction costs a transfer, being wrong in the other serves a stale
+object.
+
+Revalidation is not a separate switch. It is what expiry does, so
+`--cache-max-age` is the only knob: shorter means the object store is asked
+about a given object more often, and never means a full re-transfer unless
+something actually changed.
+
+A revalidation records *which version* of the object it confirmed, not just
+that it confirmed one. Otherwise a check that started before an upload and
+finished after it — having asked about the version the upload replaced — would
+make the replacement look fresher than it is.
+
+`--cache-max-age=0s` turns expiry off altogether. That is correct exactly when
+this proxy is the only writer, and the startup log **warns** about it rather
+than leaving it in the flag help:
+
+```
+level=warning msg="Cached objects never expire (--cache-max-age=0): only writes
+through this proxy invalidate them. If anything else writes to the bucket, an
+object can be served stale indefinitely — set --cache-max-age, or POST
+/cache/purge when it happens."
+```
+
+That purge endpoint is the escape hatch for a write that happened outside the
+proxy and cannot wait for expiry:
 
 ```
 curl -X POST http://<health-listen-addr>/cache/purge
 ```
 
-That endpoint lives on the admin listener and nowhere else. On the S3 port,
+It lives on the admin listener and nowhere else. On the S3 port,
 `/cache/purge` is indistinguishable from a request for an object called that,
 and a bucket named `cache` would put it within reach of any tenant.
 
 One caveat is worth stating for the workload above. A Parquet reader mixing a
 cached footer with a freshly fetched row group does not get old data, it gets
-garbage — the offsets no longer describe the file. Whole objects are cached
-and invalidated atomically, so this cannot happen within the proxy; it is a
-reason to take an external writer seriously rather than to bound staleness
-loosely.
+garbage — the offsets no longer describe the file. Whole objects are cached,
+revalidated and invalidated atomically, so this cannot happen within the
+proxy; it is a reason to take an external writer seriously rather than to set
+`--cache-max-age` loosely.
 
 Running more than one replica means one cache per replica: the hit rate
 divides by the replica count and each cache is independently stale. Route by
@@ -525,8 +565,8 @@ level=warning msg="request denied" tenant=1f0c… access_level=ro operation=PutO
 
 (The identity's level is logged as `access_level`, because logrus already
 uses `level` for the severity of the line itself.) With a cache configured,
-every line also carries `cache=hit|miss|stale|bypass`, which is what turns
-"the hit rate dropped" into a list of the requests that missed.
+every line also carries `cache=hit|revalidated|stale|miss|bypass`, which is
+what turns "the hit rate dropped" into a list of the requests that missed.
 
 No credentials, signatures or `Authorization` header content appear in logs or
 in metric labels, at any verbosity. The tenant id is available as a metric
@@ -539,7 +579,7 @@ an unbounded label is an unbounded number of time series.
 | `s3proxy_batch_delete_denied_keys_total{tenant,level}` | keys refused inside a batch |
 | `s3proxy_proxied_request_duration_seconds{operation,decision}` | end-to-end latency |
 | `s3proxy_policy_reloads_total{outcome}` | reloads applied / rejected / unchanged |
-| `s3proxy_cache_lookups_total{operation,result}` | cache lookups: hit, miss, stale, bypass |
+| `s3proxy_cache_lookups_total{operation,result}` | cache lookups: hit, revalidated, stale, miss, bypass |
 | `s3proxy_cache_entries`, `s3proxy_cache_bytes`, `s3proxy_cache_capacity_bytes` | what the cache holds |
 | `s3proxy_cache_stores_total`, `s3proxy_cache_store_failures_total` | responses written, and the ones that could not be |
 | `s3proxy_cache_invalidations_total` | keys dropped because the object behind them was written |
@@ -547,9 +587,11 @@ an unbounded label is an unbounded number of time series.
 
 The cache series appear only when a cache is configured: a deployment without
 one exports nothing rather than a set of zeros that read like an idle cache.
-Every served request also carries an `X-Cache` header — `HIT`, `MISS`,
-`STALE`, `BYPASS` — so a hit rate is answerable from one request and not only
-from a dashboard.
+Every served request also carries an `X-Cache` header — `HIT`, `REVALIDATED`,
+`STALE`, `MISS`, `BYPASS` — so a hit rate is answerable from one request and
+not only from a dashboard. `REVALIDATED` against `STALE` is the pair worth
+watching when tuning `--cache-max-age`: the first cost a round trip, the
+second cost a transfer.
 
 ## Out of scope
 
@@ -557,10 +599,6 @@ from a dashboard.
   * Presigned-URL support; clients that need it should address the object store
     directly.
   * Bucket-level administration through the proxy.
-  * Conditional revalidation of a stale cache entry. A stale entry is fetched
-    again rather than checked with an `If-None-Match`, so expiry costs a
-    transfer and not just a round trip. Worth adding if egress rather than
-    latency turns out to be the constraint.
   * Caching listings. It would have to be an index the proxy answers
     `ListObjectsV2` from, not a stored response, because a listing is filtered
     per access level on the way out.

@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -119,8 +120,123 @@ func TestEntryGoesStale(t *testing.T) {
 
 	tick.advance(2 * time.Minute)
 	entry, result = c.Get("k")
+	require.Equal(t, Stale, result)
+	require.NotNil(t, entry, "a stale entry is handed back: its ETag is what a revalidation compares against")
+	assert.Equal(t, `"d41d8cd98f00b204e9800998ecf8427e"`, entry.ETag())
+	assert.Equal(t, 6*time.Minute, entry.Age)
+	require.NoError(t, entry.Close())
+}
+
+func TestRefreshMakesAStaleEntryUsableAgain(t *testing.T) {
+	c, tick := newCache(t, func(o *Options) { o.MaxAge = 5 * time.Minute })
+	store(t, c, "k", objectHeader(), []byte("v"))
+
+	tick.advance(6 * time.Minute)
+	entry, result := c.Get("k")
+	require.Equal(t, Stale, result)
+	defer entry.Close()
+
+	// The object turned out to be unchanged, so the entry is current again
+	// without having been fetched again.
+	c.Refresh(entry)
+	entry, result = c.Get("k")
+	require.Equal(t, Hit, result)
+	assert.Equal(t, time.Duration(0), entry.Age)
+	assert.Equal(t, tick.Now().Add(-6*time.Minute).UnixNano(), entry.StoredAt.UnixNano(),
+		"when it was fetched does not change; only when it was last known current does")
+	require.NoError(t, entry.Close())
+
+	// And the clock keeps running from the refresh.
+	tick.advance(6 * time.Minute)
+	_, result = c.Get("k")
 	assert.Equal(t, Stale, result)
-	assert.Nil(t, entry, "a stale entry is not handed back, because there is nothing safe to do with one")
+}
+
+func TestAWriteForgetsAnEarlierRevalidation(t *testing.T) {
+	c, tick := newCache(t, func(o *Options) { o.MaxAge = 5 * time.Minute })
+	store(t, c, "k", objectHeader(), []byte("old"))
+	tick.advance(6 * time.Minute)
+	stale, result := c.Get("k")
+	require.Equal(t, Stale, result)
+	c.Refresh(stale)
+	require.NoError(t, stale.Close())
+
+	// The object is replaced. Nothing about the previous version being
+	// current a moment ago may carry into the new entry's freshness.
+	m := c.BeginMutation("k")
+	w := m.Capture(3)
+	require.NotNil(t, w)
+	_, err := w.Write([]byte("new"))
+	require.NoError(t, err)
+	m.Store(objectHeader())
+	m.End()
+
+	entry, result := c.Get("k")
+	require.Equal(t, Hit, result)
+	assert.Equal(t, time.Duration(0), entry.Age)
+	require.NoError(t, entry.Close())
+
+	tick.advance(6 * time.Minute)
+	_, result = c.Get("k")
+	assert.Equal(t, Stale, result, "freshness runs from the new write, not from the old refresh")
+}
+
+// The ordering a caller cannot arrange around: a revalidation that started
+// before a write and lands after it. What it confirmed was the version the
+// write replaced, so it has to count for nothing.
+func TestARevalidationLandingAfterAWriteIsIgnored(t *testing.T) {
+	c, tick := newCache(t, func(o *Options) { o.MaxAge = 5 * time.Minute })
+	store(t, c, "k", objectHeader(), []byte("old"))
+
+	tick.advance(6 * time.Minute)
+	inFlight, result := c.Get("k")
+	require.Equal(t, Stale, result)
+	defer inFlight.Close()
+
+	// The write happens while that revalidation is still out.
+	m := c.BeginMutation("k")
+	w := m.Capture(3)
+	require.NotNil(t, w)
+	_, err := w.Write([]byte("new"))
+	require.NoError(t, err)
+	m.Store(objectHeader())
+	m.End()
+
+	// And only now does the straggler come back saying "unchanged" — about
+	// an object that no longer exists under this key.
+	tick.advance(30 * time.Second)
+	c.Refresh(inFlight)
+
+	// Freshness has to run from the write. Four and a half more minutes puts
+	// it at 5m00s since the write, and 4m30s since the straggler: if the
+	// straggler counted, this would still be a hit.
+	tick.advance(4*time.Minute + 31*time.Second)
+	_, result = c.Get("k")
+	assert.Equal(t, Stale, result, "a revalidation of the replaced version must not refresh the replacement")
+}
+
+func TestRefreshIsBoundedInMemory(t *testing.T) {
+	c, _ := newCache(t, func(o *Options) { o.MaxAge = time.Minute })
+	for i := 0; i < maxRevalidationRecords+2000; i++ {
+		c.Refresh(&Entry{key: fmt.Sprintf("key-%06d", i)})
+	}
+	c.revalMu.Lock()
+	defer c.revalMu.Unlock()
+	assert.LessOrEqual(t, len(c.revalidated), maxRevalidationRecords,
+		"the table is memory the store does not account for, so it has a ceiling")
+}
+
+func TestWithoutExpiryNothingIsRecorded(t *testing.T) {
+	c, _ := newCache(t) // MaxAge unset
+	store(t, c, "k", objectHeader(), []byte("v"))
+	entry, result := c.Get("k")
+	require.Equal(t, Hit, result)
+	c.Refresh(entry)
+	require.NoError(t, entry.Close())
+
+	c.revalMu.Lock()
+	defer c.revalMu.Unlock()
+	assert.Empty(t, c.revalidated, "with no expiry there is nothing for a revalidation to reset")
 }
 
 func TestNoMaxAgeMeansNeverStale(t *testing.T) {

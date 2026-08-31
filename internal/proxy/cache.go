@@ -45,6 +45,12 @@ const (
 	// work nobody asked for, so they must never crowd out the requests that
 	// somebody did.
 	maxConcurrentFills = 4
+
+	// cacheRevalidateTimeout bounds the check that a stale entry is still
+	// current. Unlike a fill, this one is on somebody's critical path, so it
+	// is a ceiling rather than a target: past it the request falls through
+	// and fetches the object the ordinary way.
+	cacheRevalidateTimeout = 10 * time.Second
 )
 
 // cacheKeyFor names the upstream object a request addresses.
@@ -117,7 +123,7 @@ func (h *Handler) beginCaching(st *requestState) {
 
 // serveCachedRead answers the request from disk when it can, and reports
 // whether it did.
-func (h *Handler) serveCachedRead(w http.ResponseWriter, r *http.Request, st *requestState) bool {
+func (h *Handler) serveCachedRead(w http.ResponseWriter, r *http.Request, proxyReq *http.Request, st *requestState) bool {
 	if h.cfg.Cache == nil || st.cacheKey == "" || !readsAnObject(st.operation.Kind) {
 		return false
 	}
@@ -127,22 +133,81 @@ func (h *Handler) serveCachedRead(w http.ResponseWriter, r *http.Request, st *re
 	}
 	entry, result := h.cfg.Cache.Get(st.cacheKey)
 	st.cacheResult = string(result)
-	if result != cache.Hit {
+	if entry == nil {
 		return false
 	}
 	defer entry.Close()
 
+	if result == cache.Stale {
+		// Ask whether the object has actually changed. When it has not —
+		// which is the common case, since a write through this proxy
+		// invalidates rather than expires — this costs a round trip instead
+		// of transferring the whole object again.
+		if !h.stillCurrent(r, proxyReq, entry) {
+			return false
+		}
+		h.cfg.Cache.Refresh(entry)
+		st.cacheResult = string(cache.Revalidated)
+	}
+	h.replayCachedResponse(w, r, entry, st.cacheResult)
+	return true
+}
+
+// replayCachedResponse writes a stored response back out.
+func (h *Handler) replayCachedResponse(w http.ResponseWriter, r *http.Request, entry *cache.Entry, result string) {
 	header := w.Header()
 	for name, values := range entry.Header {
 		header[name] = values
 	}
-	header.Set("X-Cache", "HIT")
+	header.Set("X-Cache", strings.ToUpper(result))
 	// http.ServeContent does the rest: Content-Length, the Range arithmetic
 	// and its 206, `If-None-Match` against the ETag above, `If-Range`, and
 	// the 416 for a range past the end. A HEAD gets the headers and no body,
 	// because net/http already knows not to write one.
 	http.ServeContent(w, r, "", cachedModTime(entry), entry.Body())
-	return true
+}
+
+// stillCurrent asks the object store whether a stale entry still describes
+// the object, with a HEAD.
+//
+// A HEAD rather than a conditional GET, deliberately. Both cost one round
+// trip when the object is unchanged, which is the case worth optimising —
+// but a conditional GET that comes back 200 has the whole object in it, and
+// this request is not in a position to stream it anywhere. Discarding that
+// body would spend exactly the egress the revalidation was meant to save. A
+// HEAD never carries one, and when the object has changed the request simply
+// falls through and fetches it the ordinary way.
+//
+// Anything unexpected — no ETag on either side, an error, a status that is
+// not 200 — reports false, and the caller re-fetches. Being wrong in that
+// direction costs a transfer; being wrong in the other serves a stale object.
+func (h *Handler) stillCurrent(r *http.Request, proxyReq *http.Request, entry *cache.Entry) bool {
+	cached := entry.ETag()
+	if cached == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), cacheRevalidateTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, proxyReq.URL.String(), nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("X-Amz-Content-Sha256", sigv4.EmptyPayloadSHA256)
+	if err := h.cfg.UpstreamSigner.Sign(req, h.cfg.UpstreamRegion, time.Now()); err != nil {
+		return false
+	}
+	resp, err := h.transport.RoundTrip(req)
+	if err != nil {
+		return false
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	return resp.Header.Get("Etag") == cached
 }
 
 // cachedModTime is the object's Last-Modified, or the zero time if the

@@ -369,13 +369,16 @@ func TestAnObjectTooLargeForTheCacheIsStillServed(t *testing.T) {
 	assert.False(t, objectCache.Has("bucket/"+tenantA+"/datasets/big.bin"))
 }
 
-func TestEntriesExpire(t *testing.T) {
-	dir := t.TempDir()
-	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+// expiringProxy is a caching deployment with a hand-wound clock, so a test
+// about expiry does not have to wait for it.
+func expiringProxy(t *testing.T, maxAge time.Duration) (*Handler, *fakeUpstream, *cache.Cache, func(time.Duration)) {
+	t.Helper()
 	var mu sync.Mutex
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 	objectCache, err := cache.New(cache.Options{
-		Dir: dir, MaxBytes: 8 << 20, SegmentSize: 256 << 10, InlineMaxSize: 32 << 10,
-		MaxAge: time.Minute,
+		Dir: t.TempDir(), MaxBytes: 8 << 20, SegmentSize: 256 << 10, InlineMaxSize: 32 << 10,
+		MaxObjectSize: 1 << 20,
+		MaxAge:        maxAge,
 		Now: func() time.Time {
 			mu.Lock()
 			defer mu.Unlock()
@@ -383,21 +386,125 @@ func TestEntriesExpire(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	defer objectCache.Close()
+	t.Cleanup(func() { _ = objectCache.Close() })
 
-	h, upstream := newTestProxy(t, func(cfg *Config) { cfg.Cache = objectCache })
+	h, upstream := newTestProxy(t, func(cfg *Config) {
+		cfg.Cache = objectCache
+		cfg.CacheWrites = true
+		cfg.CacheRangeFills = true
+	})
+	return h, upstream, objectCache, func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		now = now.Add(d)
+	}
+}
+
+// An expired entry is asked about, not thrown away. When the object has not
+// changed — the common case, since a write through this proxy invalidates
+// rather than expires — the answer costs a round trip instead of transferring
+// the object again.
+func TestAnExpiredEntryIsRevalidatedRatherThanRefetched(t *testing.T) {
+	h, upstream, _, advance := expiringProxy(t, time.Minute)
 	servesObject(upstream, "contents", nil)
 
 	require.Equal(t, http.StatusOK, getObject(t, h, tenantA, "rw", "/bucket/datasets/a.csv", nil).StatusCode)
+	require.Equal(t, 1, upstream.count())
+
+	advance(2 * time.Minute)
+	revalidated := getObject(t, h, tenantA, "rw", "/bucket/datasets/a.csv", nil)
+	require.Equal(t, http.StatusOK, revalidated.StatusCode)
+	assert.Equal(t, "REVALIDATED", revalidated.Header.Get("X-Cache"))
+	assert.Equal(t, "contents", readBody(t, revalidated), "the body came off the disk, not the wire")
+
+	// One extra upstream request, and it was a HEAD: no body crossed the
+	// network, which is the whole point of revalidating.
+	require.Equal(t, 2, upstream.count())
+	assert.Equal(t, http.MethodHead, upstream.last(t).method)
+
+	// And it is fresh again, so the next read does not ask a second time.
 	assert.Equal(t, "HIT", getObject(t, h, tenantA, "rw", "/bucket/datasets/a.csv", nil).Header.Get("X-Cache"))
+	assert.Equal(t, 2, upstream.count())
+}
 
-	mu.Lock()
-	now = now.Add(2 * time.Minute)
-	mu.Unlock()
+func TestAChangedObjectIsFetchedAgain(t *testing.T) {
+	h, upstream, _, advance := expiringProxy(t, time.Minute)
+	servesObject(upstream, "old contents", nil)
 
-	stale := getObject(t, h, tenantA, "rw", "/bucket/datasets/a.csv", nil)
-	assert.Equal(t, "STALE", stale.Header.Get("X-Cache"))
-	assert.Equal(t, "contents", readBody(t, stale), "and it is answered from the object store instead")
+	require.Equal(t, http.StatusOK, getObject(t, h, tenantA, "rw", "/bucket/datasets/a.csv", nil).StatusCode)
+
+	// Somebody else replaced the object, so the ETag no longer matches what
+	// was cached and the revalidation has to come back negative.
+	advance(2 * time.Minute)
+	upstream.mu.Lock()
+	upstream.respond = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Etag", `"a-different-etag"`)
+		http.ServeContent(w, r, "", time.Time{}, strings.NewReader("new contents"))
+	}
+	upstream.mu.Unlock()
+
+	fresh := getObject(t, h, tenantA, "rw", "/bucket/datasets/a.csv", nil)
+	require.Equal(t, http.StatusOK, fresh.StatusCode)
+	assert.Equal(t, "STALE", fresh.Header.Get("X-Cache"))
+	assert.Equal(t, "new contents", readBody(t, fresh))
+
+	// And the new version replaced the old one.
+	advance(time.Second)
+	next := getObject(t, h, tenantA, "rw", "/bucket/datasets/a.csv", nil)
+	assert.Equal(t, "HIT", next.Header.Get("X-Cache"))
+	assert.Equal(t, "new contents", readBody(t, next))
+}
+
+func TestARevalidatedRangeComesOffDisk(t *testing.T) {
+	h, upstream, _, advance := expiringProxy(t, time.Minute)
+	servesObject(upstream, "0123456789abcdef", nil)
+
+	require.Equal(t, http.StatusOK, getObject(t, h, tenantA, "rw", "/bucket/datasets/a.parquet", nil).StatusCode)
+	advance(2 * time.Minute)
+
+	// The reason revalidation is answered here rather than by rewriting a
+	// 304 further down: only here is there a ResponseWriter to hand to
+	// ServeContent, and a ranged read of a revalidated object still has to
+	// come out as a proper 206.
+	ranged := getObject(t, h, tenantA, "rw", "/bucket/datasets/a.parquet", http.Header{"Range": {"bytes=4-7"}})
+	assert.Equal(t, http.StatusPartialContent, ranged.StatusCode)
+	assert.Equal(t, "REVALIDATED", ranged.Header.Get("X-Cache"))
+	assert.Equal(t, "bytes 4-7/16", ranged.Header.Get("Content-Range"))
+	assert.Equal(t, "4567", readBody(t, ranged))
+}
+
+func TestRevalidationFallsBackToFetchingWhenItCannotTell(t *testing.T) {
+	h, upstream, _, advance := expiringProxy(t, time.Minute)
+
+	// An object store that returns no ETag leaves nothing to compare, so
+	// the entry has to be fetched rather than assumed current. Being wrong
+	// this way costs a transfer; being wrong the other way serves a stale
+	// object.
+	upstream.mu.Lock()
+	upstream.respond = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		http.ServeContent(w, r, "", time.Time{}, strings.NewReader("contents"))
+	}
+	upstream.mu.Unlock()
+
+	require.Equal(t, http.StatusOK, getObject(t, h, tenantA, "rw", "/bucket/datasets/a.csv", nil).StatusCode)
+	advance(2 * time.Minute)
+
+	resp := getObject(t, h, tenantA, "rw", "/bucket/datasets/a.csv", nil)
+	assert.Equal(t, "STALE", resp.Header.Get("X-Cache"))
+	assert.Equal(t, "contents", readBody(t, resp))
+	assert.Equal(t, http.MethodGet, upstream.last(t).method, "no HEAD is worth issuing without an ETag to compare")
+}
+
+func TestExpiryCanBeTurnedOff(t *testing.T) {
+	h, upstream, _, advance := expiringProxy(t, 0)
+	servesObject(upstream, "contents", nil)
+
+	require.Equal(t, http.StatusOK, getObject(t, h, tenantA, "rw", "/bucket/datasets/a.csv", nil).StatusCode)
+	advance(365 * 24 * time.Hour)
+	assert.Equal(t, "HIT", getObject(t, h, tenantA, "rw", "/bucket/datasets/a.csv", nil).Header.Get("X-Cache"))
+	assert.Equal(t, 1, upstream.count(), "with no expiry only a write through this proxy invalidates")
 }
 
 func TestWithoutACacheNothingChanges(t *testing.T) {

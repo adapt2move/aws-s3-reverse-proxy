@@ -46,6 +46,7 @@ func (c *Cache) BeginMutation(keys ...string) *Mutation {
 	for _, key := range keys {
 		_ = c.store.Delete(key)
 	}
+	c.forgetRevalidation(keys...)
 	c.invalidations.Add(uint64(len(keys)))
 	return &Mutation{c: c, keys: keys}
 }
@@ -105,6 +106,10 @@ func (m *Mutation) End() {
 			_ = m.c.store.Delete(key)
 		}
 	}
+	// Always, stored or not. A revalidation that was in flight while this
+	// write happened can land after it, and its "still current" was about
+	// the version this write replaced. Freshness has to run from the write.
+	m.c.forgetRevalidation(m.keys...)
 	m.c.mu.Lock()
 	for _, key := range m.keys {
 		p := m.c.pending[key]

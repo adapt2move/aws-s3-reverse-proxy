@@ -226,7 +226,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer st.mutation.End()
 	}
 
-	if h.serveCachedRead(rec, r, st) {
+	if h.serveCachedRead(rec, r, proxyReq, st) {
 		entry.Cache = st.cacheResult
 		h.access.Finish(entry, rec.Status(), time.Since(start))
 		return
