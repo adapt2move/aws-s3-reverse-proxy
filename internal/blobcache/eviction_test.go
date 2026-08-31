@@ -3,7 +3,8 @@ package blobcache
 import (
 	"fmt"
 	"io"
-	"path/filepath"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -123,15 +124,40 @@ func TestEvictedBlobFilesLeaveTheDisk(t *testing.T) {
 		o.InlineMaxSize = 4 << 10
 		o.MaxObjectSize = 64 << 10
 	})
-	defer s.Close()
 
 	for i := 0; i < 20; i++ {
 		put(t, s, fmt.Sprintf("big-%02d", i), nil, payload(32<<10, byte(i)))
 	}
-	files, err := filepath.Glob(filepath.Join(dir, "blob-*.dat"))
+	// A commit is acknowledged before the reclaim its batch triggers has run,
+	// so the store is still moving when the last Put returns: counting files
+	// here and reading the counters a moment later compares two different
+	// instants, and on a loaded machine the difference shows. Closing stops
+	// the writer, and what is measured below is the state the last reclaim
+	// actually left behind.
+	require.NoError(t, s.Close())
+
+	var blobs int
+	var bytes int64
+	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
-	assert.LessOrEqual(t, len(files), 6, "evicted payloads should be unlinked, not merely forgotten")
-	assert.Equal(t, len(files), s.Stats().Blobs, "the store's count should match what is on disk")
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		require.NoError(t, err)
+		bytes += info.Size()
+		if strings.HasPrefix(e.Name(), "blob-") {
+			blobs++
+		}
+	}
+
+	st := s.Stats()
+	assert.LessOrEqual(t, blobs, 6, "evicted payloads should be unlinked, not merely forgotten")
+	assert.Equal(t, blobs, st.Blobs, "the store's count should match what is on disk")
+	assert.LessOrEqual(t, st.Bytes, bytes,
+		"the store must not go on counting disk that nothing occupies: the "+
+			"budget it enforces is that number, so overstating it shrinks the cache")
 }
 
 func TestReaderKeepsWorkingAfterItsEntryIsEvicted(t *testing.T) {

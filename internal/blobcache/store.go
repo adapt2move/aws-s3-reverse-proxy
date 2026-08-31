@@ -811,7 +811,21 @@ func (s *Store) overBudget() bool {
 }
 
 // retire drops a container and everything the index still reaches through it.
+//
+// The accounting is given back before the entries are, and not after. Dropping
+// an entry can unlink a file — this container's own, when it is a blob file
+// holding the payload of the entry being dropped — and a caller reading Stats
+// while this runs would otherwise see the file gone from the directory and the
+// store still counting it.
 func (s *Store) retire(c *container) {
+	size := c.size.Load()
+	s.disk.Add(-size)
+	if c.blob {
+		s.blobs.Add(-1)
+	} else {
+		s.segments.Add(-1)
+	}
+
 	for _, e := range c.members {
 		sh := &s.shards[e.h1&(numShards-1)]
 		sh.mu.Lock()
@@ -824,13 +838,6 @@ func (s *Store) retire(c *container) {
 		sh.mu.Unlock()
 	}
 	c.members = nil
-	size := c.size.Load()
-	s.disk.Add(-size)
-	if c.blob {
-		s.blobs.Add(-1)
-	} else {
-		s.segments.Add(-1)
-	}
 	s.counters.evictions.Add(1)
 	s.counters.evictedBytes.Add(uint64(size))
 	c.retire()
