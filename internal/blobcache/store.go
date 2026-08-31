@@ -814,9 +814,15 @@ func (s *Store) overBudget() bool {
 //
 // The accounting is given back before the entries are, and not after. Dropping
 // an entry can unlink a file — this container's own, when it is a blob file
-// holding the payload of the entry being dropped — and a caller reading Stats
-// while this runs would otherwise see the file gone from the directory and the
-// store still counting it.
+// holding the payload of the entry being dropped — so the counters and the
+// directory disagree for as long as this function runs either way. The order
+// picks which way they disagree, not whether they do: a concurrent Stats() is
+// never atomic with respect to ls.
+//
+// Under-counting for the few microseconds this takes costs nothing.
+// Over-counting is the direction that can hurt, because overBudget() reads
+// s.disk: a store that counts space nothing occupies enforces a smaller cache
+// than it was given.
 func (s *Store) retire(c *container) {
 	size := c.size.Load()
 	s.disk.Add(-size)
