@@ -255,6 +255,11 @@ func (s *Store) Purge() error {
 	return s.submit(op)
 }
 
+// MaxObjectSize is the largest payload this store accepts, after the
+// defaults have been applied. A caller that would rather not start something
+// the store is going to refuse can ask.
+func (s *Store) MaxObjectSize() int64 { return s.opts.MaxObjectSize }
+
 // Stats reports what the store holds and what it has done since Open.
 func (s *Store) Stats() Stats {
 	return Stats{
@@ -348,7 +353,7 @@ var opPool = sync.Pool{New: func() any {
 func takeOp() *writeOp {
 	op := opPool.Get().(*writeOp)
 	op.key, op.record, op.blob, op.err = "", nil, nil, nil
-	op.sync, op.purge = false, false
+	op.sync, op.purge, op.offset = false, false, 0
 	op.header = recordHeader{}
 	return op
 }
@@ -368,6 +373,11 @@ type writeOp struct {
 
 	header recordHeader
 	record []byte
+
+	// offset is where the record landed, filled in when it is appended and
+	// used when it is published into the index — two steps that a flush has
+	// to happen between.
+	offset int64
 
 	// blob is set when the payload was streamed into a file of its own and
 	// the log only has to record where it went.
@@ -396,13 +406,22 @@ func (s *Store) writeLoop() {
 			// Take whatever else is already queued: those commits are
 			// waiting on a flush anyway, and folding them into one costs
 			// nothing.
-		drain:
-			for len(batch) < s.opts.BatchSize {
-				select {
-				case next := <-s.ops:
-					batch = append(batch, next)
-				default:
-					break drain
+			//
+			// A purge is the exception. It replaces the segment everything
+			// else in the batch was just appended to, so it is only ever
+			// the last thing in one.
+			if !op.purge {
+			drain:
+				for len(batch) < s.opts.BatchSize {
+					select {
+					case next := <-s.ops:
+						batch = append(batch, next)
+						if next.purge {
+							break drain
+						}
+					default:
+						break drain
+					}
 				}
 			}
 			s.applyBatch(batch)
@@ -424,44 +443,67 @@ func (s *Store) writeLoop() {
 }
 
 func (s *Store) applyBatch(batch []*writeOp) {
+	// A purge is always last in its batch, because it replaces the segment
+	// the rest of the batch was appended to.
+	var purge *writeOp
+	if last := batch[len(batch)-1]; last.purge {
+		purge, batch = last, batch[:len(batch)-1]
+	}
+
 	needSync := false
 	for _, op := range batch {
-		if err := s.applyOne(op); err != nil {
-			op.err = err
-		}
+		op.err = s.appendRecord(op)
 		needSync = needSync || op.sync
 	}
+
 	// One flush for the whole batch. Without an fsync this is a copy into
 	// the page cache, which is what makes the batching worth having: the
 	// syscall, not the durability, is the cost being amortised.
-	if err := s.active.flush(s.opts.WritebackEvery); err != nil {
-		s.fail(err)
-		for _, op := range batch {
-			if op.err == nil {
-				op.err = err
-			}
-		}
+	flushErr := s.active.flush(s.opts.WritebackEvery)
+	if flushErr != nil {
+		s.fail(flushErr)
 	} else if needSync {
 		if err := s.active.sync(); err != nil {
 			s.fail(err)
 		}
 	}
+
+	// Only now does anything point at those bytes.
+	//
+	// The index has to be updated after the flush and not before it. A
+	// record is appended into a buffer, and until that buffer reaches the
+	// page cache the file still holds whatever the segment was preallocated
+	// with — zeroes. An entry published before the flush is one a concurrent
+	// reader can find and answer from those zeroes: the right length, the
+	// right key, and none of the payload. The writer that submitted it would
+	// never notice, because it is still waiting for its acknowledgement.
+	for _, op := range batch {
+		if op.err == nil && flushErr != nil {
+			op.err = flushErr
+		}
+		if op.err == nil {
+			s.publish(op)
+		}
+	}
 	for _, op := range batch {
 		op.done <- struct{}{}
+	}
+
+	if purge != nil {
+		purge.err = s.purgeAll()
+		purge.done <- struct{}{}
 	}
 	s.maintain()
 }
 
-// applyOne appends one record and updates the index to match.
-func (s *Store) applyOne(op *writeOp) error {
+// appendRecord writes one record into the log and accounts for the disk it
+// takes. It publishes nothing: see the note in applyBatch.
+func (s *Store) appendRecord(op *writeOp) error {
 	if err := s.failed.Load(); err != nil {
 		if op.blob != nil {
 			op.blob.retire()
 		}
 		return *err
-	}
-	if op.purge {
-		return s.purgeAll()
 	}
 	offset, err := s.active.append(op.record)
 	if err != nil {
@@ -471,19 +513,27 @@ func (s *Store) applyOne(op *writeOp) error {
 		}
 		return err
 	}
+	op.offset = offset
 	s.active.c.size.Store(s.active.end)
 	s.disk.Add(int64(len(op.record)))
 
 	if op.blob != nil {
+		// The payload file was fsynced and renamed before this record was
+		// written, so it is readable already; it is the record pointing at
+		// it that is not, until the flush.
 		s.containers[op.blob.id] = op.blob
 		s.blobs.Add(1)
 		s.disk.Add(op.blob.size.Load())
 	}
-	s.apply(s.active.c, offset, op.header, op.key, op.blob)
+	return nil
+}
+
+// publish makes an appended record reachable.
+func (s *Store) publish(op *writeOp) {
+	s.apply(s.active.c, op.offset, op.header, op.key, op.blob)
 	if op.header.Kind != kindTombstone {
 		s.counters.puts.Add(1)
 	}
-	return nil
 }
 
 // purgeAll unlinks everything and starts a fresh log.

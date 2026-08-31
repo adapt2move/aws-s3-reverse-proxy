@@ -239,3 +239,81 @@ func TestConcurrentAccessIsSafe(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestAnEntryIsNeverVisibleBeforeItsBytesAre pins down the ordering that the
+// batching makes easy to get wrong.
+//
+// A record is appended into a buffer and only reaches the page cache at the
+// flush. Publish it into the index before that and a reader can find it while
+// the file still holds what the segment was preallocated with: the right
+// length, the right key, and none of the payload. The writer never notices,
+// because it is still waiting for its acknowledgement — so the only place
+// this shows up is here.
+func TestAnEntryIsNeverVisibleBeforeItsBytesAre(t *testing.T) {
+	s := open(t, t.TempDir(), func(o *Options) {
+		o.MaxBytes = 8 << 20
+		o.SegmentSize = 128 << 10
+		o.InlineMaxSize = 16 << 10
+		o.BatchSize = 64 // batch aggressively, to widen the window
+	})
+	defer s.Close()
+
+	const rounds = 400
+	want := payload(2048, 77)
+
+	var writers, readers sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Readers poll for whatever the writers are publishing. Anything they
+	// find has to be complete.
+	for r := 0; r < 4; r++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				for i := 0; i < rounds; i++ {
+					reader, err := s.Get(fmt.Sprintf("round-%04d", i))
+					if err != nil {
+						continue
+					}
+					got, err := io.ReadAll(reader)
+					_ = reader.Close()
+					if assert.NoError(t, err) {
+						assert.Equal(t, want, got,
+							"an entry the index points at must already be readable in full")
+					}
+				}
+			}
+		}()
+	}
+
+	for w := 0; w < 4; w++ {
+		writers.Add(1)
+		go func(w int) {
+			defer writers.Done()
+			for i := w; i < rounds; i += 4 {
+				writer, err := s.Put(fmt.Sprintf("round-%04d", i), int64(len(want)))
+				if err != nil {
+					continue
+				}
+				if _, err := writer.Write(want); err != nil {
+					writer.Abort()
+					continue
+				}
+				if err := writer.Commit([]byte("m")); err != nil && err != ErrBusy {
+					t.Errorf("commit: %v", err)
+				}
+				writer.Abort()
+			}
+		}(w)
+	}
+
+	writers.Wait()
+	close(stop)
+	readers.Wait()
+}
