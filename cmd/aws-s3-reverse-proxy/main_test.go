@@ -36,20 +36,62 @@ func baseOptions(t *testing.T) config.Options {
 }
 
 func TestBuildProxy(t *testing.T) {
-	handler, store, err := buildProxy(baseOptions(t))
+	handler, store, objectCache, err := buildProxy(baseOptions(t))
 	require.NoError(t, err)
 
 	scheme, endpoint := handler.UpstreamAddr()
 	assert.Equal(t, "https", scheme)
 	assert.Equal(t, "", endpoint, "no configured endpoint means auto-detect from the region")
 	assert.Equal(t, []string{"ro", "rw", "rws"}, store.Current().Levels())
+	assert.Nil(t, objectCache, "caching is off unless a directory is configured for it")
+}
+
+func TestBuildProxyOpensTheCacheWhenOneIsConfigured(t *testing.T) {
+	opts := baseOptions(t)
+	opts.CacheDir = filepath.Join(t.TempDir(), "objects")
+	opts.CacheMaxBytes = 8 << 20
+	opts.CacheMaxObjectSize = 1 << 20
+
+	_, _, objectCache, err := buildProxy(opts)
+	require.NoError(t, err)
+	require.NotNil(t, objectCache)
+	defer objectCache.Close()
+
+	assert.Equal(t, int64(8<<20), objectCache.Stats().Capacity)
+	assert.DirExists(t, opts.CacheDir, "the cache directory is created rather than required to exist")
+}
+
+// A cache an operator asked for and did not get is worse than no cache: the
+// deployment quietly performs like one without it and nothing says so.
+func TestStartupFailsOnAnUnusableCacheDirectory(t *testing.T) {
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	require.NoError(t, os.WriteFile(blocked, []byte("in the way"), 0o600))
+
+	opts := baseOptions(t)
+	opts.CacheDir = filepath.Join(blocked, "objects")
+	_, _, _, err := buildProxy(opts)
+	require.Error(t, err)
+}
+
+func TestStartupRejectsContradictoryCacheSizes(t *testing.T) {
+	opts := baseOptions(t)
+	opts.CacheDir = filepath.Join(t.TempDir(), "objects")
+	// An object that cannot share a segment with anything would make the
+	// segment layout pointless, so it is refused rather than quietly
+	// reinterpreted.
+	opts.CacheSegmentSize = 4 << 20
+	opts.CacheInlineMaxSize = 4 << 20
+
+	_, _, _, err := buildProxy(opts)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "InlineMaxSize")
 }
 
 func TestBuildProxyRejectsBrokenSubnets(t *testing.T) {
 	for _, subnet := range []string{"foobar", "", "127.0.0.1/XXX", "127.0.0.1", "256.0.0.1"} {
 		opts := baseOptions(t)
 		opts.AllowedSourceSubnet = []string{subnet}
-		_, _, err := buildProxy(opts)
+		_, _, _, err := buildProxy(opts)
 		require.Error(t, err, subnet)
 		assert.Contains(t, err.Error(), "invalid allowed source subnet")
 	}
@@ -68,13 +110,13 @@ rules:
   - pathPattern: 'datasets/**'
     grant: { ro: read }
 `)
-	_, _, err := buildProxy(opts)
+	_, _, _, err := buildProxy(opts)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `grant is missing level "rw"`)
 
 	opts = baseOptions(t)
 	opts.PolicyFile = filepath.Join(t.TempDir(), "does-not-exist.yaml")
-	_, _, err = buildProxy(opts)
+	_, _, _, err = buildProxy(opts)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot read policy file")
 }
@@ -82,13 +124,13 @@ rules:
 func TestStartupRequiresSecrets(t *testing.T) {
 	opts := baseOptions(t)
 	opts.Pepper = nil
-	_, _, err := buildProxy(opts)
+	_, _, _, err := buildProxy(opts)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no credential pepper configured")
 
 	opts = baseOptions(t)
 	opts.UpstreamSecretAccessKey = ""
-	_, _, err = buildProxy(opts)
+	_, _, _, err = buildProxy(opts)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no upstream credentials configured")
 }

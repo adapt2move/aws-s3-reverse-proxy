@@ -10,6 +10,39 @@ import (
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/s3"
 )
 
+// modifyResponse is everything that happens to an upstream response before it
+// reaches the client: the tenant rewriting below, and — when a cache is
+// configured — recording what the response says about the object.
+//
+// The order is deliberate. A write's outcome is recorded first, because
+// whether the upload was accepted decides what the cache should hold. The
+// rewriting comes next, because it is what the client is owed. The read
+// capture comes last, so that what is stored is the upstream's response and
+// not the rewritten one: a listing filtered for one access level, or a body
+// with the tenant prefix stripped out, is an answer to one request rather
+// than a copy of an object.
+func (h *Handler) modifyResponse(resp *http.Response) error {
+	if resp == nil || resp.Request == nil {
+		return nil
+	}
+	st := requestStateFrom(resp.Request.Context())
+	if st == nil {
+		return rewriteUpstreamResponse(resp)
+	}
+	h.finishMutation(resp, st)
+	if err := rewriteUpstreamResponse(resp); err != nil {
+		return err
+	}
+	h.captureRead(resp, st)
+	if st.cacheResult != "" {
+		// The client asked for something the cache could have answered and
+		// did not. Saying so is what makes a hit rate debuggable from one
+		// request rather than only from a dashboard.
+		resp.Header.Set("X-Cache", strings.ToUpper(st.cacheResult))
+	}
+	return nil
+}
+
 // rewriteUpstreamResponse is the response half of the tenant scoping: it
 // strips the injected key prefix back out, hides listing entries no rule
 // grants the caller read on, and merges the per-key denials of a batch delete

@@ -25,8 +25,10 @@ the security boundary — not a convenience layer in front of one.
 2. Resolve `{tenant, level}` from that access-key id.
 3. Inject the tenant key prefix into the object key and into listing parameters.
 4. Authorize the HTTP method + key against the policy for that level.
-5. Re-sign with the upstream credentials and forward, streaming.
-6. Strip the prefix back out of `ListObjectsV2` and `DeleteObjects` responses.
+5. Answer object reads from the local cache if one is configured and holds
+   the object — after step 4, never before it.
+6. Otherwise re-sign with the upstream credentials and forward, streaming.
+7. Strip the prefix back out of `ListObjectsV2` and `DeleteObjects` responses.
 
 ## Module layout
 
@@ -45,8 +47,8 @@ cmd/aws-s3-reverse-proxy   the process: flags, secrets, listeners, shutdown
     internal/sigv4         inbound signature verification, upstream re-signing
     internal/observability access log, metrics, health probes
 
-  internal/blobcache       a bounded blob store on local disk (standalone;
-                           nothing in the request path uses it yet)
+    internal/cache         cached upstream responses: freshness, invalidation
+      internal/blobcache   the disk underneath it
 ```
 
 Three seams keep the arrows pointing one way:
@@ -61,9 +63,10 @@ Three seams keep the arrows pointing one way:
   a hook instead of reaching for a logger and a metric registry, which is what
   lets the authorization model be tested without either.
 
-`internal/blobcache` is deliberately outside that stack. It stores opaque
-payloads under opaque keys and knows nothing about HTTP, S3, tenants or
-policy — see [Local blob store](#local-blob-store).
+The two cache packages keep the same discipline. `internal/cache` knows what
+an HTTP response is and when one goes stale; `internal/blobcache` knows only
+opaque keys and opaque payloads. Neither knows what S3 is, which tenant asked,
+or whether anyone was allowed to — see [Caching](#caching).
 
 ## Identity and credential derivation
 
@@ -233,6 +236,27 @@ a mounted secret, which is what a Kubernetes Secret volume gives you.
 S3-compatible backend over `http` and a hosted provider over `https` with no
 second flag to keep in sync.
 
+### Cache flags
+
+Caching is off unless `--cache-dir` is set, and every other flag here is
+ignored while it is empty. See [Caching](#caching) for what they mean in
+practice.
+
+| Flag (env) | Default | Meaning |
+| --- | --- | --- |
+| `--cache-dir` (`CACHE_DIR`) | *off* | directory to cache object reads in; empty disables caching entirely |
+| `--cache-max-bytes` (`CACHE_MAX_BYTES`) | 1 GiB | how much disk the cache may use |
+| `--cache-max-object-size` (`CACHE_MAX_OBJECT_SIZE`) | 64 MiB | largest object accepted; bigger ones are proxied without being stored |
+| `--cache-max-age` (`CACHE_MAX_AGE`) | `0s` | how long an object may be served before it is fetched again; `0` means never |
+| `--cache-writes` (`CACHE_WRITES`) | `true` | also cache the body of an accepted upload |
+| `--cache-range-fills` (`CACHE_RANGE_FILLS`) | `true` | fetch the whole object in the background when a ranged read misses |
+| `--cache-max-entries` (`CACHE_MAX_ENTRIES`) | `0` | object count limit; `0` for none. Budget ~100 bytes of memory each |
+| `--cache-segment-size` (`CACHE_SEGMENT_SIZE`) | 256 MiB | size of the append-only segment files, and the granularity disk is reclaimed at |
+| `--cache-inline-max-size` (`CACHE_INLINE_MAX_SIZE`) | 1 MiB | objects up to this size share a segment; larger ones get a file of their own |
+
+The last three are expert knobs. The first six are the ones a deployment
+actually turns.
+
 ### Hot reload
 
 The policy file is re-read on `SIGHUP` and, by default, on a timer. A reload
@@ -318,6 +342,11 @@ Measured added latency for `GET`/`HEAD` is well inside the 5 ms p99 budget;
 `TestAddedLatencyP99` measures it against the same upstream reached directly
 and fails the build if it regresses past it.
 
+An object served from the local cache never reaches the object store at all,
+and is answered by `http.ServeContent` — which brings correct `Range`,
+`If-None-Match`, `If-Range` and `416` handling with it. See
+[Caching](#caching).
+
 `/healthz` and `/readyz` live on their own listener — on the S3 one, a path
 like `/healthz` would be indistinguishable from a bucket named `healthz`.
 `SIGTERM` flips `/readyz` to 503 and then drains in-flight requests, so a
@@ -327,22 +356,131 @@ Client compatibility: clients that sign a real payload hash (e.g. DuckDB's
 `httpfs`, which also signs with an empty region scope) and clients that send
 `aws-chunked` bodies (e.g. the AWS JS SDK v3) both work unchanged.
 
-## Local blob store
+## Caching
 
-`internal/blobcache` is a size-bounded store for opaque payloads on local
-disk. Nothing in the request path uses it yet; it exists so that the caching
-layer it is meant to carry can be designed against something real.
+Set `--cache-dir` and object reads are answered from local disk instead of the
+object store. Everything else about the proxy is unchanged; leave it unset and
+none of this code runs.
 
-It is built for a network-attached volume, where an fsync is a round trip and
-so is a file create, and every decision follows from that:
+It is aimed at a workload of many small files read over and over — Parquet and
+DuckDB files behind a query engine — on a proxy that is the only thing writing
+to the bucket.
 
-  * Payloads up to `InlineMaxSize` are **appended to shared segment files**
-    rather than stored one file per key. A write is one buffered append, not
-    create + write + rename with an inode update behind each. Concurrent
-    commits fold into a single `write()`.
-  * Larger payloads get **a file of their own**, streamed rather than
-    buffered, because a single big object would otherwise monopolise the
-    append point and make its segment unreclaimable.
+### What it does and does not cache
+
+| | |
+| --- | --- |
+| `GetObject`, `HeadObject` | served from the cache, and stored on the way past. A `HEAD` is answered out of a cached `GET`. |
+| Ranged reads | answered from a cached object, Range arithmetic and all. A ranged **miss** is proxied straight through and the whole object is fetched in the background — see below. |
+| `PutObject` | invalidates the object, and with `--cache-writes` the uploaded body is kept, so writing an object leaves it cached. |
+| `DeleteObject`, `DeleteObjects`, `CompleteMultipartUpload` | invalidate every key they touch. |
+| `ListObjectsV2` | **never cached.** A listing's body is filtered per access level on the way out, so a cached one would be an answer to one caller rather than a copy of anything. |
+| Multipart parts | not cached. The object does not exist until the upload is completed, and completing it invalidates the key. |
+
+An object marked `Cache-Control: no-store` or `private` is not stored: those
+are statements about the object, and this is a shared cache. Freshness
+directives (`max-age`, `no-cache`) are ignored — how long an entry may be
+served is the deployment's decision, made once in the configuration, not one
+an object's own metadata makes on its behalf.
+
+A request carrying `If-Match` or `If-Unmodified-Since` bypasses the cache
+entirely. Those are not freshness questions but concurrency primitives: the
+caller is asking the object store to decide about the object's current state,
+and a cache answering on its behalf would break exactly what the caller is
+relying on.
+
+### Ranged reads, and why the background fetch exists
+
+A client like DuckDB's `httpfs` reads an object almost entirely in ranges: a
+Parquet footer, then row groups, then column chunks. A cache that only ever
+filled from whole-object reads would never see one, and its hit rate against
+that workload would be exactly zero.
+
+So a ranged read that misses is proxied through unchanged — the client gets
+its bytes at full speed from the object store — and the whole object is
+fetched separately in the background, bounded by `--cache-max-object-size`.
+Every range after that is answered from disk. Concurrent ranged reads of the
+same cold object trigger one fetch between them, and at most four fetches run
+at a time so that work nobody asked for cannot crowd out work somebody did.
+`--cache-range-fills=false` turns it off.
+
+### What keeps it correct
+
+Five rules, and every line of `internal/proxy/cache.go` is one of them:
+
+  * The cache is consulted **after** authentication and authorization, never
+    before. A hit answers a request that was already going to be allowed; it
+    can never answer one that would have been refused. `ro` reading an object
+    that `rws` cached is still a `403`, and the object store is not consulted
+    either.
+  * The key names the **upstream** object — bucket plus the injected tenant
+    prefix — never what the client asked for. Two tenants that both call
+    something `data/a.parquet` are two different keys by construction, which
+    is not something any code path has to remember to check.
+  * What is stored is what the **upstream** sent, before any tenant rewriting.
+  * Nothing is committed until the upstream confirmed it **and** the whole
+    announced length arrived. A client that hangs up halfway does not leave a
+    truncated object behind.
+  * The cache never delays or fails a request. Every error path ends in "then
+    don't cache it" — out of disk, over the size limit, store busy. A cache
+    that can break a read is worse than no cache.
+
+Response headers are a whitelist like request headers are: `Content-Type`,
+`Content-Encoding`, `Content-Disposition`, `Content-Language`,
+`Cache-Control`, `Expires`, `ETag`, `Last-Modified` and the `x-amz-meta-*`
+family are stored and replayed. `Date`, `Server`, `x-amz-request-id` and
+`x-amz-id-2` are not: they identify one exchange with the object store, and
+replaying somebody else's request id is a false trail through two systems'
+logs.
+
+### Staleness, and the one thing the cache cannot see
+
+Every write **through this proxy** invalidates what it touched, so the only
+way an entry can go stale is a write that did not go through it: another
+client, a lifecycle rule, replication, the console.
+
+The default `--cache-max-age=0` means entries never expire, which is correct
+exactly when this proxy is the only writer — and that assumption is stated out
+loud in the startup log rather than left in the flag help. If anything else
+writes to the bucket, either set `--cache-max-age` to bound how long a stale
+object can be served, or empty the cache when it happens:
+
+```
+curl -X POST http://<health-listen-addr>/cache/purge
+```
+
+That endpoint lives on the admin listener and nowhere else. On the S3 port,
+`/cache/purge` is indistinguishable from a request for an object called that,
+and a bucket named `cache` would put it within reach of any tenant.
+
+One caveat is worth stating for the workload above. A Parquet reader mixing a
+cached footer with a freshly fetched row group does not get old data, it gets
+garbage — the offsets no longer describe the file. Whole objects are cached
+and invalidated atomically, so this cannot happen within the proxy; it is a
+reason to take an external writer seriously rather than to bound staleness
+loosely.
+
+Running more than one replica means one cache per replica: the hit rate
+divides by the replica count and each cache is independently stale. Route by
+key if that matters.
+
+The cache directory holds tenant object data at rest, which the proxy
+otherwise never does. It is created `0700`; encryption at rest is the
+operator's to arrange, and it wants a volume of its own.
+
+### The disk underneath
+
+`internal/blobcache` is what holds the bytes: a size-bounded blob store built
+for a network-attached volume, where an fsync is a round trip and so is a file
+create.
+
+  * Objects up to `--cache-inline-max-size` are **appended to shared segment
+    files** rather than stored one file per key. A write is one buffered
+    append, not create + write + rename with an inode update behind each, and
+    concurrent writes fold into a single `write()`.
+  * Larger objects get **a file of their own**, streamed rather than buffered:
+    one big object would otherwise monopolise the append point and make its
+    segment unreclaimable.
   * **Nothing on the hot path is fsynced.** A cache does not need durability,
     it needs to never be wrong, and only the second one is free. Correctness
     after a crash comes from per-record checksums: a record that was torn, or
@@ -350,13 +488,13 @@ so is a file create, and every decision follows from that:
     leaves behind — is a miss, and a miss is always safe because the truth
     lives upstream.
   * The two fsyncs that remain are amortised past noticing: sealing a full
-    segment, and committing one large payload alongside its own megabytes.
+    segment, and committing one large object alongside its own megabytes.
     Deletions are synced too, because a resurrected key is the one kind of
     staleness the store can prevent on its own.
   * Reclaim is **segment-granular** — records are never rewritten, so write
     amplification is exactly 1.0 and one `unlink` returns a whole segment.
-    Victims are chosen from a bounded sample, so eviction costs the same
-    whether the store holds a thousand files or a million.
+    Victims come from a bounded sample, so eviction costs the same whether the
+    store holds a thousand files or a million.
 
 Measured against the obvious alternative on the same volume
 (`go test ./internal/blobcache -bench Put`):
@@ -386,7 +524,9 @@ level=warning msg="request denied" tenant=1f0c… access_level=ro operation=PutO
 ```
 
 (The identity's level is logged as `access_level`, because logrus already
-uses `level` for the severity of the line itself.)
+uses `level` for the severity of the line itself.) With a cache configured,
+every line also carries `cache=hit|miss|stale|bypass`, which is what turns
+"the hit rate dropped" into a list of the requests that missed.
 
 No credentials, signatures or `Authorization` header content appear in logs or
 in metric labels, at any verbosity. The tenant id is available as a metric
@@ -399,6 +539,17 @@ an unbounded label is an unbounded number of time series.
 | `s3proxy_batch_delete_denied_keys_total{tenant,level}` | keys refused inside a batch |
 | `s3proxy_proxied_request_duration_seconds{operation,decision}` | end-to-end latency |
 | `s3proxy_policy_reloads_total{outcome}` | reloads applied / rejected / unchanged |
+| `s3proxy_cache_lookups_total{operation,result}` | cache lookups: hit, miss, stale, bypass |
+| `s3proxy_cache_entries`, `s3proxy_cache_bytes`, `s3proxy_cache_capacity_bytes` | what the cache holds |
+| `s3proxy_cache_stores_total`, `s3proxy_cache_store_failures_total` | responses written, and the ones that could not be |
+| `s3proxy_cache_invalidations_total` | keys dropped because the object behind them was written |
+| `s3proxy_cache_evictions_total`, `s3proxy_cache_evicted_bytes_total` | reclaim, to stay within the size limit |
+
+The cache series appear only when a cache is configured: a deployment without
+one exports nothing rather than a set of zeros that read like an idle cache.
+Every served request also carries an `X-Cache` header — `HIT`, `MISS`,
+`STALE`, `BYPASS` — so a hit rate is answerable from one request and not only
+from a dashboard.
 
 ## Out of scope
 
@@ -406,6 +557,13 @@ an unbounded label is an unbounded number of time series.
   * Presigned-URL support; clients that need it should address the object store
     directly.
   * Bucket-level administration through the proxy.
+  * Conditional revalidation of a stale cache entry. A stale entry is fetched
+    again rather than checked with an `If-None-Match`, so expiry costs a
+    transfer and not just a round trip. Worth adding if egress rather than
+    latency turns out to be the constraint.
+  * Caching listings. It would have to be an index the proxy answers
+    `ListObjectsV2` from, not a stored response, because a listing is filtered
+    per access level on the way out.
 
 ## Releases
 
@@ -472,6 +630,8 @@ $ AWS_ACCESS_KEY_ID=$TENANT$LEVEL AWS_SECRET_ACCESS_KEY=$DERIVED \
   * per-key authorization for batch deletes, with S3-shaped per-key results
   * limits access based on source IP, subnet and endpoint URL
   * streaming bodies with explicit caps on the two paths that must buffer
+  * optional local disk cache for object reads, with ranged reads served from
+    it and every write through the proxy keeping it in step
   * full instrumentation with Prometheus metrics and a structured access log
   * health endpoints and graceful shutdown with connection draining
   * HTTP and HTTPS for clients; upstream scheme follows the configured endpoint

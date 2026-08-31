@@ -105,6 +105,58 @@ var consumedHeaders = map[string]bool{
 // unforwarded headers.
 var consumedPrefixes = []string{"X-Amz-Sdk-"}
 
+// cachedResponseHeaders is the exact set of response headers worth keeping
+// beside a stored object, and it is a whitelist for the same reason the
+// request set is: a header replayed from a cache describes a response that is
+// no longer the one it was sent for.
+//
+// What is deliberately absent is as much the point as what is here.
+// `Content-Length` is recomputed from the payload actually stored, so a
+// replayed one could never be wrong. `Date`, `Server`, `x-amz-request-id` and
+// `x-amz-id-2` identify one particular exchange with the object store, and
+// serving somebody else's request id back is at best confusing and at worst a
+// false trail through two systems' logs. `Accept-Ranges` is set by whoever
+// serves the payload, which for a cached response is not the object store.
+var cachedResponseHeaders = map[string]bool{
+	// What the object is.
+	"Content-Type":        true,
+	"Content-Encoding":    true,
+	"Content-Disposition": true,
+	"Content-Language":    true,
+
+	// What may be done with it, and which version of it this is.
+	"Cache-Control": true,
+	"Expires":       true,
+	"Etag":          true,
+	"Last-Modified": true,
+}
+
+// CacheableResponseHeader reports whether a response header should be stored
+// with a cached object and replayed when it is served.
+//
+// The `x-amz-meta-` family travels with it: it is the tenant's own metadata,
+// it was set on the object rather than on the exchange, and a read that does
+// not return it has not returned the object.
+func CacheableResponseHeader(name string) bool {
+	canonical := http.CanonicalHeaderKey(name)
+	if cachedResponseHeaders[canonical] {
+		return true
+	}
+	return strings.HasPrefix(canonical, "X-Amz-Meta-")
+}
+
+// CacheableResponseHeaders is the subset of a response's headers worth
+// storing with it.
+func CacheableResponseHeaders(header http.Header) http.Header {
+	out := make(http.Header, len(header))
+	for name, values := range header {
+		if CacheableResponseHeader(name) {
+			out[http.CanonicalHeaderKey(name)] = values
+		}
+	}
+	return out
+}
+
 // ForwardableHeader reports whether a client request header travels upstream.
 func ForwardableHeader(name string) bool {
 	canonical := http.CanonicalHeaderKey(name)

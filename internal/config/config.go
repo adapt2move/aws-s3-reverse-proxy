@@ -41,6 +41,18 @@ type Options struct {
 	PolicyFile           string
 	PolicyReloadInterval time.Duration
 
+	// Cache. The whole feature is off unless CacheDir is set, and every
+	// field below is ignored while it is empty.
+	CacheDir           string
+	CacheMaxBytes      int64
+	CacheMaxEntries    int
+	CacheMaxObjectSize int64
+	CacheMaxAge        time.Duration
+	CacheWrites        bool
+	CacheRangeFills    bool
+	CacheSegmentSize   int64
+	CacheInlineMaxSize int64
+
 	MaxClockSkew       time.Duration
 	MaxChunkedBodySize int64
 	MaxDeleteBodySize  int64
@@ -79,6 +91,18 @@ func Parse() Options {
 	kingpin.Flag("key-file", "path to the private key file (env - KEY_FILE)").Envar("KEY_FILE").Default("").StringVar(&opts.KeyFile)
 	kingpin.Flag("read-only", "reject every mutating request regardless of policy (env - READ_ONLY)").Envar("READ_ONLY").Default("false").BoolVar(&opts.ReadOnly)
 	kingpin.Flag("metrics-tenant-label", "add the tenant id as a Prometheus label; tenant count is unbounded, so consider the cardinality first (env - METRICS_TENANT_LABEL)").Envar("METRICS_TENANT_LABEL").Default("false").BoolVar(&opts.TenantMetricLabel)
+	// Caching. One flag turns it on and the rest tune it, so a deployment
+	// that does not want a cache carries none of this.
+	kingpin.Flag("cache-dir", "directory to cache object reads in; empty disables caching entirely (env - CACHE_DIR)").Envar("CACHE_DIR").PlaceHolder("/var/cache/s3proxy").StringVar(&opts.CacheDir)
+	kingpin.Flag("cache-max-bytes", "how much disk the cache may use (env - CACHE_MAX_BYTES)").Envar("CACHE_MAX_BYTES").Default("1073741824").Int64Var(&opts.CacheMaxBytes)
+	kingpin.Flag("cache-max-entries", "how many objects the cache may hold, 0 for no limit; each one costs about 100 bytes of memory (env - CACHE_MAX_ENTRIES)").Envar("CACHE_MAX_ENTRIES").Default("0").IntVar(&opts.CacheMaxEntries)
+	kingpin.Flag("cache-max-object-size", "largest object the cache will accept; bigger ones are proxied without being stored (env - CACHE_MAX_OBJECT_SIZE)").Envar("CACHE_MAX_OBJECT_SIZE").Default("67108864").Int64Var(&opts.CacheMaxObjectSize)
+	kingpin.Flag("cache-max-age", "how long a cached object may be served before it is fetched again; 0 means never expire, which assumes this proxy is the only writer (env - CACHE_MAX_AGE)").Envar("CACHE_MAX_AGE").Default("0s").DurationVar(&opts.CacheMaxAge)
+	kingpin.Flag("cache-writes", "also cache the body of an accepted upload, so writing an object leaves it cached (env - CACHE_WRITES)").Envar("CACHE_WRITES").Default("true").BoolVar(&opts.CacheWrites)
+	kingpin.Flag("cache-range-fills", "fetch the whole object in the background when a ranged read misses; without it a client that only reads ranges never fills the cache (env - CACHE_RANGE_FILLS)").Envar("CACHE_RANGE_FILLS").Default("true").BoolVar(&opts.CacheRangeFills)
+	kingpin.Flag("cache-segment-size", "size of the cache's append-only segment files, which is also the granularity it reclaims disk at (env - CACHE_SEGMENT_SIZE)").Envar("CACHE_SEGMENT_SIZE").Default("268435456").Int64Var(&opts.CacheSegmentSize)
+	kingpin.Flag("cache-inline-max-size", "objects up to this size are appended to a shared segment; larger ones get a file of their own (env - CACHE_INLINE_MAX_SIZE)").Envar("CACHE_INLINE_MAX_SIZE").Default("1048576").Int64Var(&opts.CacheInlineMaxSize)
+
 	kingpin.Flag("max-clock-skew", "how far X-Amz-Date may be from this clock in either direction (env - MAX_CLOCK_SKEW)").Envar("MAX_CLOCK_SKEW").Default("15m").DurationVar(&opts.MaxClockSkew)
 	kingpin.Flag("max-chunked-body-size", "cap on an aws-chunked body that has to be buffered to recover its checksum trailer (env - MAX_CHUNKED_BODY_SIZE)").Envar("MAX_CHUNKED_BODY_SIZE").Default("67108864").Int64Var(&opts.MaxChunkedBodySize)
 	kingpin.Flag("max-delete-body-size", "cap on a DeleteObjects request body (env - MAX_DELETE_BODY_SIZE)").Envar("MAX_DELETE_BODY_SIZE").Default("2097152").Int64Var(&opts.MaxDeleteBodySize)
@@ -88,6 +112,10 @@ func Parse() Options {
 	kingpin.Parse()
 	return opts
 }
+
+// CacheEnabled reports whether a cache was configured. One flag decides it,
+// so a deployment cannot end up half-configured.
+func (o Options) CacheEnabled() bool { return o.CacheDir != "" }
 
 // envOr is the default for a flag that has an older environment variable to
 // stay compatible with.

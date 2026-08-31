@@ -37,6 +37,11 @@ type AccessLog struct {
 	// DeniedKeys counts the keys a batch delete refused, which is the one
 	// case where a single request carries more than one decision.
 	DeniedKeys int
+
+	// Cache is what the local cache made of the request — hit, miss, stale,
+	// bypass — or empty when no cache is configured. It is the field that
+	// turns "the hit rate dropped" into a list of the requests that missed.
+	Cache string
 }
 
 func (e *AccessLog) decision() string {
@@ -92,6 +97,9 @@ func (r *Recorder) Finish(e *AccessLog, status int, duration time.Duration) {
 	if e.Reason != "" {
 		fields["reason"] = e.Reason
 	}
+	if e.Cache != "" {
+		fields["cache"] = e.Cache
+	}
 
 	if e.Allowed {
 		log.WithFields(fields).Info("request served")
@@ -108,6 +116,9 @@ func (r *Recorder) Finish(e *AccessLog, status int, duration time.Duration) {
 		deniedBatchKeys.WithLabelValues(tenant, e.Level).Add(float64(e.DeniedKeys))
 	}
 	proxiedRequestDuration.WithLabelValues(e.Operation, e.decision()).Observe(duration.Seconds())
+	if e.Cache != "" {
+		cacheLookups.WithLabelValues(e.Operation, e.Cache).Inc()
+	}
 }
 
 // StatusRecorder remembers the status code for the access log. It forwards
