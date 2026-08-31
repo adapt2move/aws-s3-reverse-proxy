@@ -516,6 +516,14 @@ The cache directory holds tenant object data at rest, which the proxy
 otherwise never does. It is created `0700`; encryption at rest is the
 operator's to arrange, and it wants a volume of its own.
 
+**It also has to belong to the user the proxy runs as.** The container image
+runs as `proxyuser`, and both a Kubernetes PVC and a Docker volume are handed
+over owned by root — so the proxy cannot create anything in one and refuses to
+start rather than serve without the cache it was told to use. On Kubernetes
+set `fsGroup` in the pod's security context; elsewhere `chown` the directory
+before the process starts. `e2e/docker-compose.yml` does the latter, in the
+`cache-dir` service.
+
 ### The disk underneath
 
 `internal/blobcache` is what holds the bytes: a size-bounded blob store built

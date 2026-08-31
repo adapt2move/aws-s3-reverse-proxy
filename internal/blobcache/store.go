@@ -91,7 +91,12 @@ func Open(opts Options) (*Store, error) {
 		return nil, err
 	}
 	if err := os.MkdirAll(tempDir(opts.Dir), 0o700); err != nil {
-		return nil, err
+		// Worth naming what is wrong rather than passing the syscall's own
+		// message up. The usual cause is a volume mounted into a container
+		// that runs as somebody other than root: the directory is there, it
+		// just belongs to the wrong user, and "permission denied" on a path
+		// nobody chose by hand does not say that.
+		return nil, fmt.Errorf("%s must be writable by the user this process runs as: %w", opts.Dir, err)
 	}
 	s := &Store{
 		opts:       opts,

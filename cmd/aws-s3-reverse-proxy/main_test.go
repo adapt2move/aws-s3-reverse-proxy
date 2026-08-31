@@ -63,6 +63,11 @@ func TestBuildProxyOpensTheCacheWhenOneIsConfigured(t *testing.T) {
 
 // A cache an operator asked for and did not get is worse than no cache: the
 // deployment quietly performs like one without it and nothing says so.
+//
+// The message has to name the directory, because the most common way to get
+// here is a volume mounted into a container that runs as somebody other than
+// root — the directory exists and simply belongs to the wrong user, and the
+// syscall's own "permission denied" on a path nobody typed does not say that.
 func TestStartupFailsOnAnUnusableCacheDirectory(t *testing.T) {
 	blocked := filepath.Join(t.TempDir(), "not-a-directory")
 	require.NoError(t, os.WriteFile(blocked, []byte("in the way"), 0o600))
@@ -71,6 +76,8 @@ func TestStartupFailsOnAnUnusableCacheDirectory(t *testing.T) {
 	opts.CacheDir = filepath.Join(blocked, "objects")
 	_, _, _, err := buildProxy(opts)
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), opts.CacheDir)
+	assert.Contains(t, err.Error(), "writable by the user this process runs as")
 }
 
 func TestStartupRejectsContradictoryCacheSizes(t *testing.T) {

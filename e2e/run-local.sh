@@ -20,6 +20,14 @@ if [[ -z "$minio_bin" ]]; then
   echo "no minio binary found; set MINIO_BINARY or install it from https://dl.min.io" >&2
   exit 1
 fi
+# A MINIO_BINARY that does not exist, or cannot be run, otherwise gets as far
+# as starting nothing at all — and every test then fails against a store that
+# was never there, which reads as two dozen broken assertions rather than as
+# one missing file.
+if [[ ! -x "$minio_bin" ]]; then
+  echo "!!! $minio_bin is not an executable file" >&2
+  exit 1
+fi
 
 pids=()
 cleanup() {

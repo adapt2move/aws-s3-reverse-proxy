@@ -163,6 +163,22 @@ services:
       METRICS_LISTEN_ADDR: ":8100"
     ports: ["18399:8099", "18400:8100"]
 
+  # The image runs as a non-root user and a Docker volume is created owned by
+  # root, so the proxy cannot create its cache directory inside one. This is
+  # not a quirk of the test stack: an operator mounting a PVC or a host
+  # directory into this image hits exactly the same thing, and the answer
+  # there is the same as here — hand the volume to the user the process runs
+  # as before the process starts. On Kubernetes that is `fsGroup`; in compose
+  # it is this.
+  cache-dir:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    user: root
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["chown -R proxyuser:proxygroup /var/cache/s3proxy"]
+    volumes: ["cache:/var/cache/s3proxy"]
+
   # Variant D — variant A's identity scheme with the local object cache on.
   #
   # Running the whole suite against it is most of the point: a cache that
@@ -180,6 +196,7 @@ services:
       dockerfile: Dockerfile
     depends_on:
       createbuckets: {condition: service_completed_successfully}
+      cache-dir: {condition: service_completed_successfully}
     volumes:
       - "./policies/policy-a.yaml:/etc/s3proxy/policy.yaml:ro"
       # A named volume rather than a container path, so the cache is still
