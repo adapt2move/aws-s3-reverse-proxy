@@ -493,6 +493,14 @@ It lives on the admin listener and nowhere else. On the S3 port,
 `/cache/purge` is indistinguishable from a request for an object called that,
 and a bucket named `cache` would put it within reach of any tenant.
 
+All of the above is exercised end to end against a real MinIO, by a fourth
+proxy variant in `e2e/` that runs the whole suite with the cache on — so a
+cache that answered a request policy would have refused fails the isolation
+and authorization tests rather than a test written to look for it. The
+external-writer case is staged for real there too: the suite writes into the
+bucket behind the proxy's back and checks that the object is served stale
+until the maximum age and no longer. See `e2e/README.md`.
+
 One caveat is worth stating for the workload above. A Parquet reader mixing a
 cached footer with a freshly fetched row group does not get old data, it gets
 garbage — the offsets no longer describe the file. Whole objects are cached,

@@ -615,6 +615,14 @@ func TestHealthAndMetrics(t *testing.T) {
 		}
 	}
 
+	// Make a request first. The authorization series are counters with
+	// labels, so they do not exist until something has been decided — and a
+	// run narrowed to this test would otherwise fail on a deployment that is
+	// working perfectly.
+	rawSignedRequest(t, env, http.MethodGet,
+		"/"+env.Bucket+"/datasets/metrics/probe.csv", nil, nil,
+		env.TenantA, env.ReadLevel).Body.Close()
+
 	resp, err := http.Get(env.AdminEndpoint + "/metrics")
 	requireNoError(t, err, "GET /metrics")
 	defer resp.Body.Close()
