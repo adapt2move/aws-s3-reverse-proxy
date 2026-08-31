@@ -7,8 +7,8 @@ import (
 	"sync"
 )
 
-// encodeRecord lays out one log record: a fixed header, then the key, the
-// metadata and — only for an inline payload — the payload itself.
+// encodeRecord lays out one log record: a fixed header, then the key, then —
+// only for an inline payload — the payload, then the metadata.
 //
 // The checksum is taken over the variable part in exactly the order it is
 // written, which is what lets recovery verify it while streaming past a
@@ -21,10 +21,10 @@ func encodeRecord(kind recordKind, key string, meta, data []byte, dataLen int64,
 	buf := make([]byte, size)
 	n := recordHeaderSize
 	n += copy(buf[n:], key)
-	n += copy(buf[n:], meta)
 	if kind == kindInline {
-		copy(buf[n:], data)
+		n += copy(buf[n:], data)
 	}
+	copy(buf[n:], meta)
 	h := recordHeader{
 		Kind:    kind,
 		KeyLen:  uint32(len(key)),
@@ -72,9 +72,8 @@ func returnStaging(b []byte) {
 // A Writer is not safe for concurrent use, and nothing it has been given is
 // visible to Get until Commit returns.
 type Writer struct {
-	s    *Store
-	key  string
-	meta []byte
+	s   *Store
+	key string
 
 	// buf is the record itself, assembled in place: header, key, metadata,
 	// then the payload as it arrives. Building it here rather than copying
@@ -90,11 +89,10 @@ type Writer struct {
 }
 
 // beginInline lays out the fixed part of the record so the payload can be
-// appended straight onto it.
+// appended straight onto it. The metadata goes on the end at commit time.
 func (w *Writer) beginInline() {
 	w.buf = append(takeStaging(), zeroHeader[:]...)
 	w.buf = append(w.buf, w.key...)
-	w.buf = append(w.buf, w.meta...)
 	w.payloadStart = len(w.buf)
 }
 
@@ -186,15 +184,25 @@ func (w *Writer) fail(err error) {
 // Size is how many payload bytes have been written so far.
 func (w *Writer) Size() int64 { return w.written }
 
-// Commit publishes the payload. Once it returns nil, Get finds the entry.
+// Commit publishes the payload under its key, described by meta. Once it
+// returns nil, Get finds the entry.
+//
+// The metadata is supplied here rather than at Put because it is often not
+// known any earlier: what an object store says about an upload — its ETag,
+// its stored length — arrives once the upload has landed, and buffering the
+// whole payload just to record that alongside it would defeat the point.
 //
 // ErrBusy means the store was too far behind to take the write; the entry is
 // simply not cached, which is never a reason for the caller to fail.
-func (w *Writer) Commit() error {
+func (w *Writer) Commit(meta []byte) error {
 	if w.done {
 		return errors.New("blobcache: commit called twice")
 	}
 	if w.err != nil {
+		return w.err
+	}
+	if int64(len(meta)) > int64(^uint32(0)) {
+		w.fail(errors.New("blobcache: metadata is absurdly long"))
 		return w.err
 	}
 	w.done = true
@@ -210,13 +218,13 @@ func (w *Writer) Commit() error {
 		h := recordHeader{
 			Kind:    kindBlobRef,
 			KeyLen:  uint32(len(w.key)),
-			MetaLen: uint32(len(w.meta)),
+			MetaLen: uint32(len(meta)),
 			DataLen: uint64(w.written),
 			BlobID:  c.id,
 		}
 		op := takeOp()
 		op.key, op.header, op.blob = w.key, h, c
-		op.record = encodeRecord(kindBlobRef, w.key, w.meta, nil, w.written, c.id)
+		op.record = encodeRecord(kindBlobRef, w.key, meta, nil, w.written, c.id)
 		if err := w.s.submit(op); err != nil {
 			// The record never reached the log, so nothing will ever refer
 			// to this file. Take it back out now rather than leave it for
@@ -230,6 +238,7 @@ func (w *Writer) Commit() error {
 	if w.buf == nil {
 		w.beginInline()
 	}
+	w.buf = append(w.buf, meta...)
 	defer func() {
 		returnStaging(w.buf)
 		w.buf = nil
@@ -239,7 +248,7 @@ func (w *Writer) Commit() error {
 	h := recordHeader{
 		Kind:    kindInline,
 		KeyLen:  uint32(len(w.key)),
-		MetaLen: uint32(len(w.meta)),
+		MetaLen: uint32(len(meta)),
 		DataLen: uint64(w.written),
 		CRC:     checksum(w.buf[recordHeaderSize:]),
 	}

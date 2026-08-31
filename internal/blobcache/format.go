@@ -74,9 +74,15 @@ func (k recordKind) valid() bool {
 }
 
 // recordHeader is the fixed part of a log record. The variable part that
-// follows it is key, then meta, then — for kindInline — the payload.
+// follows it is the key, then — for kindInline — the payload, then the
+// metadata.
 //
-// Meta rides in the segment even when the payload does not, so reading an
+// Metadata comes last so it can be decided last. A caller that only learns
+// what to record about a payload after sending it — the ETag an object store
+// hands back once an upload lands, say — would otherwise have to buffer the
+// whole payload to get the two into one record.
+//
+// It rides in the segment even when the payload does not, so reading an
 // entry's metadata never has to open the blob file.
 type recordHeader struct {
 	Kind    recordKind

@@ -190,7 +190,7 @@ func TestConcurrentAccessIsSafe(t *testing.T) {
 					size = 24 << 10 // push some of them into their own files
 				}
 				data := payload(size, byte(i))
-				wr, err := s.Put(key, []byte(key), int64(len(data)))
+				wr, err := s.Put(key, int64(len(data)))
 				if err != nil {
 					continue
 				}
@@ -200,7 +200,7 @@ func TestConcurrentAccessIsSafe(t *testing.T) {
 				}
 				// ErrBusy is an ordinary outcome under load and never a
 				// reason for the caller to fail.
-				if err := wr.Commit(); err != nil {
+				if err := wr.Commit([]byte(key)); err != nil {
 					require.ErrorIs(t, err, ErrBusy)
 				}
 				wr.Abort()

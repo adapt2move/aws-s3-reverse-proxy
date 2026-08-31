@@ -18,6 +18,9 @@ import (
 // here, and the file-per-entry variant loses a further round trip per create
 // and per rename.
 
+// benchMeta stands in for whatever a caller records beside a payload.
+var benchMeta = []byte("metadata")
+
 func benchSizes() []int { return []int{512, 4 << 10, 64 << 10} }
 
 func BenchmarkPut(b *testing.B) {
@@ -30,14 +33,14 @@ func BenchmarkPut(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				w, err := s.Put(fmt.Sprintf("key-%08d", i), []byte("metadata"), int64(size))
+				w, err := s.Put(fmt.Sprintf("key-%08d", i), int64(size))
 				if err != nil {
 					b.Fatal(err)
 				}
 				if _, err := w.Write(data); err != nil {
 					b.Fatal(err)
 				}
-				if err := w.Commit(); err != nil && err != ErrBusy {
+				if err := w.Commit(benchMeta); err != nil && err != ErrBusy {
 					b.Fatal(err)
 				}
 			}
@@ -85,14 +88,14 @@ func BenchmarkPutParallel(b *testing.B) {
 		local := 0
 		for pb.Next() {
 			local++
-			w, err := s.Put(fmt.Sprintf("key-%d-%08d", counter, local), []byte("metadata"), int64(len(data)))
+			w, err := s.Put(fmt.Sprintf("key-%d-%08d", counter, local), int64(len(data)))
 			if err != nil {
 				b.Fatal(err)
 			}
 			if _, err := w.Write(data); err != nil {
 				b.Fatal(err)
 			}
-			if err := w.Commit(); err != nil && err != ErrBusy {
+			if err := w.Commit(benchMeta); err != nil && err != ErrBusy {
 				b.Fatal(err)
 			}
 		}
@@ -107,14 +110,14 @@ func BenchmarkGet(b *testing.B) {
 			const keys = 512
 			data := payload(size, 3)
 			for i := 0; i < keys; i++ {
-				w, err := s.Put(fmt.Sprintf("key-%08d", i), []byte("metadata"), int64(size))
+				w, err := s.Put(fmt.Sprintf("key-%08d", i), int64(size))
 				if err != nil {
 					b.Fatal(err)
 				}
 				if _, err := w.Write(data); err != nil {
 					b.Fatal(err)
 				}
-				if err := w.Commit(); err != nil {
+				if err := w.Commit(benchMeta); err != nil {
 					b.Fatal(err)
 				}
 			}

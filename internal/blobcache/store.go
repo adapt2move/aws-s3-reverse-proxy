@@ -182,30 +182,30 @@ func (s *Store) Has(key string) bool {
 }
 
 // Put starts writing key. The caller writes the payload to the returned
-// Writer and calls Commit, or Abort to leave the store unchanged; Abort after
-// a successful Commit does nothing, so it is safe to defer.
+// Writer and calls Commit with the metadata to record beside it, or Abort to
+// leave the store unchanged; Abort after a successful Commit does nothing, so
+// it is safe to defer.
 //
-// meta is an opaque blob stored beside the payload and handed back by Get.
 // sizeHint is the payload length if it is known and negative if it is not:
 // it decides up front whether the payload is worth its own file, and lets the
 // store refuse an oversized object before a byte of it is written.
 //
 // Nothing is visible to Get until Commit returns.
-func (s *Store) Put(key string, meta []byte, sizeHint int64) (*Writer, error) {
+func (s *Store) Put(key string, sizeHint int64) (*Writer, error) {
 	if err := s.writable(); err != nil {
 		return nil, err
 	}
 	if key == "" {
 		return nil, errors.New("blobcache: empty key")
 	}
-	if int64(len(key)) > int64(^uint32(0)) || int64(len(meta)) > int64(^uint32(0)) {
-		return nil, errors.New("blobcache: key or metadata is absurdly long")
+	if int64(len(key)) > int64(^uint32(0)) {
+		return nil, errors.New("blobcache: key is absurdly long")
 	}
 	if sizeHint > s.opts.MaxObjectSize {
 		return nil, ErrTooLarge
 	}
 
-	w := &Writer{s: s, key: key, meta: meta}
+	w := &Writer{s: s, key: key}
 	if sizeHint > s.opts.InlineMaxSize {
 		// The size is known and it is large, so skip the staging buffer
 		// entirely and stream straight into a file of its own.
@@ -522,7 +522,13 @@ func (s *Store) apply(seg *container, offset int64, h recordHeader, key string, 
 	h1, h2 := hashKey(key)
 	sh := &s.shards[h1&(numShards-1)]
 
-	metaOff := offset + recordHeaderSize + int64(h.KeyLen)
+	// The record is header, key, payload, metadata — so where the metadata
+	// starts depends on whether the payload is in this segment at all.
+	dataOff := offset + recordHeaderSize + int64(h.KeyLen)
+	metaOff := dataOff
+	if h.Kind == kindInline {
+		metaOff += int64(h.DataLen)
+	}
 	var e *entry
 	if h.Kind != kindTombstone {
 		e = &entry{
@@ -536,7 +542,7 @@ func (s *Store) apply(seg *container, offset int64, h recordHeader, key string, 
 		switch h.Kind {
 		case kindInline:
 			e.data = seg
-			e.dataOff = metaOff + int64(h.MetaLen)
+			e.dataOff = dataOff
 		case kindBlobRef:
 			e.data = blob
 			e.dataOff = 0

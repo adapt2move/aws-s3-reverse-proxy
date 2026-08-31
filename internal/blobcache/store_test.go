@@ -41,12 +41,12 @@ func open(t *testing.T, dir string, tune ...func(*Options)) *Store {
 // something else.
 func put(t *testing.T, s *Store, key string, meta, data []byte) {
 	t.Helper()
-	w, err := s.Put(key, meta, int64(len(data)))
+	w, err := s.Put(key, int64(len(data)))
 	require.NoError(t, err)
 	defer w.Abort()
 	_, err = w.Write(data)
 	require.NoError(t, err)
-	require.NoError(t, w.Commit())
+	require.NoError(t, w.Commit(meta))
 }
 
 // mustGet reads an entry back in full.
@@ -160,12 +160,12 @@ func TestSizeHintUnderstatesPayload(t *testing.T) {
 	// somewhere: the write spills out of the staging buffer into a file of
 	// its own without the caller doing anything about it.
 	want := payload(40<<10, 7)
-	w, err := s.Put("streamed", []byte("m"), -1)
+	w, err := s.Put("streamed", -1)
 	require.NoError(t, err)
 	defer w.Abort()
 	_, err = io.Copy(w, bytes.NewReader(want))
 	require.NoError(t, err)
-	require.NoError(t, w.Commit())
+	require.NoError(t, w.Commit([]byte("m")))
 
 	_, got := mustGet(t, s, "streamed")
 	assert.Equal(t, want, got)
@@ -176,17 +176,17 @@ func TestOversizedPayloadIsRefused(t *testing.T) {
 	s := open(t, t.TempDir(), func(o *Options) { o.MaxObjectSize = 16 << 10 })
 	defer s.Close()
 
-	_, err := s.Put("declared", nil, 32<<10)
+	_, err := s.Put("declared", 32<<10)
 	assert.ErrorIs(t, err, ErrTooLarge, "a size hint over the limit should be refused before any bytes are written")
 
 	// One that does not declare its size is refused the moment it grows
 	// past the limit, so a single object can never displace the cache.
-	w, err := s.Put("undeclared", nil, -1)
+	w, err := s.Put("undeclared", -1)
 	require.NoError(t, err)
 	defer w.Abort()
 	_, err = w.Write(payload(32<<10, 3))
 	assert.ErrorIs(t, err, ErrTooLarge)
-	assert.ErrorIs(t, w.Commit(), ErrTooLarge)
+	assert.ErrorIs(t, w.Commit(nil), ErrTooLarge)
 	mustMiss(t, s, "undeclared")
 }
 
@@ -195,7 +195,7 @@ func TestAbortLeavesNothingBehind(t *testing.T) {
 	s := open(t, dir)
 	defer s.Close()
 
-	w, err := s.Put("k", nil, 64<<10)
+	w, err := s.Put("k", 64<<10)
 	require.NoError(t, err)
 	_, err = w.Write(payload(64<<10, 1))
 	require.NoError(t, err)
@@ -208,12 +208,12 @@ func TestAbortLeavesNothingBehind(t *testing.T) {
 
 	// Abort after Commit is a no-op, which is what makes `defer w.Abort()`
 	// the right way to use a Writer.
-	w2, err := s.Put("k2", nil, 8)
+	w2, err := s.Put("k2", 8)
 	require.NoError(t, err)
 	defer w2.Abort()
 	_, err = w2.Write([]byte("12345678"))
 	require.NoError(t, err)
-	require.NoError(t, w2.Commit())
+	require.NoError(t, w2.Commit(nil))
 	w2.Abort()
 	_, data := mustGet(t, s, "k2")
 	assert.Equal(t, "12345678", string(data))
@@ -257,7 +257,7 @@ func TestClosedStoreRefusesWrites(t *testing.T) {
 	put(t, s, "k", nil, payload(16, 1))
 	require.NoError(t, s.Close())
 
-	_, err := s.Put("k2", nil, 16)
+	_, err := s.Put("k2", 16)
 	assert.ErrorIs(t, err, ErrClosed)
 	assert.ErrorIs(t, s.Delete("k"), ErrClosed)
 	assert.NoError(t, s.Close(), "closing twice should be harmless")
@@ -438,4 +438,36 @@ func TestServeContentServesRangesFromTheStore(t *testing.T) {
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusRequestedRangeNotSatisfiable, resp.StatusCode)
 	})
+}
+
+func TestMetadataIsDecidedAtCommit(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+
+	// The case this ordering exists for: what is worth recording about a
+	// payload is only known once the payload has been sent. An object store
+	// hands back an ETag when an upload lands, and buffering the upload just
+	// to get the two into one record would defeat the point of streaming it.
+	for _, size := range []int{512, 64 << 10} { // inline tier, then blob tier
+		key := fmt.Sprintf("late-%d", size)
+		data := payload(size, 4)
+		w, err := s.Put(key, int64(size))
+		require.NoError(t, err)
+		defer w.Abort()
+		_, err = w.Write(data)
+		require.NoError(t, err)
+		// Only now is the metadata known.
+		require.NoError(t, w.Commit([]byte(`{"etag":"`+key+`"}`)))
+	}
+	require.NoError(t, s.Close())
+
+	// And it has to come back through a replay, not just from memory.
+	s = open(t, dir)
+	defer s.Close()
+	for _, size := range []int{512, 64 << 10} {
+		key := fmt.Sprintf("late-%d", size)
+		meta, data := mustGet(t, s, key)
+		assert.Equal(t, `{"etag":"`+key+`"}`, string(meta))
+		assert.Equal(t, payload(size, 4), data)
+	}
 }

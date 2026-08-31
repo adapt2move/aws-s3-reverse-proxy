@@ -260,17 +260,12 @@ func replayRecords(rf *os.File, limit int64, verify bool, fn func(off int64, h r
 		if _, err := io.ReadFull(r, key); err != nil {
 			return offset, nil
 		}
-		meta := make([]byte, h.MetaLen)
-		if _, err := io.ReadFull(r, meta); err != nil {
-			return offset, nil
-		}
 
 		// The checksum covers the variable part in the order it appears on
-		// disk, so it can be computed while streaming past the payload
-		// rather than by holding it.
+		// disk — key, payload, metadata — so it can be computed while
+		// streaming past a payload this replay has no reason to hold.
 		digest := crc32.New(crc32c)
 		_, _ = digest.Write(key)
-		_, _ = digest.Write(meta)
 		if h.Kind == kindInline {
 			if verify {
 				if _, err := io.CopyN(digest, r, int64(h.DataLen)); err != nil {
@@ -280,6 +275,11 @@ func replayRecords(rf *os.File, limit int64, verify bool, fn func(off int64, h r
 				return offset, nil
 			}
 		}
+		meta := make([]byte, h.MetaLen)
+		if _, err := io.ReadFull(r, meta); err != nil {
+			return offset, nil
+		}
+		_, _ = digest.Write(meta)
 		if verify && digest.Sum32() != h.CRC {
 			return offset, nil
 		}
