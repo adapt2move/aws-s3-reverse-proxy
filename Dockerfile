@@ -1,4 +1,4 @@
-FROM golang:alpine as build
+FROM golang:1.25-alpine as build
 
 RUN apk add -U --no-cache ca-certificates git bash
 
@@ -8,7 +8,7 @@ COPY . .
 RUN go build -o aws-s3-reverse-proxy ./cmd/aws-s3-reverse-proxy && \
     mv ./aws-s3-reverse-proxy /go/bin
 
-FROM alpine:3.13
+FROM alpine:3.24
 
 WORKDIR /proxy
 
