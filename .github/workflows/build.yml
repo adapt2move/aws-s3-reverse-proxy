@@ -3,24 +3,27 @@ on:
   - push
   - pull_request
 
+# A newer push supersedes a running pipeline on the same ref. Master is left
+# alone so every commit there finishes and publishes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
     steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.25"
 
-      - name: Check out source code
-        uses: actions/checkout@v4
-
       - name: Build
         run: go build -v ./...
-
-      - name: Test
-        run: go test -v ./...
 
       - name: Build Docker image
         run: docker build -t aws-s3-reverse-proxy .
@@ -28,17 +31,34 @@ jobs:
       - name: Run Docker image
         run: docker run --rm aws-s3-reverse-proxy --help
 
-  e2e:
-    name: End-to-end
+  test:
+    name: Test
+    needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.25"
 
+      - name: Test
+        run: go test -v ./...
+
+  e2e:
+    name: End-to-end
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
       - name: Check out source code
         uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
 
       # Real S3 clients, a real proxy and a real MinIO, across three
       # deployment variants. See e2e/README.md.
@@ -51,7 +71,7 @@ jobs:
 
   publish:
     name: Publish image
-    needs: [build, e2e]
+    needs: [test, e2e]
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
