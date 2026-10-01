@@ -5,7 +5,8 @@
 #   ./e2e/run.sh              # everything
 #   ./e2e/run.sh -run TestTenantIsolation
 #
-# Set E2E_KEEP=1 to leave the stack running afterwards for poking at.
+# Set E2E_KEEP=1 to leave the stack running afterwards for poking at, and
+# E2E_PROXY_IMAGE=<image> to run a prebuilt proxy image instead of building.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -32,8 +33,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> building and starting the stack"
-"${compose[@]}" up -d --build
+# With E2E_PROXY_IMAGE set, the proxies run that already-built image instead
+# of a fresh build from the working tree. CI uses this to test the exact
+# image it publishes.
+if [[ -n "${E2E_PROXY_IMAGE:-}" ]]; then
+  echo "==> starting the stack on $E2E_PROXY_IMAGE"
+  "${compose[@]}" up -d --no-build
+else
+  echo "==> building and starting the stack"
+  "${compose[@]}" up -d --build
+fi
 
 wait_for_health() {
   local url=$1 name=$2
