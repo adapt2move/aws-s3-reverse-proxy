@@ -3,10 +3,10 @@ on:
   push:
     branches: [master]
 
-# Every commit on master finishes and publishes; none cancels another.
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+# No concurrency group: GitHub keeps only one pending run per group, so a
+# burst of pushes would silently drop the commits in between. Every commit
+# gets its own run and its own SHA tag; the latest step below keeps
+# overlapping runs from moving `latest` backwards.
 
 jobs:
   test:
@@ -49,13 +49,25 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
 
       # Signed by digest, so the signature covers exactly the bytes pushed
-      # above, whichever tag later points where.
+      # above, whichever tag later points at them.
       - name: Sign image
         run: cosign sign --yes "$IMAGE@$DIGEST"
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+
+      # Runs can overlap, so `latest` only moves when this commit is still
+      # the head of master. A run for an older commit that finishes last
+      # leaves it alone.
+      - name: Tag as latest
+        run: |
+          head=$(git ls-remote origin refs/heads/master | cut -f1)
+          if [[ "$head" != "$GITHUB_SHA" ]]; then
+            echo "master has moved on to $head, leaving latest alone"
+            exit 0
+          fi
+          docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE@$DIGEST"
         env:
           DIGEST: ${{ steps.push.outputs.digest }}

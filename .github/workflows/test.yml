@@ -6,10 +6,12 @@ on:
   pull_request:
   workflow_call:
 
-# A newer push supersedes a running pipeline on the same ref.
+# A newer push supersedes a running pipeline on the same branch. On master
+# (called from release.yml) every run gets a group of its own, since a
+# shared one would cancel or drop the tests of commits waiting to publish.
 concurrency:
-  group: test-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  group: test-${{ github.ref }}-${{ github.ref == 'refs/heads/master' && github.run_id || 'latest' }}
+  cancel-in-progress: true
 
 jobs:
   unit:
