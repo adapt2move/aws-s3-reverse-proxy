@@ -93,7 +93,6 @@ services:
   # merely slow, which is a far better test of "memory is independent of
   # object size" than reading a heap profile.
   proxy-http:
-    image: ${E2E_PROXY_IMAGE:-aws-s3-reverse-proxy:e2e}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -122,7 +121,6 @@ services:
   # identity scheme, and both secrets arriving as mounted files rather than
   # environment values.
   proxy-tls:
-    image: ${E2E_PROXY_IMAGE:-aws-s3-reverse-proxy:e2e}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -147,7 +145,6 @@ services:
 
   # Variant C — the maintenance kill switch, on top of variant A's policy.
   proxy-readonly:
-    image: ${E2E_PROXY_IMAGE:-aws-s3-reverse-proxy:e2e}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -174,7 +171,6 @@ services:
   # as before the process starts. On Kubernetes that is `fsGroup`; in compose
   # it is this.
   cache-dir:
-    image: ${E2E_PROXY_IMAGE:-aws-s3-reverse-proxy:e2e}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -195,7 +191,6 @@ services:
   # object the cache declines still streams rather than being buffered on its
   # way past.
   proxy-cache:
-    image: ${E2E_PROXY_IMAGE:-aws-s3-reverse-proxy:e2e}
     build:
       context: ..
       dockerfile: Dockerfile
