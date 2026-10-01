@@ -1,0 +1,54 @@
+name: Test
+on:
+  push:
+    # Master runs these through release.yml, ahead of publishing.
+    branches-ignore: [master]
+  pull_request:
+  workflow_call:
+
+# A newer push supersedes a running pipeline on the same branch. On master
+# (called from release.yml) every run gets a group of its own, since a
+# shared one would cancel or drop the tests of commits waiting to publish.
+concurrency:
+  group: test-${{ github.ref }}-${{ github.ref == 'refs/heads/master' && github.run_id || 'latest' }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Test
+        run: go test -v ./...
+
+  e2e:
+    name: End-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      # Real S3 clients, a real proxy and a real MinIO, across three
+      # deployment variants. See e2e/README.md.
+      - name: Run the end-to-end suite
+        run: ./e2e/run.sh
+
+      - name: Dump stack logs on failure
+        if: failure()
+        run: docker compose -f e2e/docker-compose.yml logs --tail 200
