@@ -16,7 +16,7 @@ concurrency:
 jobs:
   unit:
     name: Unit
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Check out source code
         uses: actions/checkout@v4
@@ -34,7 +34,7 @@ jobs:
 
   e2e:
     name: End-to-end
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check out source code
         uses: actions/checkout@v4
