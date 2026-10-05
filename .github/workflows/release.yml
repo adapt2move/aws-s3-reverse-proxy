@@ -16,7 +16,7 @@ jobs:
   publish:
     name: Build, push and sign image
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
       packages: write
