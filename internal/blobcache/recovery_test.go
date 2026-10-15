@@ -355,3 +355,48 @@ func TestASegmentSealedBelowItsFullSizeKeepsItsIndex(t *testing.T) {
 	require.True(t, ok, "the index has to be where a reader looks for it: at the end of the file")
 	assert.Len(t, entries, 8)
 }
+
+// A label is a claim about what every entry in the directory means. Opening
+// under another one has to start from nothing — and opening under the same
+// one, or under none when none was ever recorded, has to keep everything.
+func TestALabelChangeEmptiesTheStore(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	put(t, s, "unlabelled", []byte("m"), payload(300, 1))
+	put(t, s, "large", []byte("m"), payload(48<<10, 2))
+	require.NoError(t, s.Close())
+
+	// No label recorded and none asked for: a store that predates labels
+	// keeps its contents.
+	s = open(t, dir)
+	mustGet(t, s, "unlabelled")
+	require.NoError(t, s.Close())
+
+	s = open(t, dir, func(o *Options) { o.Label = "generation-1" })
+	_, err := s.Get("unlabelled")
+	assert.ErrorIs(t, err, ErrNotFound, "an entry written under no label must not survive a new one")
+	_, err = s.Get("large")
+	assert.ErrorIs(t, err, ErrNotFound)
+	assert.Zero(t, s.Stats().Entries)
+	put(t, s, "labelled", []byte("m"), payload(300, 3))
+	require.NoError(t, s.Close())
+
+	s = open(t, dir, func(o *Options) { o.Label = "generation-1" })
+	_, data := mustGet(t, s, "labelled")
+	assert.Equal(t, payload(300, 3), data, "the same label keeps the contents")
+	require.NoError(t, s.Close())
+
+	s = open(t, dir, func(o *Options) { o.Label = "generation-2" })
+	_, err = s.Get("labelled")
+	assert.ErrorIs(t, err, ErrNotFound)
+	put(t, s, "second", nil, payload(64, 4))
+	require.NoError(t, s.Close())
+
+	// Dropping the label is a change too, in the other direction.
+	s = open(t, dir)
+	defer s.Close()
+	_, err = s.Get("second")
+	assert.ErrorIs(t, err, ErrNotFound)
+	_, err = os.Stat(filepath.Join(dir, labelFile))
+	assert.True(t, os.IsNotExist(err), "no label asked for, none recorded")
+}

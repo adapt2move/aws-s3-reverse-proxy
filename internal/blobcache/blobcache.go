@@ -153,6 +153,18 @@ type Options struct {
 	// happens to be in flight.
 	WritebackEvery int64
 
+	// Label names the configuration the store's contents were written
+	// under. It is recorded in the directory, and a store opened with a
+	// different label starts empty: everything written under the old one is
+	// removed before recovery reads any of it. Default "", which is also
+	// what a directory without a recorded label is taken to have been
+	// written under — so a store that never used labels keeps its contents
+	// when opened without one.
+	//
+	// It is for the case where what a key *means* depends on something the
+	// key does not say. The store cannot know that; the caller can.
+	Label string
+
 	// Logf reports what the store repairs and discards on its own: corrupt
 	// records dropped at recovery, orphaned files removed. Nil discards it.
 	Logf func(format string, args ...any)

@@ -8,12 +8,89 @@ package blobcache
 // this package exists to make impossible.
 
 import (
+	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 )
+
+// labelFile records Options.Label in the store's directory.
+const labelFile = "label"
+
+// adoptLabel makes the directory belong to opts.Label before anything in it is
+// read.
+//
+// When the recorded label differs, every segment and blob file goes, and only
+// then is the new label written. The order is the safe one in both directions
+// a crash can cut it: a store that lost its files but not its old label is
+// empty, and one that has the new label has nothing left from the old one.
+// Entries written after this point are the new configuration's by
+// construction.
+func adoptLabel(opts Options) error {
+	path := filepath.Join(opts.Dir, labelFile)
+	recorded, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if string(recorded) == opts.Label {
+		return nil
+	}
+	entries, err := os.ReadDir(opts.Dir)
+	if err != nil {
+		return err
+	}
+	removed := 0
+	for _, e := range entries {
+		if name := e.Name(); name != labelFile && name != "tmp" {
+			if err := os.RemoveAll(filepath.Join(opts.Dir, name)); err != nil {
+				return err
+			}
+			removed++
+		}
+	}
+	if removed > 0 {
+		opts.logf("blobcache: the directory was written under another configuration; removed %d files", removed)
+	}
+	if opts.Label == "" {
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		return syncDir(opts.Dir)
+	}
+	tmp := filepath.Join(tempDir(opts.Dir), labelFile)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(opts.Label); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncDir(opts.Dir)
+}
+
+// syncDir makes a rename or an unlink in dir durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
 
 // recover rebuilds the index from what is on disk.
 func (s *Store) recover() error {
@@ -149,6 +226,7 @@ func (s *Store) scanDir() (segments, blobs []string, err error) {
 		name := e.Name()
 		switch {
 		case e.IsDir() && name == "tmp":
+		case !e.IsDir() && name == labelFile:
 		case !e.IsDir() && strings.HasPrefix(name, "seg-") && strings.HasSuffix(name, ".log"):
 			segments = append(segments, filepath.Join(s.opts.Dir, name))
 		case !e.IsDir() && strings.HasPrefix(name, "blob-") && strings.HasSuffix(name, ".dat"):
