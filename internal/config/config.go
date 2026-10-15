@@ -40,6 +40,10 @@ type Options struct {
 	ReadOnly              bool
 	TenantMetricLabel     bool
 
+	// UpstreamSSECRepair rewrites plaintext objects found by a read under
+	// the SSE-C key. It only means something with a key configured.
+	UpstreamSSECRepair bool
+
 	PolicyFile           string
 	PolicyReloadInterval time.Duration
 
@@ -97,6 +101,7 @@ func Parse() Options {
 	kingpin.Flag("cert-file", "path to the certificate file (env - CERT_FILE)").Envar("CERT_FILE").Default("").StringVar(&opts.CertFile)
 	kingpin.Flag("key-file", "path to the private key file (env - KEY_FILE)").Envar("KEY_FILE").Default("").StringVar(&opts.KeyFile)
 	kingpin.Flag("read-only", "reject every mutating request regardless of policy (env - READ_ONLY)").Envar("READ_ONLY").Default("false").BoolVar(&opts.ReadOnly)
+	kingpin.Flag("upstream-sse-c-repair", "with UPSTREAM_SSE_C_KEY set, rewrite plaintext objects found by a read in place under the key; only safe once nothing writes the bucket without the key (env - UPSTREAM_SSE_C_REPAIR)").Envar("UPSTREAM_SSE_C_REPAIR").Default("false").BoolVar(&opts.UpstreamSSECRepair)
 	kingpin.Flag("metrics-tenant-label", "add the tenant id as a Prometheus label; tenant count is unbounded, so consider the cardinality first (env - METRICS_TENANT_LABEL)").Envar("METRICS_TENANT_LABEL").Default("false").BoolVar(&opts.TenantMetricLabel)
 	// Caching. One flag turns it on and the rest tune it, so a deployment
 	// that does not want a cache carries none of this.

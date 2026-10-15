@@ -143,6 +143,20 @@ type Config struct {
 	// to the bucket. It requires an https upstream. See encryption.go.
 	UpstreamSSECKey *ssec.Key
 
+	// RepairPlaintext lets a read that finds an object stored in plaintext
+	// have it rewritten in place under the key. Off, such objects are served
+	// and left as they are.
+	//
+	// It is a statement about the deployment, which is why it is the
+	// operator's to make: the rewrite is conditional on the object's ETag,
+	// and a writer that stores byte-identical content with different
+	// metadata — without the key, so its ETag is unchanged — in the moment
+	// before the replacement lands would have that metadata overwritten. No
+	// object store offers a condition that covers metadata, so the guarantee
+	// rests on nothing writing the bucket without the key. Writes through
+	// this proxy always carry it.
+	RepairPlaintext bool
+
 	// rootCAs replaces the system roots for the upstream connection. Tests
 	// set it to trust an httptest TLS server; a deployment uses
 	// SSL_CERT_FILE instead.
@@ -496,6 +510,11 @@ type requestState struct {
 
 	// deletedKeys are the upstream keys a batch delete is about to remove.
 	deletedKeys []string
+
+	// unconfirmed records that the object store accepted this write without
+	// confirming the customer key, so what the cache keeps of it is marked
+	// for its encryption to be checked.
+	unconfirmed bool
 }
 
 type requestStateKey struct{}

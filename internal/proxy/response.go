@@ -36,6 +36,9 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 	if st == nil {
 		normalizeResponseETag(resp.Header)
 		hideEncryption(resp.Header)
+		if err := h.sanitizeErrorResponse(resp); err != nil {
+			return err
+		}
 		return rewriteUpstreamResponse(resp)
 	}
 	h.checkWriteConfirmation(resp, st)
@@ -62,6 +65,9 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 	// nor which customer key the store confirmed.
 	normalizeResponseETag(resp.Header)
 	hideEncryption(resp.Header)
+	if err := h.sanitizeErrorResponse(resp); err != nil {
+		return err
+	}
 	if err := rewriteUpstreamResponse(resp); err != nil {
 		return err
 	}
@@ -81,6 +87,48 @@ func normalizeResponseETag(header http.Header) {
 	if etag := header.Get("Etag"); etag != "" {
 		header.Set("Etag", s3.NormalizeETag(etag))
 	}
+}
+
+// sanitizeErrorResponse rebuilds an upstream error body from the fields a
+// client may see, and redacts the customer key from whatever is left.
+//
+// An object store's error describes the request *it* received, which is the
+// proxy's re-signed request: SignatureDoesNotMatch quotes it whole, headers
+// and all, and an argument error can repeat a header's value. With a customer
+// key on that request, passing the document on would hand the key to any
+// client that can provoke the error. Rebuilding from Code, Message, Key,
+// BucketName, Resource and the request ids keeps everything an SDK reads;
+// redacting afterwards covers a body that is not an S3 error document, and a
+// message that quotes a value. Error bodies are small, and every one of them
+// is read here regardless of its content type.
+func (h *Handler) sanitizeErrorResponse(resp *http.Response) error {
+	if resp.StatusCode < 300 || resp.StatusCode == http.StatusNotModified || resp.Body == nil || resp.Body == http.NoBody {
+		return nil
+	}
+	body, err := s3.ReadCapped(resp.Body, h.cfg.Limits.RewriteBody, "upstream error response")
+	resp.Body.Close()
+	if err != nil {
+		return err
+	}
+	body, err = s3.DecodeContentEncoding(body, resp.Header.Get("Content-Encoding"), h.cfg.Limits.RewriteBody)
+	if err != nil {
+		return err
+	}
+	resp.Header.Del("Content-Encoding")
+	body = h.sanitizeErrorBody(body)
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	return nil
+}
+
+// sanitizeErrorBody is sanitizeErrorResponse for a body already in hand.
+func (h *Handler) sanitizeErrorBody(body []byte) []byte {
+	body = s3.SanitizeErrorDocument(body)
+	if h.cfg.UpstreamSSECKey != nil {
+		body = h.cfg.UpstreamSSECKey.Redact(body)
+	}
+	return body
 }
 
 // rewriteUpstreamResponse is the response half of the tenant scoping: it

@@ -149,11 +149,11 @@ func (h *Handler) serveCachedRead(w http.ResponseWriter, r *http.Request, proxyR
 		h.cfg.Cache.Refresh(entry)
 		st.cacheResult = string(cache.Revalidated)
 	}
-	if entry.Header.Get(legacyMarker) != "" {
-		// This entry was fetched from an object stored in plaintext. Serving
-		// it from disk must not hide that from the repair for as long as the
-		// entry lives — with no maximum age, that would be forever.
-		h.repairs.schedule(st, proxyReq.URL, entry.ETag(), "a cached read of an object stored in plaintext")
+	if entry.Header.Get(unconfirmedMarker) != "" {
+		// Nobody has confirmed the object behind this entry is encrypted.
+		// Serving it from disk must not hide that from the repair for as long
+		// as the entry lives — with no maximum age, that would be forever.
+		h.repairs.schedule(st, proxyReq.URL, entry.ETag(), "a cached read of an object not confirmed to be encrypted")
 	}
 	h.replayCachedResponse(w, r, entry, st.cacheResult)
 	return true
@@ -165,7 +165,7 @@ func (h *Handler) replayCachedResponse(w http.ResponseWriter, r *http.Request, e
 	for name, values := range entry.Header {
 		header[name] = values
 	}
-	header.Del(legacyMarker)
+	header.Del(unconfirmedMarker)
 	if etag := header.Get("Etag"); etag != "" {
 		// Stored normalized; this covers an entry from before that was so.
 		header.Set("Etag", s3.NormalizeETag(etag))
@@ -209,14 +209,14 @@ func canonicalizeConditions(header http.Header) {
 }
 
 // cacheHeaders is the part of a response worth storing with it, with its ETag
-// in standard syntax and the plaintext marker kept — see legacyMarker.
+// in standard syntax and the encryption marker kept — see unconfirmedMarker.
 func cacheHeaders(header http.Header) http.Header {
 	out := s3.CacheableResponseHeaders(header)
 	if etag := out.Get("Etag"); etag != "" {
 		out.Set("Etag", s3.NormalizeETag(etag))
 	}
-	if header.Get(legacyMarker) != "" {
-		out.Set(legacyMarker, "1")
+	if header.Get(unconfirmedMarker) != "" {
+		out.Set(unconfirmedMarker, "1")
 	}
 	return out
 }
@@ -442,6 +442,9 @@ func (h *Handler) finishMutation(resp *http.Response, st *requestState) {
 	// will report to within a second.
 	if date := resp.Header.Get("Date"); date != "" {
 		header.Set("Last-Modified", date)
+	}
+	if st.unconfirmed {
+		header.Set(unconfirmedMarker, "1")
 	}
 	st.mutation.Store(header)
 }

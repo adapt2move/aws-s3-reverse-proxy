@@ -130,7 +130,7 @@ func TestQuirkyETagsThroughARepair(t *testing.T) {
 	waitForRepair(t, store, key)
 	h.Close()
 
-	source := store.requestsWhere(func(r recordedRequest) bool { return r.method == http.MethodGet && !hasKey(r) })
+	source := store.requestsWhere(func(r recordedRequest) bool { return r.method == http.MethodGet && !hasKey(r) && len(r.query) == 0 })
 	require.NotEmpty(t, source)
 	assert.Equal(t, `"`+before.etag+`"`, source[len(source)-1].header.Get("If-Match"), "the source read is pinned with a standard validator")
 	complete := store.requestsWhere(isCompletion)

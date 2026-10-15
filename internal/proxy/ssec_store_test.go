@@ -79,6 +79,18 @@ type sseStore struct {
 	// is not the plaintext refusal, carrying this message.
 	refuseReads string
 
+	// aclStatus, when set, is the answer to every GET ?acl.
+	aclStatus int
+
+	// echoSignatureErrors answers every request 403 SignatureDoesNotMatch
+	// with the request it received quoted back, headers and all — which is
+	// what S3 does, and what puts a customer key into an error document.
+	echoSignatureErrors bool
+
+	// uploadOwner is the owner ListParts names for an upload; "owner-1",
+	// the owner of every object's default ACL, unless set.
+	uploadOwner string
+
 	// fail answers 500 to every request with this method.
 	fail string
 }
@@ -90,6 +102,9 @@ type sseObject struct {
 	etag     string // canonical
 	modified time.Time
 	tags     int
+
+	// grants are extra ACL grants beyond the owner's full control, as XML.
+	grants string
 }
 
 type sseUpload struct {
@@ -216,6 +231,25 @@ func (s *sseStore) serve(w http.ResponseWriter, r *http.Request) {
 		s.fault(w, r, http.StatusInternalServerError, "InternalError", "We encountered an internal error.")
 		return
 	}
+	if s.echoSignatureErrors {
+		var canonical strings.Builder
+		fmt.Fprintf(&canonical, "%s\n%s\n", r.Method, r.URL.Path)
+		for _, name := range []string{"X-Amz-Date", ssec.HeaderAlgorithm, ssec.HeaderKey, ssec.HeaderKeyMD5} {
+			fmt.Fprintf(&canonical, "%s:%s\n", strings.ToLower(name), r.Header.Get(name))
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>SignatureDoesNotMatch</Code>`+
+			`<Message>The request signature we calculated does not match the signature you provided.</Message>`+
+			`<AWSAccessKeyId>UPSTREAMKEYID</AWSAccessKeyId><StringToSign>AWS4-HMAC-SHA256</StringToSign>`+
+			`<CanonicalRequest>%s</CanonicalRequest><CanonicalRequestBytes>%x</CanonicalRequestBytes>`+
+			`<Resource>%s</Resource><RequestId>R1</RequestId></Error>`, canonical.String(), canonical.String(), r.URL.Path)
+		return
+	}
 	if s.quirkyETags {
 		for _, name := range []string{"If-Match", "If-None-Match", "If-Range"} {
 			if strings.Contains(r.Header.Get(name), "'") {
@@ -249,6 +283,8 @@ func (s *sseStore) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	case r.Method == http.MethodGet && query.Has("uploadId"):
 		s.listParts(w, r, query.Get("uploadId"))
+	case r.Method == http.MethodGet && query.Has("acl"):
+		s.getACL(w, r, key)
 	case r.Method == http.MethodPut:
 		s.putObject(w, r, key, keyMD5, body)
 	case r.Method == http.MethodGet, r.Method == http.MethodHead:
@@ -505,12 +541,34 @@ func (s *sseStore) listParts(w http.ResponseWriter, r *http.Request, id string) 
 		numbers = append(numbers, n)
 	}
 	sort.Ints(numbers)
+	owner := s.uploadOwner
+	if owner == "" {
+		owner = "owner-1"
+	}
 	w.Header().Set("Content-Type", "application/xml")
-	fmt.Fprintf(w, `<ListPartsResult><Key>%s</Key>`, upload.key)
+	fmt.Fprintf(w, `<ListPartsResult><Key>%s</Key><Owner><ID>%s</ID></Owner>`, upload.key, owner)
 	for _, n := range numbers {
 		fmt.Fprintf(w, `<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>`, n, xmlEscape(s.spell(upload.etags[n])))
 	}
 	fmt.Fprint(w, `</ListPartsResult>`)
+}
+
+// getACL answers like S3 for an object with the default ACL — its owner's
+// full control — plus whatever extra grants a test gave it.
+func (s *sseStore) getACL(w http.ResponseWriter, r *http.Request, key string) {
+	if s.aclStatus != 0 {
+		s.fault(w, r, s.aclStatus, "AccessDenied", "Access Denied.")
+		return
+	}
+	obj := s.objects[key]
+	if obj == nil {
+		s.fault(w, r, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.")
+		return
+	}
+	w.Header().Set("Content-Type", "application/xml")
+	fmt.Fprintf(w, `<AccessControlPolicy><Owner><ID>owner-1</ID></Owner><AccessControlList>`+
+		`<Grant><Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser"><ID>owner-1</ID></Grantee>`+
+		`<Permission>FULL_CONTROL</Permission></Grant>%s</AccessControlList></AccessControlPolicy>`, obj.grants)
 }
 
 func (s *sseStore) fault(w http.ResponseWriter, r *http.Request, status int, code, message string) {

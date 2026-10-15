@@ -241,6 +241,7 @@ changing a variable or a mounted file takes effect at the next restart.
 | `--shutdown-delay` (`SHUTDOWN_DELAY`) | `0s` | how long to keep serving after `/readyz` starts failing |
 | `--read-only` (`READ_ONLY`) | `false` | reject every mutation regardless of policy — a maintenance kill switch |
 | `--metrics-tenant-label` (`METRICS_TENANT_LABEL`) | `false` | add the tenant id as a Prometheus label |
+| `--upstream-sse-c-repair` (`UPSTREAM_SSE_C_REPAIR`) | `false` | with an SSE-C key, rewrite plaintext objects found by a read under it — see [Legacy plaintext objects](#legacy-plaintext-objects) |
 
 `--upstream-endpoint` decides the scheme, so one image serves an in-cluster
 S3-compatible backend over `http` and a hosted provider over `https` with no
@@ -692,14 +693,22 @@ refuses stays refused. In other words this mode asks for encryption and
 reports when the store does not confirm it; it cannot force a store that
 ignores SSE-C to encrypt.
 
+An upstream **error** is rebuilt from the fields a client may see (`Code`,
+`Message`, `Key`, `BucketName`, `Resource` and the request ids) before it
+is passed on, and the key is redacted from whatever is left. An object
+store's error describes the request it received, which is the proxy's
+re-signed one: `SignatureDoesNotMatch` quotes it whole, customer key and
+upstream access key id included.
+
 Reading an object encrypted under a **different** key (or, with no key
 configured, any SSE-C object) returns the store's error to the client and logs
 it at error level. It never triggers a read without the key, nor a rewrite.
 
 ### Legacy plaintext objects
 
-Objects written before the key existed are still served, and are encrypted
-the first time somebody reads them:
+Objects written before the key existed are always served. With
+`UPSTREAM_SSE_C_REPAIR=true` they are also encrypted the first time somebody
+reads them; without it they are left as they are, and the log says so:
 
 1. **Detection.** The pinned MinIO, like S3, refuses a read of a plaintext
    object that carries SSE-C headers (`400 InvalidRequest`, "The encryption
@@ -715,15 +724,20 @@ the first time somebody reads them:
    `Range` and conditions intact, and streamed back as usual, caching
    included. The read does not wait for the repair, and a failing repair never
    turns it into an error.
-3. **Repair**, in the background, at most two at a time:
+3. **Repair**, only with `UPSTREAM_SSE_C_REPAIR=true`, in the background, at
+   most two at a time:
    - observe the object (`HEAD` without the key): ETag, size,
      `Last-Modified`, version id, content headers and `x-amz-meta-*`;
+   - read its ACL, and go no further unless it is the default (the
+     owner's full control and nothing else);
    - start a multipart upload **with** the key, carrying those headers over;
    - stream the whole object (`GET`, `If-Match` the observed ETag) into parts
      of 16 MiB or more. Memory stays bounded whatever the object's size, and
      a ranged response is never used as the replacement body;
-   - observe again, and abandon if anything changed — including metadata
-     replaced in place, which can leave an ETag as it was;
+   - check that the upload will belong to the object's current owner;
+   - observe again, ACL included, and abandon if anything changed —
+     metadata replaced in place, which can leave an ETag as it was, or tags,
+     retention or a hold added while the parts were uploading;
    - complete the upload with `If-Match: "<observed ETag>"`. If anything
      replaced the object in the meantime the store answers `412`, and if it
      was deleted, `404`. The upload is aborted either way and nothing is
@@ -736,6 +750,27 @@ the first time somebody reads them:
    conditional SSE-C `PutObject` over a plaintext object is refused by MinIO.
    AWS S3 accepts `If-Match` on `CompleteMultipartUpload` and needs no key
    there for an upload without checksums.
+
+**Why repair is opt-in.** The completion's `If-Match` is the only condition
+an object store enforces on a replacement, and an ETag does not cover
+metadata: a writer that stores byte-identical content with new metadata
+leaves it unchanged. MinIO ignores `If-Unmodified-Since` on a completion,
+and AWS S3 does not offer it. So a writer that does exactly that, *without
+the key*, in the moment between the repair's last observation and its
+completion would have its metadata overwritten. Writes through this proxy
+always carry the key, which gives them a fresh ETag, so they are never
+affected. Turn repair on once nothing writes the bucket without the key.
+
+The rewrite gives an object the default ACL, so an object with any other
+grant is skipped rather than silently opened up or locked down, and so is
+one whose rewrite would change its owner. MinIO has no object ACLs and
+reports exactly the default.
+
+An object whose encryption is not confirmed — served without the key, read
+or written without the store confirming the key — is cached with that
+question attached. A cache hit on such an entry has the object checked
+again, within the same retry and suspension bounds, so a long cache
+lifetime cannot hide it.
 
 **Conditional writes** onto an object that is still plaintext need the same
 care. MinIO evaluates the precondition of a write that carries the key by
@@ -757,9 +792,10 @@ over a plaintext object would come back `400` instead of `200` or `412`:
 A repair is **skipped**, and the reason logged, when the proxy runs with
 `--read-only`, when no level of the current policy may write the path (an
 operator who made a path read-only for everybody did not mean it to be
-rewritten), when the object has tags, object-lock retention or a legal hold
-(a rewrite would drop them), when it is archived, or when the store gave no
-strong ETag. A store that answers `501` to the conditional completion gets no
+rewritten), when the object has tags, object-lock retention, a legal hold or
+access grants beyond its owner's (a rewrite would drop them), when its ACL
+cannot be read, when the rewrite would change its owner, when it is
+archived, or when the store gave no strong ETag. A store that answers `501` to the conditional completion gets no
 repairs at all, rather than unconditional ones; neither does a store that
 accepts a repair's encrypted write without confirming it. Both suspend repairs
 for an hour, so a bucket is not rewritten object by object to no effect. An
@@ -771,16 +807,15 @@ What an operator should know before turning this on:
 
   * **Credentials.** The proxy's upstream credentials need to write the
     objects they read: `PutObject` and the multipart actions, including
-    `AbortMultipartUpload`.
+    `AbortMultipartUpload` and `ListMultipartUploadParts`, plus
+    `GetObjectAcl` to check an object's grants before it is rewritten.
   * **Conditional writes.** The store must enforce `If-Match` on
     `CompleteMultipartUpload` (AWS S3 and MinIO do). A store that silently
-    ignores the header cannot be told apart from one that honours it; the
-    observation just before completion narrows that window but cannot close
-    it.
+    ignores the header cannot be told apart from one that honours it.
   * **What changes.** A repaired object has the same bytes, content headers
     and user metadata, and a new ETag, `Last-Modified` and (in a versioned
     bucket) version id. A versioned bucket keeps the plaintext as the previous
-    version. Object ACLs and stored checksums are not carried over.
+    version. Stored checksums are not carried over.
   * **Traffic.** Each repair reads the object once more and writes it once.
   * **Coverage.** Only objects that are read get repaired. Objects nobody
     reads, failed or skipped repairs and old versions stay in plaintext. This

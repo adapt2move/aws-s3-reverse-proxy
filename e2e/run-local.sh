@@ -196,7 +196,7 @@ start_proxy variant-b e2e/policies/policy-b.yaml 18299 18300
 start_proxy variant-ro e2e/policies/policy-a.yaml 18399 18400 --read-only
 start_cache_proxy variant-cache e2e/policies/policy-a.yaml 18499 18500 "$work/cache"
 PROXY_UPSTREAM=https://127.0.0.1:19443 SSL_CERT_FILE="$work/certs/public.crt" \
-UPSTREAM_SSE_C_KEY_FILE="$work/sse-c-key" CACHE_PURGE_TOKEN=an-e2e-purge-token \
+UPSTREAM_SSE_C_KEY_FILE="$work/sse-c-key" UPSTREAM_SSE_C_REPAIR=true CACHE_PURGE_TOKEN=an-e2e-purge-token \
   start_proxy variant-ssec e2e/policies/policy-a.yaml 18599 18600 \
     --cache-dir="$work/ssec-cache" --cache-max-bytes=67108864 \
     --cache-max-object-size=8388608 --cache-max-age=3s

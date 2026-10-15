@@ -247,7 +247,7 @@ func (h *Handler) relayError(w http.ResponseWriter, resp *http.Response, st *req
 // writeRelayedError writes an upstream error document with the tenant prefix
 // taken back out of it, as the response rewrite would have.
 func (h *Handler) writeRelayedError(w http.ResponseWriter, status int, contentType string, body []byte, st *requestState) {
-	body = s3.StripKeyPrefix(body, st.identity.KeyPrefix)
+	body = s3.StripKeyPrefix(h.sanitizeErrorBody(body), st.identity.KeyPrefix)
 	if contentType != "" {
 		w.Header().Set("Content-Type", contentType)
 	}

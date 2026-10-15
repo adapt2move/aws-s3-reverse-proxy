@@ -251,18 +251,22 @@ var (
 	errNoConditionalWrites = errors.New("the object store does not support conditional replacement (If-Match on CompleteMultipartUpload)")
 )
 
+// skipReason is a repair that stopped because the object is one it must not
+// rewrite, found out partway through.
+type skipReason string
+
+func (s skipReason) Error() string { return string(s) }
+
 // run is one repair, start to finish.
 func (r *repairer) run(job repairJob) {
 	h := r.h
 	logger := h.objectLog(job.st).WithField("operation", "EncryptLegacyObject")
-	if reason := r.prohibited(job.st); reason != "" {
-		logger.Warn("not encrypting a plaintext object: " + reason)
-		return
-	}
-
 	ctx, cancel := context.WithTimeout(r.ctx, repairTimeout)
 	defer cancel()
 
+	// Classification comes first and runs whether or not this deployment
+	// rewrites anything: an object that turns out to be encrypted after all
+	// clears a cached entry that was still asking.
 	state, err := r.observe(ctx, &job.target)
 	switch {
 	case errors.Is(err, errNotPlaintext):
@@ -279,15 +283,32 @@ func (r *repairer) run(job repairJob) {
 		logger.WithError(err).Warn("not encrypting: the object's encryption state could not be established")
 		return
 	}
+	if !h.cfg.RepairPlaintext {
+		logger.Info("not encrypting a plaintext object: repair is off; set UPSTREAM_SSE_C_REPAIR=true " +
+			"once nothing writes the bucket without the key")
+		return
+	}
+	if reason := r.prohibited(job.st); reason != "" {
+		logger.Warn("not encrypting a plaintext object: " + reason)
+		return
+	}
 	if reason := state.unrepairable(); reason != "" {
 		logger.Warn("not encrypting a plaintext object: " + reason)
 		return
 	}
+	acl, reason := r.readACL(ctx, &job.target)
+	if reason != "" {
+		logger.Warn("not encrypting a plaintext object: " + reason)
+		return
+	}
 
-	err = r.rewrite(ctx, &job.target, job.st, state)
+	err = r.rewrite(ctx, &job.target, job.st, state, acl)
+	var skipped skipReason
 	switch {
 	case err == nil:
 		logger.WithField("size", state.size).Info("encrypted a plaintext object with the configured SSE-C key")
+	case errors.As(err, &skipped):
+		logger.Warn("not encrypting a plaintext object: " + string(skipped))
 	case errors.Is(err, errChanged), errors.Is(err, errGone):
 		logger.WithError(err).Info("abandoned encrypting a plaintext object")
 	case errors.Is(err, errUnconfirmed):
@@ -338,6 +359,11 @@ type objectState struct {
 	// preserved are the headers a rewrite carries over to the new object.
 	preserved http.Header
 
+	// guarded are the headers that decide whether the object may be
+	// rewritten at all — tags, retention, archival — beside the preserved
+	// ones. Any change to them between two observations is a change.
+	guarded http.Header
+
 	// header is the whole response, for the checks that decide whether the
 	// object can be rewritten at all.
 	header http.Header
@@ -352,6 +378,7 @@ func observeState(resp *http.Response) *objectState {
 		modified:  resp.Header.Get("Last-Modified"),
 		version:   resp.Header.Get("X-Amz-Version-Id"),
 		preserved: preservedHeaders(resp.Header),
+		guarded:   guardedHeaders(resp.Header),
 		header:    resp.Header.Clone(),
 	}
 }
@@ -370,6 +397,18 @@ func preservedHeaders(header http.Header) http.Header {
 			out[canonical] = values
 		case canonical == "X-Amz-Storage-Class" && !strings.EqualFold(header.Get(name), "STANDARD"):
 			out[canonical] = values
+		}
+	}
+	return out
+}
+
+// guardedHeaders are the headers unrepairable decides on.
+func guardedHeaders(header http.Header) http.Header {
+	out := http.Header{}
+	for _, name := range []string{"X-Amz-Tagging-Count", "X-Amz-Object-Lock-Mode", "X-Amz-Object-Lock-Retain-Until-Date",
+		"X-Amz-Object-Lock-Legal-Hold", "X-Amz-Storage-Class", "X-Amz-Restore"} {
+		if values := header.Values(name); len(values) > 0 {
+			out[name] = values
 		}
 	}
 	return out
@@ -412,7 +451,7 @@ func (s *objectState) unrepairable() string {
 func (s *objectState) sameAs(other *objectState) bool {
 	return s.etag == other.etag && s.weak == other.weak && s.size == other.size &&
 		s.modified == other.modified && s.version == other.version &&
-		reflect.DeepEqual(s.preserved, other.preserved)
+		reflect.DeepEqual(s.preserved, other.preserved) && reflect.DeepEqual(s.guarded, other.guarded)
 }
 
 // observe establishes the object's state with a HEAD without the key.
@@ -438,7 +477,7 @@ func (r *repairer) observe(ctx context.Context, target *url.URL) (*objectState, 
 
 // rewrite replaces the object with an encrypted copy of itself, conditional
 // on it still being the version observed.
-func (r *repairer) rewrite(ctx context.Context, target *url.URL, st *requestState, state *objectState) (err error) {
+func (r *repairer) rewrite(ctx context.Context, target *url.URL, st *requestState, state *objectState, acl *objectACL) (err error) {
 	uploadID, err := r.createUpload(ctx, target, state.preserved)
 	if err != nil {
 		return err
@@ -449,6 +488,15 @@ func (r *repairer) rewrite(ctx context.Context, target *url.URL, st *requestStat
 			r.abortUpload(target, uploadID)
 		}
 	}()
+
+	// The rewritten object belongs to whoever the store makes the owner of
+	// this upload. If that is not the object's owner now, the rewrite would
+	// hand the object to somebody else.
+	if owner, err := r.uploadOwner(ctx, target, uploadID); err != nil {
+		return skipReason("the owner the rewritten object would have could not be read: " + err.Error())
+	} else if acl.owner != "" && owner != "" && owner != acl.owner {
+		return skipReason("the rewritten object would belong to another owner")
+	}
 
 	source, err := r.openSource(ctx, target, state)
 	if err != nil {
@@ -468,7 +516,18 @@ func (r *repairer) rewrite(ctx context.Context, target *url.URL, st *requestStat
 	if err != nil {
 		return err
 	}
+	// Exclusions are decided again on what the store says now: tags or a
+	// hold added while the parts were uploading would be dropped by the
+	// replacement as surely as ones that were there from the start.
+	if reason := now.unrepairable(); reason != "" {
+		return skipReason(reason)
+	}
 	if !now.sameAs(state) {
+		return errChanged
+	}
+	if again, reason := r.readACL(ctx, target); reason != "" {
+		return skipReason(reason)
+	} else if !again.equal(acl) {
 		return errChanged
 	}
 
@@ -709,6 +768,89 @@ func (r *repairer) send(ctx context.Context, method string, target *url.URL, raw
 		return nil, err
 	}
 	return r.h.transport.RoundTrip(req)
+}
+
+// objectACL is an object's access control list, reduced to what decides
+// whether a rewrite keeps it: the owner, and every grant.
+type objectACL struct {
+	owner  string
+	grants []aclGrant
+}
+
+type aclGrant struct {
+	Type       string `xml:"Grantee>Type"`
+	ID         string `xml:"Grantee>ID"`
+	URI        string `xml:"Grantee>URI"`
+	Email      string `xml:"Grantee>EmailAddress"`
+	Permission string `xml:"Permission"`
+}
+
+func (a *objectACL) equal(b *objectACL) bool {
+	return a.owner == b.owner && reflect.DeepEqual(a.grants, b.grants)
+}
+
+// readACL reads the object's ACL, and reports why the object must not be
+// rewritten when it cannot be read or holds anything a new object would not.
+//
+// A rewritten object gets the default ACL — its owner's full control and
+// nothing else — because there is no way to pass an arbitrary ACL along
+// without also handing the client-facing policy a decision it does not model.
+// An object that has that ACL already loses nothing. Any other grant would be
+// silently dropped, so such an object is left as it is. MinIO has no object
+// ACLs, and answers with exactly the default.
+func (r *repairer) readACL(ctx context.Context, target *url.URL) (*objectACL, string) {
+	resp, err := r.send(ctx, http.MethodGet, target, "acl", nil, 0, sigv4.EmptyPayloadSHA256, nil)
+	if err != nil {
+		return nil, "its access control list could not be read: " + err.Error()
+	}
+	defer drain(resp)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return nil, fmt.Sprintf("its access control list could not be read (status %d)", resp.StatusCode)
+	}
+	var doc struct {
+		Owner  string     `xml:"Owner>ID"`
+		Grants []aclGrant `xml:"AccessControlList>Grant"`
+	}
+	if err := xml.Unmarshal(body, &doc); err != nil {
+		return nil, "its access control list could not be parsed"
+	}
+	acl := &objectACL{owner: doc.Owner, grants: doc.Grants}
+	if len(acl.grants) != 1 {
+		return nil, "it has access grants beyond its owner's, which a rewrite would drop"
+	}
+	grant := acl.grants[0]
+	if grant.Permission != "FULL_CONTROL" || grant.URI != "" || grant.Email != "" ||
+		(grant.Type != "" && grant.Type != "CanonicalUser") || grant.ID != acl.owner {
+		return nil, "it has access grants beyond its owner's, which a rewrite would drop"
+	}
+	return acl, ""
+}
+
+// uploadOwner is the owner the store records for an upload, which is the owner
+// the object it completes will have. Empty when the store names none.
+func (r *repairer) uploadOwner(ctx context.Context, target *url.URL, uploadID string) (string, error) {
+	header := http.Header{}
+	r.h.cfg.UpstreamSSECKey.Apply(header)
+	resp, err := r.send(ctx, http.MethodGet, target, url.Values{"uploadId": {uploadID}}.Encode(), nil, 0, sigv4.EmptyPayloadSHA256, header)
+	if err != nil {
+		return "", err
+	}
+	defer drain(resp)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("listing the upload's parts answered %d", resp.StatusCode)
+	}
+	var doc struct {
+		Owner string `xml:"Owner>ID"`
+	}
+	if err := xml.Unmarshal(body, &doc); err != nil {
+		return "", errors.New("listing the upload's parts returned an unreadable document")
+	}
+	return doc.Owner, nil
 }
 
 // invalidate drops whatever the cache holds for the object a request named.

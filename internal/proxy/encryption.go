@@ -34,12 +34,16 @@ import (
 )
 
 const (
-	// legacyMarker travels on a response the proxy had to fetch without the
-	// key because the object is still stored in plaintext. It reaches the
-	// cache — so a hit on that entry can still schedule the object's
-	// encryption instead of hiding it until the entry expires — and never
-	// the client.
-	legacyMarker = "X-S3proxy-Upstream-Plaintext"
+	// unconfirmedMarker travels on a response whose object is not known to
+	// be stored encrypted: one the proxy had to fetch without the key
+	// because the object is plaintext, a read the store answered without
+	// confirming the key, and an upload it accepted without confirming it.
+	// It reaches the cache — so a hit on that entry still has the object's
+	// state checked, and its encryption scheduled, instead of hiding both
+	// for as long as the entry lives — and never the client. It records a
+	// question, not an answer: the repair establishes the object's state
+	// itself before it writes anything.
+	unconfirmedMarker = "X-S3proxy-Encryption-Unconfirmed"
 
 	// maxErrorBodySize bounds the error document read to classify a refused
 	// read. S3 error bodies are a few hundred bytes.
@@ -111,8 +115,10 @@ func (h *Handler) checkWriteConfirmation(resp *http.Response, st *requestState) 
 	}
 	switch key.Check(resp.Header) {
 	case ssec.Unconfirmed:
+		st.unconfirmed = true
 		h.objectLog(st).Warn("the object store accepted a write without confirming SSE-C; the object may be stored unencrypted")
 	case ssec.Mismatched:
+		st.unconfirmed = true
 		h.objectLog(st).Warn("the object store confirmed a write with SSE-C parameters other than the configured key's")
 	}
 }
@@ -135,7 +141,7 @@ func (h *Handler) objectLog(st *requestState) *log.Entry {
 // encryption, and the key digest the store confirmed is the operator's.
 func hideEncryption(header http.Header) {
 	ssec.StripCustomerHeaders(header)
-	header.Del(legacyMarker)
+	header.Del(unconfirmedMarker)
 }
 
 // roundTrip sends one upstream request. It is the reverse proxy's transport
@@ -218,7 +224,9 @@ func (h *Handler) inspectRead(req *http.Request, resp *http.Response) *http.Resp
 		case ssec.Unconfirmed:
 			// The store answered without confirming the key. That is not
 			// proof the object is plaintext — only the repair's own probe
-			// can establish that — so nothing here changes the response.
+			// can establish that — so the response is served as it is, and
+			// marked so a cached copy of it keeps asking.
+			resp.Header.Set(unconfirmedMarker, "1")
 			h.repairs.schedule(st, req.URL, resp.Header.Get("Etag"), "a read with the key was answered without confirming it")
 		}
 	}
@@ -338,7 +346,7 @@ func (h *Handler) readPlaintext(req *http.Request, refused *http.Response, st *r
 	}
 	drain(refused)
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent {
-		resp.Header.Set(legacyMarker, "1")
+		resp.Header.Set(unconfirmedMarker, "1")
 	}
 	readLog(req, st).Info("served an object stored without SSE-C")
 	h.repairs.scheduleObserved(st, req.URL, state)

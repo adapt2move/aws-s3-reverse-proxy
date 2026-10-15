@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
@@ -85,6 +86,13 @@ type Key struct {
 	encoded    string
 	encodedMD5 string
 	label      string
+
+	// spellings matches every form the key or its digest could take in a
+	// document an object store sends back: Base64, percent-encoded Base64
+	// with escapes in either case, the hex of the raw key, and the hex of
+	// the Base64 text, which is how S3 renders a canonical request in a
+	// SignatureDoesNotMatch error.
+	spellings *regexp.Regexp
 }
 
 // Parse validates the Base64 form of a key: standard alphabet, padded, and
@@ -111,8 +119,38 @@ func Parse(encoded string) (*Key, error) {
 		encodedMD5: base64.StdEncoding.EncodeToString(sum[:]),
 		label:      hex.EncodeToString(mac.Sum(nil)[:16]),
 	}
+	var alternatives []string
+	for _, secret := range []string{k.encoded, k.encodedMD5} {
+		var escaped strings.Builder
+		for _, c := range secret {
+			switch c {
+			case '+':
+				escaped.WriteString(`(?:\+|%(?i:2b))`)
+			case '/':
+				escaped.WriteString(`(?:/|%(?i:2f))`)
+			case '=':
+				escaped.WriteString(`(?:=|%(?i:3d))`)
+			default:
+				escaped.WriteString(regexp.QuoteMeta(string(c)))
+			}
+		}
+		alternatives = append(alternatives, escaped.String(), `(?i:`+hex.EncodeToString([]byte(secret))+`)`)
+	}
+	alternatives = append(alternatives, `(?i:`+hex.EncodeToString(raw)+`)`)
+	k.spellings = regexp.MustCompile(strings.Join(alternatives, "|"))
 	clear(raw)
 	return k, nil
+}
+
+// Redacted is what Redact puts where key material was.
+const Redacted = "[redacted]"
+
+// Redact replaces every spelling of the key and of its digest in b. It is
+// for documents the object store sends back — an error that echoes the
+// request it refused can quote the key verbatim — and costs a scan per
+// document, which is nothing next to the round trip that produced it.
+func (k *Key) Redact(b []byte) []byte {
+	return k.spellings.ReplaceAllLiteral(b, []byte(Redacted))
 }
 
 // Apply sets the three request headers that ask the object store to encrypt

@@ -30,6 +30,7 @@ func newEncryptingProxy(t *testing.T, store *sseStore, tweaks ...func(*Config)) 
 	cfg.UpstreamEndpoint = store.host()
 	cfg.rootCAs = store.rootCAs()
 	cfg.UpstreamSSECKey = mustKey(t, testKeyEncoded)
+	cfg.RepairPlaintext = true
 	for _, tweak := range tweaks {
 		tweak(&cfg)
 	}
@@ -298,7 +299,7 @@ func TestAPlaintextObjectIsServedAndThenEncrypted(t *testing.T) {
 	require.Equal(t, http.StatusOK, get.StatusCode)
 	assert.Equal(t, "legacy,bytes\n", readBody(t, get))
 	assert.Equal(t, "text/csv", get.Header.Get("Content-Type"))
-	assert.Empty(t, get.Header.Get(legacyMarker), "the marker is never shown to a client")
+	assert.Empty(t, get.Header.Get(unconfirmedMarker), "the marker is never shown to a client")
 
 	after := waitForRepair(t, store, key)
 	assert.Equal(t, digestOf(testKeyEncoded), after.keyMD5)
@@ -699,7 +700,7 @@ func TestARepairInvalidatesWhatTheCacheHeld(t *testing.T) {
 
 	hit := clientGet(t, h, "datasets/legacy.csv", nil)
 	require.Equal(t, "HIT", hit.Header.Get("X-Cache"))
-	assert.Empty(t, hit.Header.Get(legacyMarker))
+	assert.Empty(t, hit.Header.Get(unconfirmedMarker))
 	staleETag := hit.Header.Get("Etag")
 
 	store.mu.Lock()

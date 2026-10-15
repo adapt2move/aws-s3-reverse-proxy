@@ -255,6 +255,9 @@ services:
       UPSTREAM_SECRET_ACCESS_KEY: minioadmin123
       CREDENTIAL_PEPPER: an-e2e-deployment-wide-pepper
       UPSTREAM_SSE_C_KEY: "${E2E_STACK_SSEC_KEY:-AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=}"
+      # Nothing but the suite writes this bucket, and the suite's direct
+      # writes carry the key except where a test stages a legacy object.
+      UPSTREAM_SSE_C_REPAIR: "true"
       SSL_CERT_FILE: /etc/ssl/private-ca/public.crt
       METRICS_LISTEN_ADDR: ":8100"
       VERBOSE: "true"
@@ -285,6 +288,7 @@ services:
       UPSTREAM_CREDENTIALS_FILE: /etc/s3proxy/secrets/upstream-credentials
       CREDENTIAL_PEPPER_FILE: /etc/s3proxy/secrets/pepper
       UPSTREAM_SSE_C_KEY_FILE: /etc/s3proxy/secrets/sse-c-key
+      UPSTREAM_SSE_C_REPAIR: "true"
       SSL_CERT_FILE: /etc/ssl/private-ca/public.crt
       METRICS_LISTEN_ADDR: ":8100"
       CACHE_DIR: /var/cache/s3proxy-ssec

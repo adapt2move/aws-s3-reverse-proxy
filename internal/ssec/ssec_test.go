@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/md5"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -109,4 +111,34 @@ func TestCustomerHeaderFamily(t *testing.T) {
 		assert.False(t, IsCustomerHeader(name), name)
 	}
 	assert.True(t, HasCustomerHeader(http.Header{"X-Amz-Server-Side-Encryption-Customer-Key": {""}}), "an empty value still asks for it")
+}
+
+// An error document can quote the request it refused, key and all, in more
+// than one spelling.
+func TestRedactRemovesEverySpelling(t *testing.T) {
+	raw := bytes.Repeat([]byte{0xfb}, KeySize) // Base64 with + and /
+	key, err := Parse(base64.StdEncoding.EncodeToString(raw))
+	require.NoError(t, err)
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	sum := md5.Sum(raw)
+	digest := base64.StdEncoding.EncodeToString(sum[:])
+
+	for _, spelling := range []string{
+		encoded,
+		digest,
+		url.QueryEscape(encoded),
+		strings.ToLower(url.QueryEscape(encoded)[:3]) + url.QueryEscape(encoded)[3:],
+		hex.EncodeToString([]byte(encoded)),
+		strings.ToUpper(hex.EncodeToString([]byte("x-amz-server-side-encryption-customer-key:" + encoded))),
+		hex.EncodeToString(raw),
+	} {
+		doc := []byte("<Error><CanonicalRequest>before " + spelling + " after</CanonicalRequest></Error>")
+		out := string(key.Redact(doc))
+		assert.Contains(t, out, Redacted, spelling)
+		assert.NotContains(t, out, encoded)
+		assert.NotContains(t, out, digest)
+		assert.NotContains(t, strings.ToLower(out), hex.EncodeToString([]byte(encoded)))
+	}
+	untouched := []byte("<Error><Code>AccessDenied</Code></Error>")
+	assert.Equal(t, untouched, key.Redact(untouched))
 }

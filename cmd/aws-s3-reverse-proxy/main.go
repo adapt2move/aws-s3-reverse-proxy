@@ -149,6 +149,7 @@ func buildProxy(opts config.Options) (*proxy.Handler, *policy.Store, *cache.Cach
 		CacheWrites:       opts.CacheWrites,
 		CacheRangeFills:   opts.CacheRangeFills,
 		UpstreamSSECKey:   opts.UpstreamSSECKey,
+		RepairPlaintext:   opts.UpstreamSSECRepair,
 	})
 	if err != nil {
 		if objectCache != nil {
@@ -302,12 +303,23 @@ func logStartup(opts config.Options, handler *proxy.Handler, store *policy.Store
 // what it does not.
 func logEncryptionStartup(opts config.Options) {
 	if opts.UpstreamSSECKey == nil {
+		if opts.UpstreamSSECRepair {
+			log.Warnf("UPSTREAM_SSE_C_REPAIR is set without an UPSTREAM_SSE_C_KEY; it has no effect.")
+		}
 		return
 	}
-	log.Infof("Upstream SSE-C is on: object reads and writes carry the configured customer key, " +
-		"and plaintext objects found by a read are re-encrypted in place in the background.")
-	if opts.ReadOnly {
+	log.Infof("Upstream SSE-C is on: object reads and writes carry the configured customer key.")
+	switch {
+	case !opts.UpstreamSSECRepair:
+		log.Infof("Plaintext objects found by a read are served and left as they are " +
+			"(UPSTREAM_SSE_C_REPAIR is off).")
+	case opts.ReadOnly:
 		log.Infof("Read-only mode: plaintext objects are served, but not re-encrypted.")
+	default:
+		log.Warnf("Plaintext objects found by a read are re-encrypted in place in the background " +
+			"(UPSTREAM_SSE_C_REPAIR). This assumes nothing writes the bucket without the key: such a " +
+			"writer replacing an object with identical bytes and new metadata just before a rewrite " +
+			"lands would lose that metadata.")
 	}
 	if opts.CacheEnabled() {
 		log.Warnf("The object cache holds decrypted object bytes: SSE-C protects the object store, "+
