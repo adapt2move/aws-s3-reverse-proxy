@@ -136,3 +136,99 @@ func TestLoadSecrets(t *testing.T) {
 		assert.Contains(t, err.Error(), envUpstreamCredentials)
 	})
 }
+
+// The SSE-C key is the one secret whose absence and whose emptiness must not
+// mean the same thing: an operator who meant to turn encryption on and ended
+// up with an empty value would otherwise get a proxy that writes plaintext.
+func TestLoadSSECKey(t *testing.T) {
+	valid := "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+	base := func(t *testing.T) {
+		t.Setenv(envUpstreamCredentials, "AKID,secret-value")
+		t.Setenv(envCredentialPepper, "a-sufficiently-long-pepper")
+	}
+	unset := func(t *testing.T, name string) {
+		// t.Setenv first, so the variable is restored afterwards.
+		t.Setenv(name, "")
+		require.NoError(t, os.Unsetenv(name))
+	}
+
+	t.Run("absent disables it", func(t *testing.T) {
+		base(t)
+		unset(t, envUpstreamSSECKey)
+		unset(t, envUpstreamSSECKey+"_FILE")
+		var opts Options
+		require.NoError(t, LoadSecrets(&opts))
+		assert.Nil(t, opts.UpstreamSSECKey)
+	})
+
+	t.Run("from the environment", func(t *testing.T) {
+		base(t)
+		unset(t, envUpstreamSSECKey+"_FILE")
+		t.Setenv(envUpstreamSSECKey, valid)
+		var opts Options
+		require.NoError(t, LoadSecrets(&opts))
+		require.NotNil(t, opts.UpstreamSSECKey)
+	})
+
+	t.Run("from a mounted file, trailing newline and all", func(t *testing.T) {
+		base(t)
+		unset(t, envUpstreamSSECKey)
+		path := filepath.Join(t.TempDir(), "key")
+		require.NoError(t, os.WriteFile(path, []byte(valid+"\n"), 0o600))
+		t.Setenv(envUpstreamSSECKey+"_FILE", path)
+		var opts Options
+		require.NoError(t, LoadSecrets(&opts))
+		require.NotNil(t, opts.UpstreamSSECKey)
+
+		// Loaded once: changing the file afterwards changes nothing about
+		// the key this process already holds.
+		label := opts.UpstreamSSECKey.Label()
+		require.NoError(t, os.WriteFile(path, []byte("AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="), 0o600))
+		assert.Equal(t, label, opts.UpstreamSSECKey.Label())
+	})
+
+	for name, setup := range map[string]func(t *testing.T){
+		"an explicitly empty value": func(t *testing.T) {
+			unset(t, envUpstreamSSECKey+"_FILE")
+			t.Setenv(envUpstreamSSECKey, "")
+		},
+		"an explicitly empty file path": func(t *testing.T) {
+			unset(t, envUpstreamSSECKey)
+			t.Setenv(envUpstreamSSECKey+"_FILE", "")
+		},
+		"an unreadable file": func(t *testing.T) {
+			unset(t, envUpstreamSSECKey)
+			t.Setenv(envUpstreamSSECKey+"_FILE", filepath.Join(t.TempDir(), "missing"))
+		},
+		"an empty file": func(t *testing.T) {
+			unset(t, envUpstreamSSECKey)
+			path := filepath.Join(t.TempDir(), "key")
+			require.NoError(t, os.WriteFile(path, []byte("\n"), 0o600))
+			t.Setenv(envUpstreamSSECKey+"_FILE", path)
+		},
+		"a malformed value": func(t *testing.T) {
+			unset(t, envUpstreamSSECKey+"_FILE")
+			t.Setenv(envUpstreamSSECKey, "not-a-key")
+		},
+		"a key of the wrong length": func(t *testing.T) {
+			unset(t, envUpstreamSSECKey+"_FILE")
+			t.Setenv(envUpstreamSSECKey, "AQEBAQEBAQEBAQEBAQEBAQ==")
+		},
+		"both sources at once": func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "key")
+			require.NoError(t, os.WriteFile(path, []byte(valid), 0o600))
+			t.Setenv(envUpstreamSSECKey, valid)
+			t.Setenv(envUpstreamSSECKey+"_FILE", path)
+		},
+	} {
+		t.Run(name+" fails", func(t *testing.T) {
+			base(t)
+			setup(t)
+			var opts Options
+			err := LoadSecrets(&opts)
+			require.Error(t, err)
+			assert.Nil(t, opts.UpstreamSSECKey)
+			assert.NotContains(t, err.Error(), valid, "the error never repeats a key")
+		})
+	}
+}

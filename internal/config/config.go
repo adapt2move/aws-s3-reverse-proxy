@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/alecthomas/kingpin/v2"
+
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/ssec"
 )
 
 // Options is the parsed configuration of one process.
@@ -66,6 +68,10 @@ type Options struct {
 	UpstreamAccessKeyID     string
 	UpstreamSecretAccessKey string
 	Pepper                  []byte
+
+	// UpstreamSSECKey is the customer key every object is encrypted with
+	// upstream. Nil — no key configured — leaves upstream encryption alone.
+	UpstreamSSECKey *ssec.Key
 }
 
 // Parse defines and parses the raw command line arguments.
@@ -137,14 +143,16 @@ const (
 	envUpstreamSecretKey    = "UPSTREAM_SECRET_ACCESS_KEY"
 	envCredentialPepper     = "CREDENTIAL_PEPPER"
 	envCachePurgeToken      = "CACHE_PURGE_TOKEN"
+	envUpstreamSSECKey      = "UPSTREAM_SSE_C_KEY"
 	minCredentialPepperSize = 16
 )
 
-// LoadSecrets reads the two secrets this proxy holds — the upstream
-// credentials and the derivation pepper — from the environment or from a
-// mounted file. Neither is a command line flag (they would show up in `ps`)
-// and neither may appear in the policy file (it is a ConfigMap, reviewed and
-// version-controlled like any other configuration).
+// LoadSecrets reads the secrets this proxy holds — the upstream credentials,
+// the derivation pepper, and optionally the purge token and the upstream SSE-C
+// key — from the environment or from a mounted file. None of them is a command
+// line flag (they would show up in `ps`) and none may appear in the policy file
+// (it is a ConfigMap, reviewed and version-controlled like any other
+// configuration, and hot-reloaded).
 func LoadSecrets(opts *Options) error {
 	combined, err := readSecretEnv(envUpstreamCredentials)
 	if err != nil {
@@ -187,7 +195,54 @@ func LoadSecrets(opts *Options) error {
 	if opts.CachePurgeToken, err = readSecretEnv(envCachePurgeToken); err != nil {
 		return err
 	}
-	return nil
+
+	opts.UpstreamSSECKey, err = loadSSECKey()
+	return err
+}
+
+// loadSSECKey reads the upstream SSE-C key, or returns nil when none is
+// configured.
+//
+// It is stricter than readSecretEnv about one thing: what counts as "not
+// configured". For the other secrets an empty value and an absent one mean
+// the same, because either way the process refuses to start or the feature
+// is plainly off. Here they must not. An operator who meant to turn
+// encryption on and ended up with an empty variable — a templating mistake,
+// a Secret with the wrong key name — would otherwise get a proxy that starts
+// cleanly and writes every object in plaintext. So only *absence* of both
+// variables disables SSE-C; anything that is present has to be a valid key.
+//
+// The key is read once, here. Nothing reloads it: changing the variable or
+// the mounted file takes effect at the next start, never halfway through the
+// life of a process whose cache and in-flight uploads were made with the old
+// one.
+func loadSSECKey() (*ssec.Key, error) {
+	value, haveValue := os.LookupEnv(envUpstreamSSECKey)
+	path, haveFile := os.LookupEnv(envUpstreamSSECKey + "_FILE")
+	switch {
+	case !haveValue && !haveFile:
+		return nil, nil
+	case haveValue && haveFile:
+		return nil, fmt.Errorf("set either %s or %s_FILE, not both", envUpstreamSSECKey, envUpstreamSSECKey)
+	case haveFile:
+		if path == "" {
+			return nil, fmt.Errorf("%s_FILE is set but empty", envUpstreamSSECKey)
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read %s_FILE: %v", envUpstreamSSECKey, err)
+		}
+		value = strings.TrimSpace(string(raw))
+	}
+	key, err := ssec.Parse(value)
+	if err != nil {
+		source := envUpstreamSSECKey
+		if haveFile {
+			source += "_FILE"
+		}
+		return nil, fmt.Errorf("%s: %v; it must be the Base64 encoding of 32 random bytes", source, err)
+	}
+	return key, nil
 }
 
 // readSecretEnv returns NAME, or the trimmed contents of the file NAME_FILE
