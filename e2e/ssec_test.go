@@ -517,3 +517,90 @@ func TestSSECTheKeyFileIsNotReloaded(t *testing.T) {
 		t.Fatal("E2E_SSEC_KEY does not match the key file")
 	}
 }
+
+// MinIO evaluates a write's precondition by reading the existing object with
+// the write's key, which fails for a plaintext object. A conditional write
+// through the proxy onto an object nobody has read since the key was set
+// must still get the answer S3 semantics promise — 200 or 412, never 400 —
+// and what it writes is encrypted.
+func TestSSECConditionalWritesOntoAPlaintextObject(t *testing.T) {
+	env := ssecSetup(t)
+	if env.ReadOnly {
+		t.Skip("this deployment runs with the mutation kill switch on")
+	}
+	headETag := func(key string) string {
+		out, err := env.RawAdmin(t).HeadObject(&s3.HeadObjectInput{
+			Bucket: aws.String(env.Bucket), Key: aws.String(env.UpstreamKey(env.TenantA, key)),
+		})
+		requireNoError(t, err, "reading the plaintext object's ETag")
+		return aws.StringValue(out.ETag)
+	}
+	put := func(key, body string, header http.Header) (int, string) {
+		resp := rawSignedRequest(t, env, http.MethodPut, "/"+env.Bucket+"/"+key, []byte(body), header, env.TenantA, env.WriteLevel)
+		defer resp.Body.Close()
+		answer, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(answer)
+	}
+
+	t.Run("PUT If-Match", func(t *testing.T) {
+		key := "datasets/ssec/conditional-put.csv"
+		putPlaintext(t, env, key, []byte("old"), "text/plain", nil)
+		if status, answer := put(key, "refused", http.Header{"If-Match": {`"not-the-etag"`}}); status != http.StatusPreconditionFailed {
+			t.Fatalf("a mismatched If-Match returned %d, want 412: %s", status, answer)
+		}
+		if status, answer := put(key, "accepted", http.Header{"If-Match": {headETag(key)}}); status != http.StatusOK {
+			t.Fatalf("a matching If-Match returned %d, want 200: %s", status, answer)
+		}
+		if !encryptedAtRest(t, env, key) {
+			t.Fatal("the conditional write was stored without the key")
+		}
+		got, err := getObject(t, env.Admin(t), env.Bucket, env.UpstreamKey(env.TenantA, key))
+		requireNoError(t, err, "reading the written object with the key")
+		if string(got) != "accepted" {
+			t.Fatalf("the bucket holds %q", got)
+		}
+	})
+
+	t.Run("PUT If-None-Match *", func(t *testing.T) {
+		key := "datasets/ssec/conditional-create.csv"
+		putPlaintext(t, env, key, []byte("already here"), "text/plain", nil)
+		if status, answer := put(key, "refused", http.Header{"If-None-Match": {"*"}}); status != http.StatusPreconditionFailed {
+			t.Fatalf("If-None-Match: * over an existing object returned %d, want 412: %s", status, answer)
+		}
+		got, err := getObject(t, env.RawAdmin(t), env.Bucket, env.UpstreamKey(env.TenantA, key))
+		requireNoError(t, err, "the object is untouched, in plaintext")
+		if string(got) != "already here" {
+			t.Fatalf("the bucket holds %q", got)
+		}
+	})
+
+	t.Run("CompleteMultipartUpload If-Match", func(t *testing.T) {
+		key := "datasets/ssec/conditional-complete.bin"
+		putPlaintext(t, env, key, []byte("old"), "application/octet-stream", nil)
+		client := env.Client(t, env.TenantA, env.WriteLevel)
+		created, err := client.CreateMultipartUpload(&s3.CreateMultipartUploadInput{Bucket: aws.String(env.Bucket), Key: aws.String(key)})
+		requireNoError(t, err, "create")
+		part, err := client.UploadPart(&s3.UploadPartInput{
+			Bucket: aws.String(env.Bucket), Key: aws.String(key), UploadId: created.UploadId,
+			PartNumber: aws.Int64(1), Body: bytes.NewReader([]byte("new")),
+		})
+		requireNoError(t, err, "upload part")
+		list := []byte(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>` + aws.StringValue(part.ETag) + `</ETag></Part></CompleteMultipartUpload>`)
+		resp := rawSignedRequest(t, env, http.MethodPost, "/"+env.Bucket+"/"+key+"?uploadId="+aws.StringValue(created.UploadId),
+			list, http.Header{"If-Match": {headETag(key)}}, env.TenantA, env.WriteLevel)
+		answer, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || bytes.Contains(answer, []byte("<Error>")) {
+			t.Fatalf("a matching conditional completion returned %d: %s", resp.StatusCode, answer)
+		}
+		if !encryptedAtRest(t, env, key) {
+			t.Fatal("the assembled object can be read without the key")
+		}
+		got, err := getObject(t, env.Admin(t), env.Bucket, env.UpstreamKey(env.TenantA, key))
+		requireNoError(t, err, "reading the assembled object with the key")
+		if string(got) != "new" {
+			t.Fatalf("the bucket holds %q", got)
+		}
+	})
+	noOpenUploads(t, env, 30*time.Second)
+}

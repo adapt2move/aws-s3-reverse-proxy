@@ -439,7 +439,7 @@ func (r *repairer) observe(ctx context.Context, target *url.URL) (*objectState, 
 // rewrite replaces the object with an encrypted copy of itself, conditional
 // on it still being the version observed.
 func (r *repairer) rewrite(ctx context.Context, target *url.URL, st *requestState, state *objectState) (err error) {
-	uploadID, err := r.createUpload(ctx, target, state)
+	uploadID, err := r.createUpload(ctx, target, state.preserved)
 	if err != nil {
 		return err
 	}
@@ -494,8 +494,8 @@ func (r *repairer) rewrite(ctx context.Context, target *url.URL, st *requestStat
 
 // createUpload starts the multipart upload the encrypted copy is written to,
 // carrying over the object's content headers and metadata.
-func (r *repairer) createUpload(ctx context.Context, target *url.URL, state *objectState) (string, error) {
-	header := state.preserved.Clone()
+func (r *repairer) createUpload(ctx context.Context, target *url.URL, preserved http.Header) (string, error) {
+	header := preserved.Clone()
 	r.h.cfg.UpstreamSSECKey.Apply(header)
 	resp, err := r.send(ctx, http.MethodPost, target, "uploads", nil, 0, sigv4.EmptyPayloadSHA256, header)
 	if err != nil {

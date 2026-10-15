@@ -143,8 +143,14 @@ func hideEncryption(header http.Header) {
 // interpreted the same way whoever made it.
 func (h *Handler) roundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := h.transport.RoundTrip(req)
-	if err != nil || !isObjectRead(req) {
+	if err != nil {
 		return resp, err
+	}
+	if h.cfg.UpstreamSSECKey != nil && isConditionalCompletion(req) {
+		return h.retryCompletionWithoutKey(req, resp), nil
+	}
+	if !isObjectRead(req) {
+		return resp, nil
 	}
 	return h.inspectRead(req, resp), nil
 }

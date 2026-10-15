@@ -737,6 +737,23 @@ the first time somebody reads them:
    AWS S3 accepts `If-Match` on `CompleteMultipartUpload` and needs no key
    there for an upload without checksums.
 
+**Conditional writes** onto an object that is still plaintext need the same
+care. MinIO evaluates the precondition of a write that carries the key by
+reading the existing object *with* that key, so `If-Match` or `If-None-Match`
+over a plaintext object would come back `400` instead of `200` or `412`:
+
+  * A conditional `PutObject` is preceded by a keyless `HEAD` of its target
+    (one extra round trip, only for conditional PUTs). If the target is
+    plaintext, the PUT is carried out as a one-part encrypted multipart
+    upload whose completion carries the client's own condition and no key,
+    so the store evaluates it against the object the client asked about.
+    The client gets an ordinary PUT answer; the object is encrypted. Its
+    flexible checksum headers are not carried over (`Content-MD5` is).
+  * A conditional `CompleteMultipartUpload` the store refuses that way is
+    sent once more without the key. Its body is already buffered, and the
+    assembled object is encrypted regardless, because the initiation and
+    every part carried the key.
+
 A repair is **skipped**, and the reason logged, when the proxy runs with
 `--read-only`, when no level of the current policy may write the path (an
 operator who made a path read-only for everybody did not mean it to be

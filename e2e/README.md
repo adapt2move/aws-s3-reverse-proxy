@@ -110,6 +110,7 @@ declines still streams rather than being buffered on its way past.
 | `TestSSECARepairNeverOverwritesAConcurrentWrite` | a replacement or a delete during a repair always wins |
 | `TestSSECALargePlaintextObjectIsRepairedInBoundedMemory` | a 256 MiB legacy object repaired through a 192 MiB container |
 | `TestSSECTheKeyFileIsNotReloaded` | rewriting the key file changes nothing before a restart |
+| `TestSSECConditionalWritesOntoAPlaintextObject` | `If-Match` / `If-None-Match` onto an unrepaired object get 200 or 412, never 400, and write encrypted |
 
 `TestLargeObjectStreamsThrough` is why `proxy-http` and `proxy-cache` run
 under `mem_limit`. A proxy that buffered the upload would be OOM-killed, so

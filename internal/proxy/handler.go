@@ -275,6 +275,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.serveConditionalPutOverPlaintext(rec, proxyReq, st) {
+		h.access.Finish(entry, rec.Status(), time.Since(start))
+		return
+	}
+
 	h.proxy.ServeHTTP(rec, proxyReq.WithContext(withRequestState(r.Context(), st)))
 	entry.Cache = st.cacheResult
 	h.access.Finish(entry, rec.Status(), time.Since(start))
