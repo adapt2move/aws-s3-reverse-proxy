@@ -1,11 +1,12 @@
-# The end-to-end stack: a real MinIO, and three proxies configured to agree
-# on as little as possible.
+# The end-to-end stack: a real MinIO, and six proxies configured to agree on
+# as little as possible.
 #
-# The four variants are the point. They differ in the access-key-id layout,
-# the level names, where a tenant's objects land, whether the upstream is
-# reached over http or https, where the secrets come from, and whether reads
-# are cached on local disk — while the suite that runs against them is
-# identical. Anything the proxy had baked in would fail at least one of them.
+# The variants are the point. They differ in the access-key-id layout, the
+# level names, where a tenant's objects land, whether the upstream is reached
+# over http or https, where the secrets come from, whether reads are cached
+# on local disk, and whether objects are encrypted upstream with a customer
+# key — while the suite that runs against them is identical. Anything the
+# proxy had baked in would fail at least one of them.
 
 services:
   # The in-cluster case: an S3-compatible store over plain http.
@@ -176,8 +177,8 @@ services:
       dockerfile: Dockerfile
     user: root
     entrypoint: ["/bin/sh", "-c"]
-    command: ["chown -R proxyuser:proxygroup /var/cache/s3proxy"]
-    volumes: ["cache:/var/cache/s3proxy"]
+    command: ["chown -R proxyuser:proxygroup /var/cache/s3proxy /var/cache/s3proxy-ssec"]
+    volumes: ["cache:/var/cache/s3proxy", "ssec-cache:/var/cache/s3proxy-ssec"]
 
   # Variant D — variant A's identity scheme with the local object cache on.
   #
@@ -228,6 +229,76 @@ services:
     mem_limit: 192m
     ports: ["18499:8099", "18500:8100"]
 
+  # Variant E — upstream SSE-C, with the key from the environment, no cache.
+  #
+  # SSE-C needs the https upstream: MinIO refuses a customer key over plain
+  # http, and so does the proxy at startup. The key itself is a fixed test
+  # value that run.sh hands to the suite as well, so the suite can read the
+  # bucket the way another holder of the key would. The memory cap is the
+  # same as variant A's, which is what makes the large legacy-object repair a
+  # test of bounded memory rather than of patience.
+  proxy-ssec:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      createbuckets: {condition: service_completed_successfully}
+    volumes:
+      - "./policies/policy-a.yaml:/etc/s3proxy/policy.yaml:ro"
+      - "certs:/etc/ssl/private-ca:ro"
+    environment:
+      POLICY_FILE: /etc/s3proxy/policy.yaml
+      ALLOWED_ENDPOINT: 127.0.0.1:18599
+      ALLOWED_SOURCE_SUBNET: 0.0.0.0/0
+      UPSTREAM_ENDPOINT: https://minio-tls:9000
+      UPSTREAM_ACCESS_KEY_ID: minioadmin
+      UPSTREAM_SECRET_ACCESS_KEY: minioadmin123
+      CREDENTIAL_PEPPER: an-e2e-deployment-wide-pepper
+      UPSTREAM_SSE_C_KEY: "${E2E_STACK_SSEC_KEY:-AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=}"
+      SSL_CERT_FILE: /etc/ssl/private-ca/public.crt
+      METRICS_LISTEN_ADDR: ":8100"
+      VERBOSE: "true"
+    mem_limit: 192m
+    ports: ["18599:8099", "18600:8100"]
+
+  # Variant F — upstream SSE-C with the key from a mounted file, and the
+  # cache on. The policy reload interval is short so the suite can show that
+  # rewriting the key file and waiting out a reload changes nothing.
+  proxy-ssec-cache:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      createbuckets: {condition: service_completed_successfully}
+      cache-dir: {condition: service_completed_successfully}
+    volumes:
+      - "./policies/policy-a.yaml:/etc/s3proxy/policy.yaml:ro"
+      - "./secrets:/etc/s3proxy/secrets:ro"
+      - "certs:/etc/ssl/private-ca:ro"
+      - "ssec-cache:/var/cache/s3proxy-ssec"
+    environment:
+      POLICY_FILE: /etc/s3proxy/policy.yaml
+      POLICY_RELOAD_INTERVAL: 2s
+      ALLOWED_ENDPOINT: 127.0.0.1:18699
+      ALLOWED_SOURCE_SUBNET: 0.0.0.0/0
+      UPSTREAM_ENDPOINT: https://minio-tls:9000
+      UPSTREAM_CREDENTIALS_FILE: /etc/s3proxy/secrets/upstream-credentials
+      CREDENTIAL_PEPPER_FILE: /etc/s3proxy/secrets/pepper
+      UPSTREAM_SSE_C_KEY_FILE: /etc/s3proxy/secrets/sse-c-key
+      SSL_CERT_FILE: /etc/ssl/private-ca/public.crt
+      METRICS_LISTEN_ADDR: ":8100"
+      CACHE_DIR: /var/cache/s3proxy-ssec
+      CACHE_MAX_BYTES: "67108864"
+      CACHE_MAX_OBJECT_SIZE: "8388608"
+      CACHE_MAX_AGE: 3s
+      CACHE_WRITES: "true"
+      CACHE_RANGE_FILLS: "true"
+      CACHE_PURGE_TOKEN: an-e2e-purge-token
+      VERBOSE: "true"
+    mem_limit: 192m
+    ports: ["18699:8099", "18700:8100"]
+
 volumes:
   certs:
   cache:
+  ssec-cache:

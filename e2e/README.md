@@ -13,7 +13,7 @@ MINIO_BINARY=./minio ./e2e/run-local.sh   # no Docker daemon needed
 
 ## Why it exists
 
-Four things are invisible to a suite with a stub upstream, and all four are
+Five things are invisible to a suite with a stub upstream, and all five are
 places this proxy can be wrong in production while passing every unit test:
 
 1. **A real object store verifies our signatures.** The proxy re-signs every
@@ -28,6 +28,12 @@ places this proxy can be wrong in production while passing every unit test:
 4. **A real bucket can be written to behind the proxy's back.** That is the
    one inconsistency the local cache cannot detect, so it is the one the
    suite has to stage for real — see `proxy-cache` below.
+5. **A real object store enforces SSE-C.** MinIO refuses a customer key over
+   plain http, refuses to read a plaintext object with one, refuses an
+   encrypted object without it, and evaluates a conditional write against
+   the stored object. The legacy-object repair has to work with all of that,
+   so it is tested against it rather than against a mock that would accept
+   anything — see `proxy-ssec` below.
 
 Every assertion that matters is made twice: once against what the client
 sees, and once against what is actually in the bucket, read with root
@@ -40,16 +46,17 @@ The suite is parameterised entirely by environment. The same test binary runs
 against deployments that agree on almost nothing, which is what demonstrates
 that no tenant, level name or key layout is baked into the proxy:
 
-| | `proxy-http` | `proxy-tls` | `proxy-readonly` | `proxy-cache` |
-| --- | --- | --- | --- | --- |
-| upstream | `http://minio:9000` | `https://minio-tls:9000`, private CA | `http://minio:9000` | `http://minio:9000` |
-| access-key id | `<32 hex><level>` | `<tenant>-<level>` | `<32 hex><level>` | `<32 hex><level>` |
-| levels | `ro` `rw` `rws` | `reader` `writer` `admin` | `ro` `rw` `rws` | `ro` `rw` `rws` |
-| key prefix | `{tenant}/` | `tenants/{tenant}/data/` | `{tenant}/` | `{tenant}/` |
-| secret template | `{tenant}:{level}` | `v1/{level}/{tenant}` | `{tenant}:{level}` | `{tenant}:{level}` |
-| secrets from | environment | mounted files | environment | environment |
-| local cache | off | off | off | on, 3s maximum age, 8 MiB per object |
-| extras | hot reload, 192 MiB memory cap | — | `--read-only` | 192 MiB memory cap, restartable with its cache |
+| | `proxy-http` | `proxy-tls` | `proxy-readonly` | `proxy-cache` | `proxy-ssec` | `proxy-ssec-cache` |
+| --- | --- | --- | --- | --- | --- | --- |
+| upstream | `http://minio:9000` | `https://minio-tls:9000`, private CA | `http://minio:9000` | `http://minio:9000` | `https://minio-tls:9000`, private CA | `https://minio-tls:9000`, private CA |
+| access-key id | `<32 hex><level>` | `<tenant>-<level>` | `<32 hex><level>` | `<32 hex><level>` | `<32 hex><level>` | `<32 hex><level>` |
+| levels | `ro` `rw` `rws` | `reader` `writer` `admin` | `ro` `rw` `rws` | `ro` `rw` `rws` | `ro` `rw` `rws` | `ro` `rw` `rws` |
+| key prefix | `{tenant}/` | `tenants/{tenant}/data/` | `{tenant}/` | `{tenant}/` | `{tenant}/` | `{tenant}/` |
+| secret template | `{tenant}:{level}` | `v1/{level}/{tenant}` | `{tenant}:{level}` | `{tenant}:{level}` | `{tenant}:{level}` | `{tenant}:{level}` |
+| secrets from | environment | mounted files | environment | environment | environment | mounted files |
+| upstream SSE-C | off | off | off | off | on, key from the environment | on, key from a mounted file |
+| local cache | off | off | off | on, 3s maximum age, 8 MiB per object | off | on, 3s maximum age, 8 MiB per object |
+| extras | hot reload, 192 MiB memory cap | — | `--read-only` | 192 MiB memory cap, restartable with its cache | 192 MiB memory cap | 192 MiB memory cap, restartable with its cache, 2s policy reload |
 
 The rule *paths* are deliberately identical across variants, so the same
 authorization assertions apply to each.
@@ -93,6 +100,16 @@ declines still streams rather than being buffered on its way past.
 | `TestOneTenantsWarmCacheIsAnothersMiss` | isolation holds for a warm cache, not just a cold one |
 | `TestTheCacheSurvivesARestart` | a real process really stopped, and recovered its disk |
 | `TestCacheMetricsAreExposed` | the cache series, with no key or credential in them |
+| `TestClientSuppliedSSECHeadersAreRefused` | a client's own SSE-C key is refused with a reason, on every variant |
+| `TestSSECObjectsAreEncryptedAtRest` | a proxy write is unreadable without the key, `403` with the wrong one, and the original bytes with the right one |
+| `TestSSECDirectClientsInteroperate` | the proxy and a direct key holder read each other's objects, multipart included |
+| `TestSSECAnObjectUnderAnotherKeyIsRefused` | another key's object is an error, never read without a key nor rewritten |
+| `TestSSECAPlaintextObjectIsEncryptedOnRead` | a legacy object is served, then encrypted in place with its bytes and metadata |
+| `TestSSECARangedReadRepairsTheWholeObject` | a ranged read never becomes the replacement body |
+| `TestSSECNoRepairUnderAReadOnlyPath` | a path no level may write is not rewritten either |
+| `TestSSECARepairNeverOverwritesAConcurrentWrite` | a replacement or a delete during a repair always wins |
+| `TestSSECALargePlaintextObjectIsRepairedInBoundedMemory` | a 256 MiB legacy object repaired through a 192 MiB container |
+| `TestSSECTheKeyFileIsNotReloaded` | rewriting the key file changes nothing before a restart |
 
 `TestLargeObjectStreamsThrough` is why `proxy-http` and `proxy-cache` run
 under `mem_limit`. A proxy that buffered the upload would be OOM-killed, so
@@ -100,8 +117,18 @@ the test fails as a dropped connection rather than as a subtly wrong answer —
 a far better check of "memory is independent of object size" than reading a
 heap profile.
 
-The cache tests skip on a deployment without a cache, so the same binary runs
-against all four variants. `run-local.sh` covers the caching variant too,
+The cache tests skip on a deployment without a cache, and the `TestSSEC…`
+tests on one without a customer key, so the same binary runs against all six
+variants.
+
+On the two SSE-C variants the rest of the suite runs unchanged, and that is
+deliberate too. The suite's direct client sends the deployment's key, the way
+any other holder of the key would, so every existing check of what landed in
+the bucket also checks that the proxy wrote it with the key — and every write
+the suite makes behind the proxy's back checks that the proxy reads what
+another key holder wrote. `run.sh` also checks that the proxy refuses to
+start with an empty or malformed key, an unreadable key file, or a key over
+an http upstream. `run-local.sh` covers the caching variant too,
 including the restart, since a restart of a local process needs no container
 boundary.
 
@@ -127,5 +154,7 @@ Every variable the suite reads:
 | `E2E_CACHE_MAX_OBJECT_SIZE` | its `--cache-max-object-size`, so a test can pick a size on either side of it |
 | `E2E_CACHE_PURGE_TOKEN` | the deployment's `CACHE_PURGE_TOKEN`; empty means it accepts an unauthenticated purge |
 | `E2E_CACHE_RESTART_CMD` | restarts the proxy with its cache intact; without it the restart test skips |
+| `E2E_SSEC_KEY` | the deployment's `UPSTREAM_SSE_C_KEY`; marks an SSE-C deployment and enables the `TestSSEC…` tests |
+| `E2E_SSEC_KEY_FILE` | host path of the key file the deployment read; enables the no-reload test, which rewrites it |
 
 The suite is behind the `e2e` build tag, so `go test ./...` never picks it up.

@@ -23,6 +23,14 @@ mkdir -p secrets ca
 printf '%s' 'minioadmin,minioadmin123' > secrets/upstream-credentials
 printf '%s' 'an-e2e-deployment-wide-pepper' > secrets/pepper
 
+# The upstream SSE-C key of variants E and F: the Base64 of 32 bytes. Variant E
+# takes it from the environment (compose interpolates it), variant F reads it
+# from this file — with a trailing newline, which the proxy trims — and the
+# suite reads the bucket with it directly. Only those two variants' runs are
+# told about it: to the others it would mean "this deployment encrypts".
+export E2E_STACK_SSEC_KEY='AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8='
+printf '%s\n' "$E2E_STACK_SSEC_KEY" > secrets/sse-c-key
+
 cleanup() {
   if [[ "${E2E_KEEP:-0}" != "1" ]]; then
     "${compose[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
@@ -53,6 +61,35 @@ wait_for_health http://127.0.0.1:18100/readyz proxy-http
 wait_for_health http://127.0.0.1:18300/readyz proxy-tls
 wait_for_health http://127.0.0.1:18400/readyz proxy-readonly
 wait_for_health http://127.0.0.1:18500/readyz proxy-cache
+wait_for_health http://127.0.0.1:18600/readyz proxy-ssec
+wait_for_health http://127.0.0.1:18700/readyz proxy-ssec-cache
+
+# A key that is present must be a valid key, and must not travel over plain
+# http. Each of these has to stop the process at startup — a proxy that
+# started anyway would write plaintext while looking healthy.
+expect_startup_refusal() {
+  local service=$1 what=$2 expect=$3
+  shift 3
+  local output
+  if output=$(timeout 60 "${compose[@]}" run --rm --no-deps -T "$@" "$service" 2>&1); then
+    echo "!!! the proxy started with $what" >&2
+    return 1
+  fi
+  if ! grep -q -- "$expect" <<<"$output"; then
+    echo "!!! the proxy refused $what without saying so:" >&2
+    echo "$output" | tail -5 >&2
+    return 1
+  fi
+  echo "    refused $what"
+}
+echo "==> startup refusals"
+expect_startup_refusal proxy-ssec "an empty SSE-C key" "UPSTREAM_SSE_C_KEY" -e UPSTREAM_SSE_C_KEY=
+expect_startup_refusal proxy-ssec "a malformed SSE-C key" "Base64" -e UPSTREAM_SSE_C_KEY=not-a-key
+expect_startup_refusal proxy-ssec "an SSE-C key over http" "requires an https upstream" -e UPSTREAM_ENDPOINT=http://minio:9000
+# The key is read before the cache is opened, so this cannot touch variant F's
+# cache volume even though it mounts it.
+expect_startup_refusal proxy-ssec-cache "an unreadable key file" "cannot read UPSTREAM_SSE_C_KEY_FILE" \
+  -e UPSTREAM_SSE_C_KEY_FILE=/nonexistent
 
 # Shared by every variant.
 export E2E_MINIO_ACCESS_KEY=minioadmin
@@ -161,6 +198,51 @@ run_variant() {
   # buffer it.
   export E2E_LARGE_OBJECT_SIZE=268435456
   export E2E_CACHE_RESTART_CMD="docker compose -f $PWD/docker-compose.yml restart proxy-cache"
+  run_variant "$@"
+) || status=1
+
+# ---------------------------------------------------------------- variant E
+# Variant A's identity scheme, over the https upstream, with every object
+# encrypted under the operator's SSE-C key — from the environment.
+(
+  export E2E_NAME=proxy-ssec
+  export E2E_SSEC_KEY="$E2E_STACK_SSEC_KEY"
+  export E2E_PROXY_ENDPOINT=http://127.0.0.1:18599
+  export E2E_ADMIN_ENDPOINT=http://127.0.0.1:18600
+  export E2E_MINIO_ENDPOINT=https://127.0.0.1:19443
+  export E2E_MINIO_CA="$PWD/ca/public.crt"
+  export E2E_ACCESS_KEY_TEMPLATE='{tenant}{level}'
+  export E2E_SECRET_TEMPLATE='{tenant}:{level}'
+  export E2E_KEY_PREFIX_TEMPLATE='{tenant}/'
+  export E2E_READ_LEVEL=ro
+  export E2E_WRITE_LEVEL=rw
+  export E2E_TENANT_A=a1b2c3d4e5f60718293a4b5c6d7e8f90
+  export E2E_TENANT_B=0f9e8d7c6b5a49382716f5e4d3c2b1a0
+  export E2E_LARGE_OBJECT_SIZE=268435456
+  run_variant "$@"
+) || status=1
+
+# ---------------------------------------------------------------- variant F
+# Variant E with the key from a mounted file and the cache on.
+(
+  export E2E_NAME=proxy-ssec-cache
+  export E2E_SSEC_KEY="$E2E_STACK_SSEC_KEY"
+  export E2E_PROXY_ENDPOINT=http://127.0.0.1:18699
+  export E2E_ADMIN_ENDPOINT=http://127.0.0.1:18700
+  export E2E_MINIO_ENDPOINT=https://127.0.0.1:19443
+  export E2E_MINIO_CA="$PWD/ca/public.crt"
+  export E2E_ACCESS_KEY_TEMPLATE='{tenant}{level}'
+  export E2E_SECRET_TEMPLATE='{tenant}:{level}'
+  export E2E_KEY_PREFIX_TEMPLATE='{tenant}/'
+  export E2E_READ_LEVEL=ro
+  export E2E_WRITE_LEVEL=rw
+  export E2E_TENANT_A=a1b2c3d4e5f60718293a4b5c6d7e8f90
+  export E2E_TENANT_B=0f9e8d7c6b5a49382716f5e4d3c2b1a0
+  export E2E_CACHE_MAX_AGE=3s
+  export E2E_CACHE_PURGE_TOKEN=an-e2e-purge-token
+  export E2E_CACHE_MAX_OBJECT_SIZE=8388608
+  export E2E_CACHE_RESTART_CMD="docker compose -f $PWD/docker-compose.yml restart proxy-ssec-cache"
+  export E2E_SSEC_KEY_FILE="$PWD/secrets/sse-c-key"
   run_variant "$@"
 ) || status=1
 
