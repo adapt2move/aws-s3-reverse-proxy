@@ -659,3 +659,35 @@ func TestAnUploadReleasesItsKeyBeforeTheClientSeesTheAnswer(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, cache.Hit, seen, "the upload is cached and released by the time its answer goes out")
 }
+
+// A multipart completion's headers arrive before the object it assembles
+// exists: AWS S3 answers 200 at once and streams the result afterwards. The
+// key stays claimed while that answer is in flight, so a read in that window
+// can neither be served from the cache nor commit the old object to it.
+func TestACompletionHoldsItsKeyUntilTheAnswerIsThrough(t *testing.T) {
+	h, upstream, objectCache := newCachingProxy(t)
+	upstream.mu.Lock()
+	upstream.respond = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<CompleteMultipartUploadResult><ETag>"x-1"</ETag></CompleteMultipartUploadResult>`))
+	}
+	upstream.mu.Unlock()
+
+	var seen cache.Result
+	req := clientRequest{method: http.MethodPost, target: "/bucket/datasets/2026/big.bin?uploadId=u1", tenant: tenantA, level: "rw",
+		body: []byte(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"p"</ETag></Part></CompleteMultipartUpload>`)}.build(t)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(&observingWriter{ResponseWriter: rec, onWriteHeader: func() {
+		entry, result := objectCache.Get("bucket/" + tenantA + "/datasets/2026/big.bin")
+		if entry != nil {
+			entry.Close()
+		}
+		seen = result
+	}}, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, cache.Bypass, seen, "the completion still holds its key when its headers go out")
+
+	_, after := objectCache.Get("bucket/" + tenantA + "/datasets/2026/big.bin")
+	assert.Equal(t, cache.Miss, after, "and lets go of it once the answer is through")
+}

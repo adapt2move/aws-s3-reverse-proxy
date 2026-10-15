@@ -40,13 +40,22 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 	}
 	h.checkWriteConfirmation(resp, st)
 	h.finishMutation(resp, st)
-	// The write's outcome is known and recorded, so its claim on the key can
-	// go now, before the client sees a byte of the answer. Releasing it any
-	// later leaves a window: the reverse proxy flushes headers immediately,
-	// so a client can read the object it just wrote while the claim is still
-	// held — and be told the cache had to step aside. ServeHTTP's deferred
-	// End remains for the requests that never get a response.
-	st.mutation.End()
+	// For most writes the outcome is known and recorded once the headers are
+	// in, so the claim on the key can go now, before the client sees a byte
+	// of the answer. Releasing it any later leaves a window: the reverse
+	// proxy flushes headers immediately, so a client can read the object it
+	// just wrote while the claim is still held — and be told the cache had to
+	// step aside.
+	//
+	// A multipart completion is the exception. AWS S3 answers it 200 at
+	// once and keeps the connection open, streaming whitespace, until the
+	// object is assembled; the result (or an error) is in the body. Its
+	// headers say nothing about whether the new object exists yet, so its
+	// claim is held until the whole answer is through — ServeHTTP's deferred
+	// End, which also covers every request that never gets a response.
+	if st.operation.Kind != s3.CompleteMultipartUpload {
+		st.mutation.End()
+	}
 	h.captureRead(resp, st)
 	// After the capture, which keeps the plaintext marker in the cache, and
 	// before anything reaches the client, which must see neither the marker
