@@ -57,6 +57,10 @@ func (h *Handler) buildUpstreamRequest(req *http.Request, st *requestState) (*ht
 			proxyReq.Header[http.CanonicalHeaderKey(name)] = values
 		}
 	}
+	// Past authentication, the forwarded copy is ours to spell: entity tags
+	// in the client's conditions go upstream in standard syntax, never with
+	// the single-quote wrappers some stores put around them.
+	canonicalizeConditions(proxyReq.Header)
 	if st.mutation != nil {
 		// What the client says about the object it is uploading is what a
 		// later read of it should report back, so it is kept from the
@@ -82,6 +86,10 @@ func (h *Handler) buildUpstreamRequest(req *http.Request, st *requestState) (*ht
 	// the body to compute one — that read is what would otherwise pull an
 	// entire upload into memory.
 	proxyReq.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	// The operator's key, when there is one, goes on last and is signed with
+	// everything else. The header whitelist above already refused any key a
+	// client tried to send, so there is nothing of the client's to replace.
+	h.applyCustomerKey(proxyReq.Header, st.operation.Kind)
 
 	if err := h.cfg.UpstreamSigner.Sign(proxyReq, region, time.Now()); err != nil {
 		return nil, err

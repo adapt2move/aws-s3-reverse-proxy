@@ -143,11 +143,17 @@ func (h *Handler) serveCachedRead(w http.ResponseWriter, r *http.Request, proxyR
 		// which is the common case, since a write through this proxy
 		// invalidates rather than expires — this costs a round trip instead
 		// of transferring the whole object again.
-		if !h.stillCurrent(r, proxyReq, entry) {
+		if !h.stillCurrent(r, proxyReq, entry, st) {
 			return false
 		}
 		h.cfg.Cache.Refresh(entry)
 		st.cacheResult = string(cache.Revalidated)
+	}
+	if entry.Header.Get(legacyMarker) != "" {
+		// This entry was fetched from an object stored in plaintext. Serving
+		// it from disk must not hide that from the repair for as long as the
+		// entry lives — with no maximum age, that would be forever.
+		h.repairs.schedule(st, proxyReq.URL, entry.ETag(), "a cached read of an object stored in plaintext")
 	}
 	h.replayCachedResponse(w, r, entry, st.cacheResult)
 	return true
@@ -159,12 +165,60 @@ func (h *Handler) replayCachedResponse(w http.ResponseWriter, r *http.Request, e
 	for name, values := range entry.Header {
 		header[name] = values
 	}
+	header.Del(legacyMarker)
+	if etag := header.Get("Etag"); etag != "" {
+		// Stored normalized; this covers an entry from before that was so.
+		header.Set("Etag", s3.NormalizeETag(etag))
+	}
 	header.Set("X-Cache", strings.ToUpper(result))
 	// http.ServeContent does the rest: Content-Length, the Range arithmetic
 	// and its 206, `If-None-Match` against the ETag above, `If-Range`, and
 	// the 416 for a range past the end. A HEAD gets the headers and no body,
 	// because net/http already knows not to write one.
-	http.ServeContent(w, r, "", cachedModTime(entry), entry.Body())
+	//
+	// It compares the client's validators against the stored ETag, so they
+	// get the same normalization a forwarded request does. The client's
+	// signature was verified already; this copy is only ever compared.
+	http.ServeContent(w, withCanonicalConditions(r), "", cachedModTime(entry), entry.Body())
+}
+
+// withCanonicalConditions returns the request with its entity-tag conditions
+// in standard syntax, or the request itself when it has none.
+func withCanonicalConditions(r *http.Request) *http.Request {
+	if r.Header.Get("If-Match") == "" && r.Header.Get("If-None-Match") == "" && r.Header.Get("If-Range") == "" {
+		return r
+	}
+	clone := r.Clone(r.Context())
+	canonicalizeConditions(clone.Header)
+	return clone
+}
+
+// canonicalizeConditions rewrites the entity tags in a request's conditional
+// headers into standard syntax, so a validator a client copied out of a
+// malformed upstream header — `"'abc'"` — is sent as the `"abc"` the store
+// accepts.
+func canonicalizeConditions(header http.Header) {
+	for _, name := range []string{"If-Match", "If-None-Match"} {
+		if v := header.Get(name); v != "" {
+			header.Set(name, s3.NormalizeETagList(v))
+		}
+	}
+	if v := header.Get("If-Range"); v != "" {
+		header.Set("If-Range", s3.NormalizeIfRange(v))
+	}
+}
+
+// cacheHeaders is the part of a response worth storing with it, with its ETag
+// in standard syntax and the plaintext marker kept — see legacyMarker.
+func cacheHeaders(header http.Header) http.Header {
+	out := s3.CacheableResponseHeaders(header)
+	if etag := out.Get("Etag"); etag != "" {
+		out.Set("Etag", s3.NormalizeETag(etag))
+	}
+	if header.Get(legacyMarker) != "" {
+		out.Set(legacyMarker, "1")
+	}
+	return out
 }
 
 // stillCurrent asks the object store whether a stale entry still describes
@@ -181,22 +235,32 @@ func (h *Handler) replayCachedResponse(w http.ResponseWriter, r *http.Request, e
 // Anything unexpected — no ETag on either side, an error, a status that is
 // not 200 — reports false, and the caller re-fetches. Being wrong in that
 // direction costs a transfer; being wrong in the other serves a stale object.
-func (h *Handler) stillCurrent(r *http.Request, proxyReq *http.Request, entry *cache.Entry) bool {
-	cached := entry.ETag()
+//
+// The HEAD carries the customer key like any other read of the object, and
+// goes through the same transport, so a legacy plaintext object revalidates —
+// and gets its encryption scheduled — exactly the way a read of it would.
+// ETags are compared by their canonical values: the stored one is normalized,
+// and an upstream that spells them `"'abc'"` must not make every revalidation
+// fail.
+func (h *Handler) stillCurrent(r *http.Request, proxyReq *http.Request, entry *cache.Entry, st *requestState) bool {
+	cached, cachedWeak := s3.CanonicalETag(entry.ETag())
 	if cached == "" {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), cacheRevalidateTimeout)
+	ctx, cancel := context.WithTimeout(withRequestState(r.Context(), st), cacheRevalidateTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, proxyReq.URL.String(), nil)
+	target := *proxyReq.URL
+	target.RawQuery = ""
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, target.String(), nil)
 	if err != nil {
 		return false
 	}
 	req.Header.Set("X-Amz-Content-Sha256", sigv4.EmptyPayloadSHA256)
+	h.applyCustomerKey(req.Header, s3.HeadObject)
 	if err := h.cfg.UpstreamSigner.Sign(req, h.cfg.UpstreamRegion, time.Now()); err != nil {
 		return false
 	}
-	resp, err := h.transport.RoundTrip(req)
+	resp, err := h.roundTrip(req)
 	if err != nil {
 		return false
 	}
@@ -207,7 +271,8 @@ func (h *Handler) stillCurrent(r *http.Request, proxyReq *http.Request, entry *c
 	if resp.StatusCode != http.StatusOK {
 		return false
 	}
-	return resp.Header.Get("Etag") == cached
+	current, currentWeak := s3.CanonicalETag(resp.Header.Get("Etag"))
+	return current == cached && currentWeak == cachedWeak
 }
 
 // cachedModTime is the object's Last-Modified, or the zero time if the
@@ -252,7 +317,7 @@ func (h *Handler) captureRead(resp *http.Response, st *requestState) {
 	resp.Body = &cacheTee{
 		source: resp.Body,
 		sink:   writer,
-		header: s3.CacheableResponseHeaders(resp.Header),
+		header: cacheHeaders(resp.Header),
 	}
 }
 
@@ -277,12 +342,17 @@ func (h *Handler) fillAfterRangedRead(resp *http.Response, st *requestState) {
 		return
 	}
 	target := *resp.Request.URL
-	go h.fillObject(st.cacheKey, &target)
+	go h.fillObject(st, &target)
 }
 
 // fillObject fetches one object and stores it. Nobody is waiting for it, so
 // every failure is silent and simply leaves the object uncached.
-func (h *Handler) fillObject(key string, target *url.URL) {
+//
+// It reads the object the way a client's read would — with the customer key,
+// through the same transport — so a legacy plaintext object fills the cache
+// too, and is scheduled for encryption on the way.
+func (h *Handler) fillObject(st *requestState, target *url.URL) {
+	key := st.cacheKey
 	defer h.cfg.Cache.ReleaseFill(key)
 
 	select {
@@ -294,9 +364,11 @@ func (h *Handler) fillObject(key string, target *url.URL) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), cacheFillTimeout)
+	ctx, cancel := context.WithTimeout(withRequestState(context.Background(), st), cacheFillTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	plain := *target
+	plain.RawQuery = ""
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, plain.String(), nil)
 	if err != nil {
 		return
 	}
@@ -305,10 +377,11 @@ func (h *Handler) fillObject(key string, target *url.URL) {
 	// point is to store what the object store holds rather than what some
 	// particular caller negotiated.
 	req.Header.Set("X-Amz-Content-Sha256", sigv4.EmptyPayloadSHA256)
+	h.applyCustomerKey(req.Header, s3.GetObject)
 	if err := h.cfg.UpstreamSigner.Sign(req, h.cfg.UpstreamRegion, time.Now()); err != nil {
 		return
 	}
-	resp, err := h.transport.RoundTrip(req)
+	resp, err := h.roundTrip(req)
 	if err != nil {
 		return
 	}
@@ -328,7 +401,7 @@ func (h *Handler) fillObject(key string, target *url.URL) {
 	if _, err := io.Copy(writer, resp.Body); err != nil {
 		return
 	}
-	_ = writer.Commit(s3.CacheableResponseHeaders(resp.Header))
+	_ = writer.Commit(cacheHeaders(resp.Header))
 }
 
 // totalSizeFromContentRange reads the object's full length out of a
@@ -362,7 +435,7 @@ func (h *Handler) finishMutation(resp *http.Response, st *requestState) {
 		header[name] = values
 	}
 	if etag := resp.Header.Get("Etag"); etag != "" {
-		header.Set("Etag", etag)
+		header.Set("Etag", s3.NormalizeETag(etag))
 	}
 	// A PUT response has no Last-Modified. Its Date is the object store's
 	// clock at the moment it accepted the object, which is what a later read

@@ -34,10 +34,25 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 	}
 	st := requestStateFrom(resp.Request.Context())
 	if st == nil {
+		normalizeResponseETag(resp.Header)
+		hideEncryption(resp.Header)
 		return rewriteUpstreamResponse(resp)
 	}
+	h.checkWriteConfirmation(resp, st)
 	h.finishMutation(resp, st)
+	// The write's outcome is known and recorded, so its claim on the key can
+	// go now, before the client sees a byte of the answer. Releasing it any
+	// later leaves a window: the reverse proxy flushes headers immediately,
+	// so a client can read the object it just wrote while the claim is still
+	// held — and be told the cache had to step aside. ServeHTTP's deferred
+	// End remains for the requests that never get a response.
+	st.mutation.End()
 	h.captureRead(resp, st)
+	// After the capture, which keeps the plaintext marker in the cache, and
+	// before anything reaches the client, which must see neither the marker
+	// nor which customer key the store confirmed.
+	normalizeResponseETag(resp.Header)
+	hideEncryption(resp.Header)
 	if err := rewriteUpstreamResponse(resp); err != nil {
 		return err
 	}
@@ -48,6 +63,15 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 		resp.Header.Set("X-Cache", strings.ToUpper(st.cacheResult))
 	}
 	return nil
+}
+
+// normalizeResponseETag puts a response's ETag into standard entity-tag
+// syntax, so a client is never handed a validator — `"'abc'"` — that the
+// object store would refuse to take back.
+func normalizeResponseETag(header http.Header) {
+	if etag := header.Get("Etag"); etag != "" {
+		header.Set("Etag", s3.NormalizeETag(etag))
+	}
 }
 
 // rewriteUpstreamResponse is the response half of the tenant scoping: it
@@ -107,6 +131,10 @@ func rewriteUpstreamResponse(resp *http.Response) error {
 	if st.operation.Kind == s3.DeleteObjects {
 		body = s3.MergeDeniedDeletes(body, st.deniedDeletes)
 	}
+	// A listing, a part list and a multipart result all carry ETags, and a
+	// client may well send them back — as a precondition, or in a part list.
+	// They get the same normalization the ETag header does.
+	body = s3.NormalizeXMLETags(body)
 
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))

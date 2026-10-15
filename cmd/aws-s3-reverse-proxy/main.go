@@ -73,6 +73,10 @@ func main() {
 			log.WithError(err).Warn("server did not shut down cleanly")
 		}
 	}
+	// Background encryption repairs hold multipart uploads open upstream and
+	// may still be invalidating cache entries, so they stop — and abandon
+	// what they started — before the cache does.
+	handler.Close()
 	if objectCache != nil {
 		// After the listeners, so that a request still streaming out of the
 		// cache is not reading from a file that just closed. Closing it
@@ -101,6 +105,12 @@ func buildProxy(opts config.Options) (*proxy.Handler, *policy.Store, *cache.Cach
 	}
 	if opts.UpstreamAccessKeyID == "" || opts.UpstreamSecretAccessKey == "" {
 		return nil, nil, nil, errors.New("no upstream credentials configured")
+	}
+	// Checked here as well as in proxy.New, because it has to fail before
+	// the cache is opened: opening it under the key's label would already
+	// have discarded what an unencrypted deployment had cached.
+	if opts.UpstreamSSECKey != nil && scheme != "https" {
+		return nil, nil, nil, errors.New("UPSTREAM_SSE_C_KEY requires an https upstream endpoint: the key would otherwise cross the network in the clear")
 	}
 
 	// An unparseable or contradictory policy must never start serving: there
@@ -138,6 +148,7 @@ func buildProxy(opts config.Options) (*proxy.Handler, *policy.Store, *cache.Cach
 		Cache:             objectCache,
 		CacheWrites:       opts.CacheWrites,
 		CacheRangeFills:   opts.CacheRangeFills,
+		UpstreamSSECKey:   opts.UpstreamSSECKey,
 	})
 	if err != nil {
 		if objectCache != nil {
@@ -166,6 +177,7 @@ func buildCache(opts config.Options) (*cache.Cache, error) {
 		SegmentSize:   opts.CacheSegmentSize,
 		InlineMaxSize: opts.CacheInlineMaxSize,
 		MaxAge:        opts.CacheMaxAge,
+		Label:         cacheLabel(opts),
 		Logf:          func(format string, args ...any) { log.Warnf(format, args...) },
 	})
 	if err != nil {
@@ -186,6 +198,21 @@ func buildCache(opts config.Options) (*cache.Cache, error) {
 		}
 	})
 	return c, nil
+}
+
+// cacheLabel names the upstream encryption configuration the cache's entries
+// depend on.
+//
+// An entry is a copy of what the object store returned, and with a customer
+// key that depends on the key: a restart with a different one, or with none,
+// must not look healthy only because the cache still answers for objects the
+// store would now refuse to decrypt. Any change of label empties the cache.
+// No key is the empty label, which keeps a cache written before this existed.
+func cacheLabel(opts config.Options) string {
+	if opts.UpstreamSSECKey == nil {
+		return ""
+	}
+	return "upstream-sse-c:" + opts.UpstreamSSECKey.Label()
 }
 
 // listeners starts every server this process serves on and returns them in
@@ -267,7 +294,25 @@ func logStartup(opts config.Options, handler *proxy.Handler, store *policy.Store
 	if opts.ReadOnly {
 		log.Infof("Read-only mode: only GET/HEAD are proxied; mutating requests are rejected with 403.")
 	}
+	logEncryptionStartup(opts)
 	logCacheStartup(opts)
+}
+
+// logEncryptionStartup says what upstream encryption does and, as importantly,
+// what it does not.
+func logEncryptionStartup(opts config.Options) {
+	if opts.UpstreamSSECKey == nil {
+		return
+	}
+	log.Infof("Upstream SSE-C is on: object reads and writes carry the configured customer key, " +
+		"and plaintext objects found by a read are re-encrypted in place in the background.")
+	if opts.ReadOnly {
+		log.Infof("Read-only mode: plaintext objects are served, but not re-encrypted.")
+	}
+	if opts.CacheEnabled() {
+		log.Warnf("The object cache holds decrypted object bytes: SSE-C protects the object store, "+
+			"not %s. Protect that volume accordingly.", opts.CacheDir)
+	}
 }
 
 // logCacheStartup states what the cache will and will not do, in the terms an

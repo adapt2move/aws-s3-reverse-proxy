@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,8 +11,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/cache"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/config"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/policytest"
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/ssec"
 )
 
 // Startup is the last place a misconfiguration can be caught before requests
@@ -149,4 +154,72 @@ func TestIsListenAddr(t *testing.T) {
 	for _, addr := range []string{"", "8099", "no-port-here"} {
 		assert.False(t, isListenAddr(addr), addr)
 	}
+}
+
+func sseKey(t *testing.T, b byte) *ssec.Key {
+	t.Helper()
+	key, err := ssec.Parse(base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{b}, ssec.KeySize)))
+	require.NoError(t, err)
+	return key
+}
+
+// A customer key over plain http would cross the network in the clear on
+// every request. It fails at startup — and before the cache is opened, which
+// would otherwise already have discarded what an unencrypted deployment had
+// cached under the new key's label.
+func TestStartupRefusesAKeyOverHTTP(t *testing.T) {
+	opts := baseOptions(t)
+	opts.UpstreamEndpoint = "http://minio:9000"
+	opts.UpstreamSSECKey = sseKey(t, 1)
+	opts.CacheDir = filepath.Join(t.TempDir(), "objects")
+
+	_, _, _, err := buildProxy(opts)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "https")
+	assert.NoDirExists(t, opts.CacheDir, "the cache was never opened")
+
+	opts.UpstreamEndpoint = "https://minio:9000"
+	opts.CacheDir = ""
+	handler, _, _, err := buildProxy(opts)
+	require.NoError(t, err)
+	handler.Close()
+}
+
+// What the cache holds was read with one key. A restart with another one — or
+// with none — must not look healthy only because the cache still answers for
+// objects the store would now refuse to decrypt.
+func TestTheCacheIsEmptiedWhenTheKeyChanges(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "objects")
+	// The cache is opened the way buildCache opens it, label and all; going
+	// through buildCache itself would register its metrics a second time.
+	start := func(key *ssec.Key) (*cache.Cache, func()) {
+		opts := baseOptions(t)
+		opts.UpstreamSSECKey = key
+		objectCache, err := cache.New(cache.Options{Dir: dir, Label: cacheLabel(opts)})
+		require.NoError(t, err)
+		return objectCache, func() { require.NoError(t, objectCache.Close()) }
+	}
+	store := func(c *cache.Cache) {
+		w, err := c.Put("bucket/tenant/object", 5)
+		require.NoError(t, err)
+		_, _ = w.Write([]byte("bytes"))
+		require.NoError(t, w.Commit(http.Header{}))
+	}
+
+	c, stop := start(sseKey(t, 1))
+	store(c)
+	stop()
+
+	c, stop = start(sseKey(t, 1))
+	assert.True(t, c.Has("bucket/tenant/object"), "the same key keeps the cache")
+	stop()
+
+	c, stop = start(sseKey(t, 2))
+	assert.False(t, c.Has("bucket/tenant/object"), "another key empties it")
+	store(c)
+	stop()
+
+	c, stop = start(nil)
+	assert.False(t, c.Has("bucket/tenant/object"), "and so does removing the key")
+	stop()
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -621,4 +622,40 @@ func readBody(t *testing.T, resp *http.Response) string {
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	return string(body)
+}
+
+// observingWriter runs a check at the moment the response starts — which,
+// behind a reverse proxy that flushes headers immediately, is the moment the
+// client can act on it.
+type observingWriter struct {
+	http.ResponseWriter
+	onWriteHeader func()
+}
+
+func (w *observingWriter) WriteHeader(status int) {
+	if w.onWriteHeader != nil {
+		w.onWriteHeader()
+		w.onWriteHeader = nil
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+// A client that reads an object the instant its upload is acknowledged must
+// find it cached rather than claimed by the upload that just finished.
+func TestAnUploadReleasesItsKeyBeforeTheClientSeesTheAnswer(t *testing.T) {
+	h, upstream, objectCache := newCachingProxy(t)
+	servesObject(upstream, "", nil)
+
+	var seen cache.Result
+	req := clientRequest{method: http.MethodPut, target: "/bucket/datasets/2026/a.csv", tenant: tenantA, level: "rw", body: []byte("fresh")}.build(t)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(&observingWriter{ResponseWriter: rec, onWriteHeader: func() {
+		entry, result := objectCache.Get("bucket/" + tenantA + "/datasets/2026/a.csv")
+		if entry != nil {
+			entry.Close()
+		}
+		seen = result
+	}}, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, cache.Hit, seen, "the upload is cached and released by the time its answer goes out")
 }

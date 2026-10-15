@@ -78,6 +78,14 @@ func (h *Handler) prepareBody(req *http.Request, st *requestState) (*preparedBod
 		return h.prepareDeleteBody(raw, req.Header, st)
 	}
 
+	if st.operation.Kind == s3.CompleteMultipartUpload {
+		raw, err := s3.ReadCapped(req.Body, h.cfg.Limits.RewriteBody, "multipart completion")
+		if err != nil {
+			return nil, "", err
+		}
+		return h.prepareCompleteBody(raw, req.Header, req.Header.Get("X-Amz-Content-Sha256"), nil)
+	}
+
 	// The body travels upstream byte for byte, so the digest the client
 	// signed still describes it exactly. Reusing it keeps the integrity check
 	// end-to-end and costs no memory; without it we would have to read the
@@ -103,7 +111,7 @@ func (h *Handler) prepareChunkedBody(req *http.Request, st *requestState) (*prep
 	trailerAnnounced := req.Header.Get("X-Amz-Trailer") != ""
 	s3.StripStreamingMarkers(req.Header)
 
-	if !trailerAnnounced && haveLength && st.operation.Kind != s3.DeleteObjects {
+	if !trailerAnnounced && haveLength && st.operation.Kind != s3.DeleteObjects && st.operation.Kind != s3.CompleteMultipartUpload {
 		return &preparedBody{
 			reader:        s3.NewChunkedReader(req.Body),
 			contentLength: decodedLength,
@@ -123,12 +131,40 @@ func (h *Handler) prepareChunkedBody(req *http.Request, st *requestState) (*prep
 	if st.operation.Kind == s3.DeleteObjects {
 		return h.prepareDeleteBody(decoded, req.Header, st)
 	}
+	if st.operation.Kind == s3.CompleteMultipartUpload {
+		return h.prepareCompleteBody(decoded, req.Header, "", s3.ChecksumTrailers(trailers))
+	}
 
 	sum := sha256.Sum256(decoded)
 	return &preparedBody{
 		reader:        bytes.NewReader(decoded),
 		contentLength: int64(len(decoded)),
 		extraHeaders:  s3.ChecksumTrailers(trailers),
+	}, hex.EncodeToString(sum[:]), nil
+}
+
+// prepareCompleteBody puts the part ETags of a multipart completion into their
+// canonical form — the bare value, without the double quotes SDKs add and
+// without the single quotes some stores wrap their ETags in and then refuse to
+// take back. The body is small (a part list) and capped like the other XML
+// documents this proxy rewrites.
+//
+// A body that canonicalization leaves untouched travels with the client's own
+// digest. One that changed has a new payload hash, and loses the client's
+// Content-MD5, which described the bytes it sent rather than the bytes going
+// upstream. Its x-amz-checksum-* headers stay: on a completion they are the
+// checksum of the assembled object, not of this body.
+func (h *Handler) prepareCompleteBody(raw []byte, reqHeader http.Header, clientHash string, extra http.Header) (*preparedBody, string, error) {
+	body := s3.CanonicalXMLETags(raw)
+	if bytes.Equal(body, raw) && sigv4.IsPayloadHash(clientHash) {
+		return &preparedBody{reader: bytes.NewReader(body), contentLength: int64(len(body)), extraHeaders: extra}, clientHash, nil
+	}
+	reqHeader.Del("Content-Md5")
+	sum := sha256.Sum256(body)
+	return &preparedBody{
+		reader:        bytes.NewReader(body),
+		contentLength: int64(len(body)),
+		extraHeaders:  extra,
 	}, hex.EncodeToString(sum[:]), nil
 }
 
