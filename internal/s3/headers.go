@@ -61,8 +61,13 @@ var forwardedHeaders = map[string]bool{
 //     deletion, the operator's included
 //   - x-amz-storage-class             a cost the tenant would choose and the
 //     operator would pay
-//   - x-amz-server-side-encryption-*  SSE belongs on the bucket, not in a
-//     header the tenant picks; SSE-C would put key material in the request
+//   - x-amz-server-side-encryption    SSE belongs on the bucket, or on the
+//     proxy's own SSE-C key, not in a header the tenant picks
+//   - x-amz-server-side-encryption-customer-* and the copy-source variants:
+//     a client's own key, refused before anything else with an explicit
+//     message (see Classify) — key passthrough is not something this proxy
+//     does, and the operator's key is applied upstream without the client
+//     ever seeing it
 //   - x-amz-tagging                   billing and lifecycle input
 //   - x-amz-security-token            this proxy derives credentials, so a
 //     session token means nothing to it
