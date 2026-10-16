@@ -10,6 +10,8 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -24,6 +26,7 @@ import (
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/policy"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/s3"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/sigv4"
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/ssec"
 )
 
 // PolicySource hands out the policy in force at the moment it is asked.
@@ -46,8 +49,9 @@ type Limits struct {
 	// DeleteBody caps a DeleteObjects request body, which is parsed and
 	// rebuilt key by key.
 	DeleteBody int64
-	// RewriteBody caps an XML response buffered to strip the tenant prefix
-	// back out of it.
+	// RewriteBody caps an XML document buffered to rewrite it: a response,
+	// to strip the tenant prefix back out of it, or a multipart completion,
+	// to put its part ETags into canonical form.
 	RewriteBody int64
 }
 
@@ -131,6 +135,32 @@ type Config struct {
 	// DuckDB's httpfs over Parquet is the case in mind — would never fill
 	// the cache at all.
 	CacheRangeFills bool
+
+	// UpstreamSSECKey, when set, is the customer key every object is stored
+	// under upstream (SSE-C). The proxy adds it to the object operations
+	// that take one — client requests and its own background requests alike
+	// — and clients never see it or send one. Nil leaves upstream encryption
+	// to the bucket. It requires an https upstream. See encryption.go.
+	UpstreamSSECKey *ssec.Key
+
+	// RepairPlaintext lets a read that finds an object stored in plaintext
+	// have it rewritten in place under the key. Off, such objects are served
+	// and left as they are.
+	//
+	// It is a statement about the deployment, which is why it is the
+	// operator's to make: the rewrite is conditional on the object's ETag,
+	// and a writer that stores byte-identical content with different
+	// metadata — without the key, so its ETag is unchanged — in the moment
+	// before the replacement lands would have that metadata overwritten. No
+	// object store offers a condition that covers metadata, so the guarantee
+	// rests on nothing writing the bucket without the key. Writes through
+	// this proxy always carry it.
+	RepairPlaintext bool
+
+	// rootCAs replaces the system roots for the upstream connection. Tests
+	// set it to trust an httptest TLS server; a deployment uses
+	// SSL_CERT_FILE instead.
+	rootCAs *x509.CertPool
 }
 
 // Handler is a multi-tenant S3 reverse proxy. Every request carries its own
@@ -155,6 +185,10 @@ type Handler struct {
 	// fillSlots bounds those fills. Work nobody asked for must not crowd out
 	// work somebody did.
 	fillSlots chan struct{}
+
+	// repairs encrypts legacy plaintext objects in the background when a
+	// customer key is configured; nil otherwise.
+	repairs *repairer
 }
 
 // New validates the configuration and wires up the shared reverse proxy.
@@ -172,11 +206,21 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.UpstreamSigner == nil {
 		return nil, errors.New("proxy: no upstream signer configured")
 	}
+	if cfg.UpstreamSSECKey != nil && cfg.UpstreamScheme != "https" {
+		// S3 refuses SSE-C over plain http, and rightly: the key would cross
+		// the network in the clear on every request. Refusing here means a
+		// misconfigured deployment fails at startup instead of on its first
+		// upload — or worse, against a store that does not refuse it.
+		return nil, errors.New("proxy: an upstream SSE-C key requires an https upstream endpoint")
+	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 512
 	transport.MaxIdleConnsPerHost = 128
 	transport.IdleConnTimeout = 90 * time.Second
+	if cfg.rootCAs != nil {
+		transport.TLSClientConfig = &tls.Config{RootCAs: cfg.rootCAs, MinVersion: tls.VersionTLS12}
+	}
 
 	h := &Handler{
 		cfg: cfg,
@@ -188,11 +232,17 @@ func New(cfg Config) (*Handler, error) {
 		transport: transport,
 		fillSlots: make(chan struct{}, maxConcurrentFills),
 	}
+	if cfg.UpstreamSSECKey != nil {
+		h.repairs = newRepairer(h)
+	}
 	h.proxy = &httputil.ReverseProxy{
 		// The request handed to ServeHTTP already carries the absolute
 		// upstream URL, so there is nothing left to direct.
-		Director:       func(*http.Request) {},
-		Transport:      transport,
+		Director: func(*http.Request) {},
+		// Every upstream response to an object read goes through
+		// inspectRead, which is where a legacy plaintext object is told
+		// apart from an encrypted one. See encryption.go.
+		Transport:      roundTripperFunc(h.roundTrip),
 		FlushInterval:  -1, // flush every write: object downloads stream
 		ModifyResponse: h.modifyResponse,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -201,6 +251,13 @@ func New(cfg Config) (*Handler, error) {
 		},
 	}
 	return h, nil
+}
+
+// Close stops the background work the handler started on its own — the
+// encryption repairs — and waits for it to let go of what it holds upstream.
+// Call it after the listeners have shut down and before the cache is closed.
+func (h *Handler) Close() {
+	h.repairs.close()
 }
 
 // UpstreamAddr is the endpoint this handler forwards to, for a caller that
@@ -232,6 +289,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.serveConditionalPutOverPlaintext(rec, proxyReq, st) {
+		h.access.Finish(entry, rec.Status(), time.Since(start))
+		return
+	}
+
 	h.proxy.ServeHTTP(rec, proxyReq.WithContext(withRequestState(r.Context(), st)))
 	entry.Cache = st.cacheResult
 	h.access.Finish(entry, rec.Status(), time.Since(start))
@@ -253,6 +315,14 @@ func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, entry *observa
 	// credential, so an unsupported call can never fall through to the
 	// upstream by accident.
 	op, err := s3.Classify(r)
+	if errors.Is(err, s3.ErrCustomerKey) {
+		// The one refusal worth explaining outside debug mode: the client
+		// can fix it, and the message is fixed text that never repeats a
+		// header value.
+		entry.Allowed, entry.Reason = false, err.Error()
+		s3.WriteError(w, http.StatusBadRequest, "InvalidRequest", s3.CustomerKeyMessage)
+		return nil, nil, err
+	}
 	if err != nil {
 		status := http.StatusForbidden
 		if errors.Is(err, s3.ErrInvalidKey) {
@@ -440,6 +510,11 @@ type requestState struct {
 
 	// deletedKeys are the upstream keys a batch delete is about to remove.
 	deletedKeys []string
+
+	// unconfirmed records that the object store accepted this write without
+	// confirming the customer key, so what the cache keeps of it is marked
+	// for its encryption to be checked.
+	unconfirmed bool
 }
 
 type requestStateKey struct{}

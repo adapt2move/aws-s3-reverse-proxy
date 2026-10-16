@@ -29,7 +29,9 @@ the security boundary — not a convenience layer in front of one.
    the object — after step 4, never before it. An entry past
    `--cache-max-age` is checked against the object store first, and re-served
    if it has not changed.
-6. Otherwise re-sign with the upstream credentials and forward, streaming.
+6. Otherwise re-sign with the upstream credentials and forward, streaming —
+   with the operator's SSE-C key added to object reads and writes when one is
+   configured (see [Upstream encryption](#upstream-encryption-sse-c)).
 7. Strip the prefix back out of `ListObjectsV2` and `DeleteObjects` responses.
 
 ## Module layout
@@ -47,6 +49,7 @@ cmd/aws-s3-reverse-proxy   the process: flags, secrets, listeners, shutdown
     internal/s3            classification, keys, aws-chunked, XML request and
                            response bodies
     internal/sigv4         inbound signature verification, upstream re-signing
+    internal/ssec          the upstream SSE-C key and the headers that carry it
     internal/observability access log, metrics, health probes
 
     internal/cache         cached upstream responses: freshness, invalidation
@@ -194,7 +197,7 @@ Split by lifetime and sensitivity:
 | Kind | Source | Contents |
 | --- | --- | --- |
 | **Policy** | file (e.g. a mounted ConfigMap), hot-reloadable | rule list, access-key-id pattern, key-prefix template, level names |
-| **Secrets** | env / mounted secret only | upstream credentials, derivation pepper |
+| **Secrets** | env / mounted secret only | upstream credentials, derivation pepper, optional upstream SSE-C key |
 | **Deployment knobs** | flags or env | listen and metrics addresses, upstream endpoint, allowed source subnets, body caps, logging verbosity |
 
 A secret is never readable from the policy file, and the policy file never
@@ -212,6 +215,10 @@ a mounted secret, which is what a Kubernetes Secret volume gives you.
 | `UPSTREAM_CREDENTIALS` | the same pair as `"ACCESS_KEY_ID,SECRET_ACCESS_KEY"` |
 | `CREDENTIAL_PEPPER` | keys the HMAC that derives every client secret (minimum 16 bytes) |
 | `CACHE_PURGE_TOKEN` | bearer token required by `POST /cache/purge`; unset leaves that endpoint open |
+| `UPSTREAM_SSE_C_KEY` | Base64 of a 32-byte key; when set, every object is encrypted upstream with it (SSE-C) — see [Upstream encryption](#upstream-encryption-sse-c) |
+
+Secrets are read once, at startup. A policy reload does not touch them, and
+changing a variable or a mounted file takes effect at the next restart.
 
 ### Flags
 
@@ -234,6 +241,7 @@ a mounted secret, which is what a Kubernetes Secret volume gives you.
 | `--shutdown-delay` (`SHUTDOWN_DELAY`) | `0s` | how long to keep serving after `/readyz` starts failing |
 | `--read-only` (`READ_ONLY`) | `false` | reject every mutation regardless of policy — a maintenance kill switch |
 | `--metrics-tenant-label` (`METRICS_TENANT_LABEL`) | `false` | add the tenant id as a Prometheus label |
+| `--upstream-sse-c-repair` (`UPSTREAM_SSE_C_REPAIR`) | `false` | with an SSE-C key, rewrite plaintext objects found by a read under it — see [Legacy plaintext objects](#legacy-plaintext-objects) |
 
 `--upstream-endpoint` decides the scheme, so one image serves an in-cluster
 S3-compatible backend over `http` and a hosted provider over `https` with no
@@ -318,9 +326,13 @@ never touch the file except when told to.
     the `x-amz-sdk-*` family — is accepted but not forwarded. Every other
     `x-amz-` header is `403`, because one the proxy does not understand is
     one it cannot authorize: `x-amz-acl`, `x-amz-object-lock-*`,
-    `x-amz-tagging`, `x-amz-storage-class` and
-    `x-amz-server-side-encryption-*` are all decisions that belong to the
-    operator and are made on the bucket.
+    `x-amz-tagging`, `x-amz-storage-class` and `x-amz-server-side-encryption`
+    are all decisions that belong to the operator and are made on the bucket.
+    A client's own SSE-C key (`x-amz-server-side-encryption-customer-*`, and
+    the `x-amz-copy-source-…` variants) is refused before anything else with
+    `400 InvalidRequest` and a message saying that key passthrough is not
+    supported. The headers are never silently dropped: a client would then
+    believe its object is encrypted under a key it chose.
   * Whatever is forwarded is also **signed** upstream. Headers are copied onto
     the upstream request before it is signed, never after, so nothing reaches
     the object store outside the proxy's own signature.
@@ -619,6 +631,229 @@ exist to hold the second half of that sentence — each one damages a store the
 way a particular failure would and checks that what comes back is a subset of
 what went in.
 
+## Upstream encryption (SSE-C)
+
+Set `UPSTREAM_SSE_C_KEY` (or `UPSTREAM_SSE_C_KEY_FILE`) and every object is
+stored encrypted with that key. The object store does the AES-256; the proxy
+supplies the key with each request, over HTTPS. Clients change nothing: they
+send no key, receive no key, and never see the response headers that would
+show one was involved.
+
+```sh
+openssl rand -base64 32 > sse-c-key      # 32 random bytes, Base64
+UPSTREAM_SSE_C_KEY_FILE=/etc/s3proxy/secrets/sse-c-key
+```
+
+```mermaid
+flowchart LR
+  C[client<br/>no key] -->|PUT / GET| P[proxy]
+  P -->|"+ x-amz-server-side-encryption-customer-*<br/>(HTTPS only)"| S[(object store<br/>encrypts at rest)]
+  P -. "plaintext object found on read" .-> R[background repair:<br/>rewrite in place under the key]
+  R -->|"multipart upload,<br/>completion If-Match: original ETag"| S
+```
+
+### Configuration
+
+| | |
+| --- | --- |
+| neither variable set | SSE-C off; behaviour is exactly what it was without this feature |
+| a valid key | SSE-C on. There is no separate switch |
+| empty value, empty or unreadable file, malformed or wrong-length key, both variables set | **startup fails** |
+| key set and an `http://` upstream | **startup fails**: the key would cross the network in the clear |
+
+The key is independent of the upstream credentials and of `CREDENTIAL_PEPPER`,
+and nothing is derived from either. It is never accepted as a flag or from the
+policy file, and it is loaded once: neither a policy reload nor an edit of the
+mounted file changes it before a restart. Startup checks that the key is
+well-formed. Whether it is the key an existing object was written with only
+shows when that object is read, and there is deliberately no startup scan of
+the bucket to find out.
+
+Provisioning and distributing the key is the operator's job. Lose it and the
+objects written with it are unreadable — by this proxy and by anybody else.
+
+### What carries the key
+
+| Operation | Upstream request |
+| --- | --- |
+| `GetObject`, `HeadObject`, `PutObject` | key |
+| `CreateMultipartUpload`, `UploadPart` | key (S3 requires it on every part) |
+| `CompleteMultipartUpload`, `ListParts` | key (AWS needs it there for uploads with checksums, and accepts it otherwise) |
+| `AbortMultipartUpload`, `DeleteObject(s)`, `ListObjects` | no key |
+
+The cache's own requests (the freshness `HEAD` of an expired entry, the
+background fetch after a ranged miss) carry it the same way.
+
+A write the store accepts **without confirming** encryption — no
+`x-amz-server-side-encryption-customer-algorithm` in the response, or another
+key's digest — is logged as a warning and otherwise treated as the success it
+is: the client gets its `200` and the cache behaves as usual. It is never
+failed after the fact, and never retried without the key. A write the store
+refuses stays refused. In other words this mode asks for encryption and
+reports when the store does not confirm it; it cannot force a store that
+ignores SSE-C to encrypt.
+
+An upstream **error** is rebuilt from the fields a client may see (`Code`,
+`Message`, `Key`, `BucketName`, `Resource` and the request ids) before it
+is passed on, and the key is redacted from whatever is left. An object
+store's error describes the request it received, which is the proxy's
+re-signed one: `SignatureDoesNotMatch` quotes it whole, customer key and
+upstream access key id included.
+
+Reading an object encrypted under a **different** key (or, with no key
+configured, any SSE-C object) returns the store's error to the client and logs
+it at error level. It never triggers a read without the key, nor a rewrite.
+
+### Legacy plaintext objects
+
+Objects written before the key existed are always served. With
+`UPSTREAM_SSE_C_REPAIR=true` they are also encrypted the first time somebody
+reads them; without it they are left as they are, and the log says so:
+
+1. **Detection.** The pinned MinIO, like S3, refuses a read of a plaintext
+   object that carries SSE-C headers (`400 InvalidRequest`, "The encryption
+   parameters are not applicable to this object"). On that answer — and only
+   that one; for a `HEAD`, whose error has no body, any `400` — the proxy asks
+   once more with a `HEAD` *without* the key. Only a `200` that names no
+   customer algorithm counts as proof of plaintext. A timeout, a `403`, any
+   other status, or a store that says the object *is* encrypted, leaves the
+   client with the original error. An object stored with SSE-S3 or SSE-KMS
+   reads the same way as a plaintext one here, and is treated as one: it is
+   served, and rewritten under the customer key.
+2. **Serving.** The client's own request is re-sent without the key, with its
+   `Range` and conditions intact, and streamed back as usual, caching
+   included. The read does not wait for the repair, and a failing repair never
+   turns it into an error.
+3. **Repair**, only with `UPSTREAM_SSE_C_REPAIR=true`, in the background, at
+   most two at a time:
+   - observe the object (`HEAD` without the key): ETag, size,
+     `Last-Modified`, version id, content headers and `x-amz-meta-*`;
+   - read its ACL, and go no further unless it is the default (the
+     owner's full control and nothing else);
+   - start a multipart upload **with** the key, carrying those headers over;
+   - stream the whole object (`GET`, `If-Match` the observed ETag) into parts
+     of 16 MiB or more. Memory stays bounded whatever the object's size, and
+     a ranged response is never used as the replacement body;
+   - check that the upload will belong to the object's current owner;
+   - observe again, ACL included, and abandon if anything changed —
+     metadata replaced in place, which can leave an ETag as it was, or tags,
+     retention or a hold added while the parts were uploading;
+   - complete the upload with `If-Match: "<observed ETag>"`. If anything
+     replaced the object in the meantime the store answers `412`, and if it
+     was deleted, `404`. The upload is aborted either way and nothing is
+     retried unconditionally, so a concurrent write always wins and a deleted
+     object stays deleted.
+
+   The completion carries no key. MinIO evaluates a precondition by reading
+   the existing object *with* the request's key, which fails for a plaintext
+   object. That is also why the repair is always a multipart upload: a
+   conditional SSE-C `PutObject` over a plaintext object is refused by MinIO.
+   AWS S3 accepts `If-Match` on `CompleteMultipartUpload` and needs no key
+   there for an upload without checksums.
+
+**Why repair is opt-in.** The completion's `If-Match` is the only condition
+an object store enforces on a replacement, and an ETag does not cover
+metadata: a writer that stores byte-identical content with new metadata
+leaves it unchanged. MinIO ignores `If-Unmodified-Since` on a completion,
+and AWS S3 does not offer it. So a writer that does exactly that, *without
+the key*, in the moment between the repair's last observation and its
+completion would have its metadata overwritten. Writes through this proxy
+always carry the key, which gives them a fresh ETag, so they are never
+affected. Turn repair on once nothing writes the bucket without the key.
+
+The rewrite gives an object the default ACL, so an object with any other
+grant is skipped rather than silently opened up or locked down, and so is
+one whose rewrite would change its owner. MinIO has no object ACLs and
+reports exactly the default.
+
+An object whose encryption is not confirmed — served without the key, read
+or written without the store confirming the key — is cached with that
+question attached. A cache hit on such an entry has the object checked
+again, within the same retry and suspension bounds, so a long cache
+lifetime cannot hide it.
+
+**Conditional writes** onto an object that is still plaintext need the same
+care. MinIO evaluates the precondition of a write that carries the key by
+reading the existing object *with* that key, so `If-Match` or `If-None-Match`
+over a plaintext object would come back `400` instead of `200` or `412`:
+
+  * A conditional `PutObject` is preceded by a keyless `HEAD` of its target
+    (one extra round trip, only for conditional PUTs). If the target is
+    plaintext, the PUT is carried out as a one-part encrypted multipart
+    upload whose completion carries the client's own condition and no key,
+    so the store evaluates it against the object the client asked about.
+    The client gets an ordinary PUT answer; the object is encrypted. Its
+    flexible checksum headers are not carried over (`Content-MD5` is).
+  * A conditional `CompleteMultipartUpload` the store refuses that way is
+    sent once more without the key. Its body is already buffered, and the
+    assembled object is encrypted regardless, because the initiation and
+    every part carried the key.
+
+A repair is **skipped**, and the reason logged, when the proxy runs with
+`--read-only`, when no level of the current policy may write the path (an
+operator who made a path read-only for everybody did not mean it to be
+rewritten), when the object has tags, object-lock retention, a legal hold or
+access grants beyond its owner's (a rewrite would drop them), when its ACL
+cannot be read, when the rewrite would change its owner, when it is
+archived, or when the store gave no strong ETag. A store that answers `501` to the conditional completion gets no
+repairs at all, rather than unconditional ones; neither does a store that
+accepts a repair's encrypted write without confirming it. Both suspend repairs
+for an hour, so a bucket is not rewritten object by object to no effect. An
+object that was tried, successfully or not, is left alone for ten minutes; a
+later read after that retries it. In-flight repairs are cancelled on shutdown
+and their uploads aborted.
+
+What an operator should know before turning this on:
+
+  * **Credentials.** The proxy's upstream credentials need to write the
+    objects they read: `PutObject` and the multipart actions, including
+    `AbortMultipartUpload` and `ListMultipartUploadParts`, plus
+    `GetObjectAcl` to check an object's grants before it is rewritten.
+  * **Conditional writes.** The store must enforce `If-Match` on
+    `CompleteMultipartUpload` (AWS S3 and MinIO do). A store that silently
+    ignores the header cannot be told apart from one that honours it.
+  * **What changes.** A repaired object has the same bytes, content headers
+    and user metadata, and a new ETag, `Last-Modified` and (in a versioned
+    bucket) version id. A versioned bucket keeps the plaintext as the previous
+    version. Stored checksums are not carried over.
+  * **Traffic.** Each repair reads the object once more and writes it once.
+  * **Coverage.** Only objects that are read get repaired. Objects nobody
+    reads, failed or skipped repairs and old versions stay in plaintext. This
+    is opportunistic encryption, not a migration — and there is no key
+    rotation, no per-tenant key, and no second key to read old objects with.
+
+### ETags
+
+ETags are opaque values to the proxy, and it keeps them in one canonical form:
+the value with any matching surrounding quotes removed, however nested. At
+least one object store answers `ETag: "'abcef123'"` and then refuses that same
+value, single quotes included, as a precondition or in a part list.
+
+| Received | Canonical | Sent as an HTTP validator | Sent in a part list |
+| --- | --- | --- | --- |
+| `abcef123` | `abcef123` | `"abcef123"` | `abcef123` |
+| `"abcef123"` | `abcef123` | `"abcef123"` | `abcef123` |
+| `'abcef123'` | `abcef123` | `"abcef123"` | `abcef123` |
+| `"'abcef123'"` | `abcef123` | `"abcef123"` | `abcef123` |
+
+Weak validators stay weak. Apostrophes inside a value, its case and a
+multipart `-N` suffix are left alone, and an ETag is never taken for the MD5
+of the bytes (under SSE-C it is not). Cache freshness checks, replayed
+validators, client conditions forwarded upstream, multipart completions and
+the repair's preconditions all use the canonical value; clients receive the
+standard `"abcef123"` form, in headers and in XML.
+
+### Encryption and the cache
+
+The cache stores **decrypted** object bytes. SSE-C protects the object store;
+the cache volume needs protecting on its own terms. The cache directory
+records which key it was written under (as a keyed hash, never the key
+itself), and a start with a different key — or with none — empties it, so a
+changed key cannot look healthy only because the cache still answers for
+objects the store would now refuse to decrypt. Writes made directly to the bucket, even
+with the same key, are still external writes to the cache: keep
+`--cache-max-age` finite when anything else writes.
+
 ## Observability
 
 The structured access log and the authorization metrics carry the same four
@@ -667,6 +902,8 @@ second cost a transfer.
   * Any credential store or per-tenant configuration — identity stays derived.
   * Presigned-URL support; clients that need it should address the object store
     directly.
+  * `CopyObject`, client-provided SSE-C keys, key rotation, per-tenant keys,
+    and a bulk migration of plaintext objects to the SSE-C key.
   * Bucket-level administration through the proxy.
   * Caching listings. It would have to be an index the proxy answers
     `ListObjectsV2` from, not a stored response, because a listing is filtered
@@ -739,6 +976,8 @@ $ AWS_ACCESS_KEY_ID=$TENANT$LEVEL AWS_SECRET_ACCESS_KEY=$DERIVED \
   * streaming bodies with explicit caps on the two paths that must buffer
   * optional local disk cache for object reads, with ranged reads served from
     it and every write through the proxy keeping it in step
+  * optional upstream SSE-C with an operator-held key, invisible to clients,
+    with plaintext objects encrypted in place when they are read
   * full instrumentation with Prometheus metrics and a structured access log
   * health endpoints and graceful shutdown with connection draining
   * HTTP and HTTPS for clients; upstream scheme follows the configured endpoint

@@ -334,3 +334,23 @@ func TestDecodeContentEncodingCapsTheDecompressedSize(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, plain.String(), string(out))
 }
+
+func TestSanitizeErrorDocument(t *testing.T) {
+	in := []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match.</Message>` +
+		`<AWSAccessKeyId>AKIAUPSTREAM</AWSAccessKeyId><StringToSign>AWS4-HMAC-SHA256 ...</StringToSign>` +
+		`<CanonicalRequest>PUT /b/k x-amz-server-side-encryption-customer-key:c2VjcmV0</CanonicalRequest>` +
+		`<CanonicalRequestBytes>50 55 54</CanonicalRequestBytes><Resource>/b/acme/k</Resource>` +
+		`<RequestId>R1</RequestId><HostId>H1</HostId></Error>`)
+	out := string(SanitizeErrorDocument(in))
+	assert.Contains(t, out, "<Code>SignatureDoesNotMatch</Code>")
+	assert.Contains(t, out, "<Message>The request signature we calculated does not match.</Message>")
+	assert.Contains(t, out, "<Resource>/b/acme/k</Resource><RequestId>R1</RequestId><HostId>H1</HostId>")
+	for _, gone := range []string{"AKIAUPSTREAM", "StringToSign", "CanonicalRequest", "c2VjcmV0", "50 55 54"} {
+		assert.NotContains(t, out, gone)
+	}
+
+	for _, other := range []string{"not xml at all", `<ListBucketResult><Key>k</Key></ListBucketResult>`} {
+		assert.Equal(t, other, string(SanitizeErrorDocument([]byte(other))), "only an <Error> document is rebuilt")
+	}
+}

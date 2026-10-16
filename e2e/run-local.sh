@@ -2,11 +2,12 @@
 # The same end-to-end suite as run.sh, against binaries instead of
 # containers — for environments without a Docker daemon.
 #
-# It covers the two policy variants, the read-only kill switch and the
-# caching variant. What it cannot cover is anything the container boundary
-# provides: the image build, the https upstream with its private CA, and the
-# memory limit that makes the streaming test meaningful. Use run.sh where a
-# daemon is available.
+# It covers the two policy variants, the read-only kill switch, the caching
+# variant and an SSE-C variant against a second MinIO behind TLS (which needs
+# openssl, for the certificate). What it cannot cover is anything the
+# container boundary provides: the image build and the memory limit that
+# makes the streaming tests meaningful. Use run.sh where a daemon is
+# available.
 #
 #   MINIO_BINARY=/path/to/minio ./e2e/run-local.sh
 #   ./e2e/run-local.sh -run TestTenantIsolation
@@ -58,6 +59,24 @@ for _ in $(seq 1 60); do
   sleep 0.5
 done
 
+# SSE-C needs https all the way: MinIO refuses a customer key over plain http,
+# and so does the proxy. A throwaway certificate for 127.0.0.1 is enough.
+echo "==> starting minio behind TLS"
+mkdir -p "$work/certs"
+openssl req -x509 -nodes -days 1 -newkey rsa:2048 \
+  -keyout "$work/certs/private.key" -out "$work/certs/public.crt" \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
+MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin123 \
+  "$minio_bin" server "$work/data-tls" --address :19443 --console-address :19444 --certs-dir "$work/certs" \
+  >"$work/minio-tls.log" 2>&1 &
+pids+=($!)
+for _ in $(seq 1 60); do
+  curl -fsS -o /dev/null --cacert "$work/certs/public.crt" https://127.0.0.1:19443/minio/health/live 2>/dev/null && break
+  sleep 0.5
+done
+ssec_key='AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8='
+printf '%s\n' "$ssec_key" > "$work/sse-c-key"
+
 # A port already in use is the one failure that can masquerade as success:
 # whatever is squatting on it answers /readyz perfectly well, and the run
 # then exercises a deployment nobody configured. Refuse to start instead.
@@ -85,7 +104,7 @@ start_proxy() {
       --listen-addr=":$api" \
       --health-listen-addr=":$admin" \
       --metrics-listen-addr=":$admin" \
-      --upstream-endpoint=http://127.0.0.1:19000 \
+      --upstream-endpoint="${PROXY_UPSTREAM:-http://127.0.0.1:19000}" \
       --policy-reload-interval=2s \
       "$@" >"$work/$name.log" 2>&1 &
   local pid=$!
@@ -176,6 +195,11 @@ start_proxy variant-a e2e/policies/policy-a.yaml 18099 18100
 start_proxy variant-b e2e/policies/policy-b.yaml 18299 18300
 start_proxy variant-ro e2e/policies/policy-a.yaml 18399 18400 --read-only
 start_cache_proxy variant-cache e2e/policies/policy-a.yaml 18499 18500 "$work/cache"
+PROXY_UPSTREAM=https://127.0.0.1:19443 SSL_CERT_FILE="$work/certs/public.crt" \
+UPSTREAM_SSE_C_KEY_FILE="$work/sse-c-key" UPSTREAM_SSE_C_REPAIR=true CACHE_PURGE_TOKEN=an-e2e-purge-token \
+  start_proxy variant-ssec e2e/policies/policy-a.yaml 18599 18600 \
+    --cache-dir="$work/ssec-cache" --cache-max-bytes=67108864 \
+    --cache-max-object-size=8388608 --cache-max-age=3s
 
 export E2E_MINIO_ENDPOINT=http://127.0.0.1:19000
 export E2E_MINIO_ACCESS_KEY=minioadmin
@@ -252,6 +276,26 @@ run_variant() {
   export E2E_CACHE_PURGE_TOKEN=an-e2e-purge-token
   export E2E_CACHE_MAX_OBJECT_SIZE=8388608
   export E2E_CACHE_RESTART_CMD="$work/restart-variant-cache.sh"
+  run_variant "$@"
+) || status=1
+
+(
+  export E2E_NAME=variant-ssec
+  export E2E_PROXY_ENDPOINT=http://127.0.0.1:18599
+  export E2E_ADMIN_ENDPOINT=http://127.0.0.1:18600
+  export E2E_MINIO_ENDPOINT=https://127.0.0.1:19443
+  export E2E_MINIO_CA="$work/certs/public.crt"
+  export E2E_ACCESS_KEY_TEMPLATE='{tenant}{level}'
+  export E2E_SECRET_TEMPLATE='{tenant}:{level}'
+  export E2E_KEY_PREFIX_TEMPLATE='{tenant}/'
+  export E2E_READ_LEVEL=ro E2E_WRITE_LEVEL=rw
+  export E2E_TENANT_A=a1b2c3d4e5f60718293a4b5c6d7e8f90
+  export E2E_TENANT_B=0f9e8d7c6b5a49382716f5e4d3c2b1a0
+  export E2E_CACHE_MAX_AGE=3s
+  export E2E_CACHE_PURGE_TOKEN=an-e2e-purge-token
+  export E2E_CACHE_MAX_OBJECT_SIZE=8388608
+  export E2E_SSEC_KEY="$ssec_key"
+  export E2E_SSEC_KEY_FILE="$work/sse-c-key"
   run_variant "$@"
 ) || status=1
 

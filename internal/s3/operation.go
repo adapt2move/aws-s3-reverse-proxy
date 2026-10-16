@@ -16,6 +16,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/ssec"
 )
 
 // The proxy is the security boundary for untrusted clients, so the set of
@@ -70,7 +72,19 @@ func (o *Operation) IsBucketLevel() bool {
 var (
 	ErrUnsupportedOperation = errors.New("operation not supported")
 	ErrInvalidKey           = errors.New("invalid object key")
+
+	// ErrCustomerKey refuses a request that carries an SSE-C header. It has
+	// an error of its own because the client deserves to be told why: it
+	// asked for its own encryption key to be used, which this proxy does not
+	// do, and a bare "access denied" would send it looking for a permission
+	// problem.
+	ErrCustomerKey = errors.New("client-provided SSE-C keys are not supported")
 )
+
+// CustomerKeyMessage is what a client is told when it sends an SSE-C header.
+// It is fixed text, so it can be shown outside debug mode and can never echo
+// a header value back.
+const CustomerKeyMessage = "This proxy does not accept SSE-C headers: client-provided encryption keys are not passed through to the object store. Send the request without x-amz-server-side-encryption-customer-* and x-amz-copy-source-server-side-encryption-customer-* headers."
 
 // Query parameters accepted per operation shape. A parameter outside the
 // matching set makes the request unclassifiable, which means 403 — that is
@@ -114,6 +128,18 @@ func (s paramSet) covers(q url.Values) bool {
 // and returns what it is. The error is deliberately coarse: a client learns
 // that an operation is refused, not which check refused it.
 func Classify(req *http.Request) (*Operation, error) {
+	// A client-supplied encryption key is refused first and by name, whatever
+	// else is wrong with the request: it is the one refusal a client can do
+	// something about, and it must never reach the object store or the cache.
+	// Stripping the headers and carrying on would be worse than refusing —
+	// the client would believe its object is encrypted under its own key. The
+	// copy-source variants are included even though CopyObject itself is
+	// refused below, so the message does not depend on which header was seen
+	// first.
+	if ssec.HasCustomerHeader(req.Header) {
+		return nil, ErrCustomerKey
+	}
+
 	// A copy names a *second* object key — the source — that no other check
 	// on the request path ever sees, so it would travel upstream
 	// unauthorized and unprefixed. Refuse the header outright rather than

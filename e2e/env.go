@@ -5,7 +5,9 @@ package e2e
 import (
 	"bytes"
 	"crypto/hmac"
+	"crypto/md5"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -103,6 +106,17 @@ type Env struct {
 	// survives a restart, which is the one part of recovery a unit test can
 	// only simulate.
 	CacheRestartCmd string
+
+	// SSECKey, when set, is the Base64 customer key the deployment encrypts
+	// every object with upstream. It marks an SSE-C deployment and enables
+	// the tests in ssec_test.go — and it is what lets Admin read the bucket
+	// as it is, since an encrypted object cannot be read without it.
+	SSECKey string
+
+	// SSECKeyFile is the host path of the key file the deployment read at
+	// startup, when it took its key from one. The test that shows the key is
+	// not hot-reloaded rewrites it.
+	SSECKeyFile string
 }
 
 // Caches reports whether this deployment has the object cache on.
@@ -168,8 +182,13 @@ func LoadEnv(t *testing.T) Env {
 	}
 	env.CachePurgeToken = os.Getenv("E2E_CACHE_PURGE_TOKEN")
 	env.CacheRestartCmd = os.Getenv("E2E_CACHE_RESTART_CMD")
+	env.SSECKey = os.Getenv("E2E_SSEC_KEY")
+	env.SSECKeyFile = os.Getenv("E2E_SSEC_KEY_FILE")
 	return env
 }
+
+// Encrypts reports whether this deployment encrypts objects upstream.
+func (e Env) Encrypts() bool { return e.SSECKey != "" }
 
 func mustEnv(t *testing.T, name string) string {
 	t.Helper()
@@ -233,9 +252,51 @@ func (e Env) ClientWithCredentials(t *testing.T, accessKeyID, secret string) *s3
 
 // Admin returns a client that talks to MinIO directly, bypassing the proxy.
 // It is how the suite checks what really landed in the bucket.
+//
+// On an SSE-C deployment it sends the deployment's key on every object read
+// and write, the way any other client of the same bucket would have to. That
+// is what lets the rest of the suite run unchanged against such a deployment
+// — and it makes every one of its direct reads a check that the proxy wrote
+// with the key, and every direct write a check that the proxy reads what
+// other key holders wrote.
 func (e Env) Admin(t *testing.T) *s3.S3 {
 	t.Helper()
+	client := e.RawAdmin(t)
+	if e.SSECKey != "" {
+		withCustomerKey(client, e.SSECKey)
+	}
+	return client
+}
+
+// RawAdmin is Admin without the customer key: the bucket as a client that
+// does not hold it sees it.
+func (e Env) RawAdmin(t *testing.T) *s3.S3 {
+	t.Helper()
 	return e.clientFor(t, e.MinioEndpoint, e.MinioAccessKey, e.MinioSecretKey)
+}
+
+// AdminWithKey is Admin holding a key of the caller's choosing.
+func (e Env) AdminWithKey(t *testing.T, key string) *s3.S3 {
+	t.Helper()
+	return withCustomerKey(e.RawAdmin(t), key)
+}
+
+// withCustomerKey makes a client send an SSE-C key on the operations that take
+// one. It is a request handler rather than the SDK's per-call fields so that
+// the existing tests' direct reads pick it up without being rewritten.
+func withCustomerKey(client *s3.S3, encoded string) *s3.S3 {
+	raw, _ := base64.StdEncoding.DecodeString(encoded)
+	sum := md5.Sum(raw)
+	digest := base64.StdEncoding.EncodeToString(sum[:])
+	client.Handlers.Build.PushBack(func(r *request.Request) {
+		switch r.Operation.Name {
+		case "GetObject", "HeadObject", "PutObject", "CreateMultipartUpload", "UploadPart":
+			r.HTTPRequest.Header.Set("X-Amz-Server-Side-Encryption-Customer-Algorithm", "AES256")
+			r.HTTPRequest.Header.Set("X-Amz-Server-Side-Encryption-Customer-Key", encoded)
+			r.HTTPRequest.Header.Set("X-Amz-Server-Side-Encryption-Customer-Key-Md5", digest)
+		}
+	})
+	return client
 }
 
 func (e Env) clientFor(t *testing.T, endpoint, accessKeyID, secret string) *s3.S3 {

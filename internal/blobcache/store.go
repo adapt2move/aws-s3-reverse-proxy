@@ -116,6 +116,9 @@ func Open(opts Options) (*Store, error) {
 	for i := range s.shards {
 		s.shards[i].m = make(map[uint64]*entry)
 	}
+	if err := adoptLabel(opts); err != nil {
+		return nil, err
+	}
 	if err := s.recover(); err != nil {
 		if s.active != nil {
 			_ = s.active.close()

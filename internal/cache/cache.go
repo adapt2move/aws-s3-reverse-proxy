@@ -47,6 +47,11 @@ type Options struct {
 	SegmentSize   int64
 	InlineMaxSize int64
 
+	// Label names the configuration the cached responses depend on beyond
+	// their key. A cache opened with a different label than the one its
+	// directory was written under starts empty. See blobcache.Options.Label.
+	Label string
+
 	// MaxAge is how long an entry may be served without being fetched
 	// again. Zero means never: the cache is then only ever wrong if
 	// something outside this process changes an object.
@@ -144,6 +149,7 @@ func New(opts Options) (*Cache, error) {
 		SegmentSize:   opts.SegmentSize,
 		InlineMaxSize: opts.InlineMaxSize,
 		SyncDeletes:   true,
+		Label:         opts.Label,
 		Logf:          opts.Logf,
 	})
 	if err != nil {

@@ -23,6 +23,7 @@ type Mutation struct {
 
 	capture *Writer
 	stored  bool
+	ended   bool
 }
 
 // BeginMutation claims these keys for a write that is about to be sent
@@ -107,16 +108,19 @@ func (m *Mutation) Store(header http.Header) {
 	}
 }
 
-// End releases the keys.
+// End releases the keys. Calling it again does nothing, so a caller can end a
+// mutation as early as it knows the outcome and still defer End as a
+// backstop.
 //
 // If no body was stored — the write failed, there was nothing to capture, or
 // capturing it did not work out — the keys are invalidated once more. They
 // were already invalidated at the start; doing it again costs a lookup and
 // closes the case where something slipped into the cache in between.
 func (m *Mutation) End() {
-	if m == nil {
+	if m == nil || m.ended {
 		return
 	}
+	m.ended = true
 	if m.capture != nil {
 		m.capture.Abort() // no-op after a successful Commit
 	}
