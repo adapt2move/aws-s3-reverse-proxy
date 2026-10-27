@@ -291,6 +291,11 @@ func TestAWriteThatDidNotHappenKeepsTheRememberedListing(t *testing.T) {
 		require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
 
 		upstream.server.Close()
+		// The object store is gone and refuses new connections. A pooled
+		// one it closed a moment ago is another case: a write on it may
+		// have been sent, so it invalidates, and the test must not depend
+		// on which of the two the transport happens to pick.
+		h.transport.CloseIdleConnections()
 		require.Equal(t, http.StatusBadGateway, put(t, h, "/bucket/datasets/2026/b.csv").StatusCode)
 		remembered := list(t, h, tenantA, "rws")
 		require.Equal(t, http.StatusOK, remembered.StatusCode)
