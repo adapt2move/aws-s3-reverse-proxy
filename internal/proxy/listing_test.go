@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -571,4 +572,38 @@ func TestClosingTheHandlerCancelsBackgroundListings(t *testing.T) {
 	start := time.Now()
 	h.Close()
 	assert.Less(t, time.Since(start), time.Second)
+}
+
+// abortingBody is a client that sends part of an upload and then goes away.
+type abortingBody struct{ left int }
+
+func (b *abortingBody) Read(p []byte) (int, error) {
+	if b.left == 0 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	n := min(len(p), b.left)
+	for i := range p[:n] {
+		p[i] = 'x'
+	}
+	b.left -= n
+	return n, nil
+}
+
+// An object store cannot store an object from half its body, so a write
+// whose body never reached its end was not applied. It must not hold its
+// prefix the way a write that was sent and never answered does.
+func TestAnUploadAbortedHalfwayHoldsNothing(t *testing.T) {
+	h, _, _ := newFallbackProxy(t, time.Second, withRefreshDelay(20*time.Millisecond))
+	require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
+
+	req := clientRequest{
+		method: http.MethodPut, target: "/bucket/datasets/2026/big.bin", body: make([]byte, 1<<20),
+		tenant: tenantA, level: "rw", headers: http.Header{"X-Amz-Content-Sha256": {"UNSIGNED-PAYLOAD"}},
+	}.build(t)
+	req.Body = io.NopCloser(&abortingBody{left: 64 << 10})
+	assert.NotEqual(t, http.StatusOK, doRequest(t, h, req).Code)
+
+	require.Equal(t, uint64(1), h.ListFallback().Stats().Stored)
+	require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
+	assert.Equal(t, uint64(2), h.ListFallback().Stats().Stored, "the prefix is not held: the next listing is remembered")
 }

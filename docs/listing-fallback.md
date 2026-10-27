@@ -72,7 +72,10 @@ contradicting what a client was told through this proxy:
     object takes minutes. Such a write drops the listings that would show it
     and keeps its keys claimed for `--list-fallback-max-age`: no listing under
     them is remembered in that time, and nothing is refreshed, since either
-    could capture the state from before the write landed.
+    could capture the state from before the write landed. A write whose body
+    never reached its end — a client that aborted an upload halfway — is not
+    one of these: no object store applies part of a request, so it counts as
+    refused.
 
 What is remembered is the object store's own response, before the tenant
 prefix is stripped out and before entries are filtered by access level. A

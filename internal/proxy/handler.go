@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -590,6 +591,12 @@ type requestState struct {
 	// answered. See settleWrite.
 	writeOutcome listcache.Outcome
 	writeSettled bool
+
+	// bodyTracked and bodySent say whether the upstream request had a body,
+	// and whether it was read to its end. The transport reads it on a
+	// goroutine of its own, hence the atomic.
+	bodyTracked bool
+	bodySent    atomic.Bool
 }
 
 type requestStateKey struct{}

@@ -35,6 +35,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/listcache"
@@ -289,11 +290,56 @@ func (st *requestState) settleWrite(outcome listcache.Outcome) {
 
 // listingWriteOutcome is what became of this request's write, as far as it
 // is known when the request is over.
+//
+// A write whose body never reached its end was not applied, whatever else
+// went wrong: an object store cannot store an object, or complete an upload,
+// from part of the request.
 func (st *requestState) listingWriteOutcome() listcache.Outcome {
 	if st.writeSettled {
 		return st.writeOutcome
 	}
+	if st.bodyTracked && !st.bodySent.Load() {
+		return listcache.Refused
+	}
 	return listcache.Unresolved
+}
+
+// trackBodySent records on st when the upstream request's body has been read
+// to its end — the earliest point at which the object store can have all of
+// it. A body that is empty is not tracked: there is nothing it could be
+// missing.
+//
+// GetBody is wrapped the same way, so a retry on a fresh connection is
+// tracked as well, and stays possible at all.
+func trackBodySent(req *http.Request, st *requestState) {
+	if req.Body == nil || req.Body == http.NoBody || req.ContentLength <= 0 {
+		return
+	}
+	st.bodyTracked = true
+	req.Body = &sentTracker{ReadCloser: req.Body, sent: &st.bodySent}
+	if getBody := req.GetBody; getBody != nil {
+		req.GetBody = func() (io.ReadCloser, error) {
+			body, err := getBody()
+			if err != nil {
+				return nil, err
+			}
+			return &sentTracker{ReadCloser: body, sent: &st.bodySent}, nil
+		}
+	}
+}
+
+// sentTracker marks a request body as sent once it has been read to EOF.
+type sentTracker struct {
+	io.ReadCloser
+	sent *atomic.Bool
+}
+
+func (t *sentTracker) Read(p []byte) (int, error) {
+	n, err := t.ReadCloser.Read(p)
+	if err == io.EOF {
+		t.sent.Store(true)
+	}
+	return n, err
 }
 
 // neverSent reports whether an upstream request failed before the object
