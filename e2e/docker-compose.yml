@@ -11,7 +11,7 @@
 services:
   # The in-cluster case: an S3-compatible store over plain http.
   minio:
-    image: reg.mini.dev/minio:0.20250907.161309
+    image: ghcr.io/adapt2move/minio:release.2025-10-15t17-29-55z
     command: server /data --address :9000 --console-address :9001
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -46,7 +46,7 @@ services:
         cp /certs/public.crt /out/public.crt
 
   minio-tls:
-    image: reg.mini.dev/minio:0.20250907.161309
+    image: ghcr.io/adapt2move/minio:release.2025-10-15t17-29-55z
     command: server /data --address :9000 --certs-dir /certs
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -62,7 +62,7 @@ services:
     # it actually needs to do until it works.
 
   createbuckets:
-    image: reg.mini.dev/minio-client:0.20250813.083541
+    image: ghcr.io/adapt2move/minio-mc:release.2025-08-13t08-35-41z
     depends_on:
       minio: {condition: service_healthy}
       minio-tls: {condition: service_started}
