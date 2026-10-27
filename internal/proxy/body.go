@@ -208,7 +208,7 @@ func (h *Handler) prepareDeleteBody(raw []byte, reqHeader http.Header, st *reque
 			continue
 		}
 		obj.Key = st.identity.KeyPrefix + obj.Key
-		if h.cfg.Cache != nil {
+		if h.cfg.Cache != nil || h.cfg.ListFallback != nil {
 			st.deletedKeys = append(st.deletedKeys, upstreamKeyFor(st.operation.Bucket, obj.Key))
 		}
 		allowed = append(allowed, obj)

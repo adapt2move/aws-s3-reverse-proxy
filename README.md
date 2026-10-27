@@ -33,6 +33,9 @@ the security boundary — not a convenience layer in front of one.
    with the operator's SSE-C key added to object reads and writes when one is
    configured (see [Upstream encryption](#upstream-encryption-sse-c)).
 7. Strip the prefix back out of `ListObjectsV2` and `DeleteObjects` responses.
+   With `--list-fallback`, a listing the object store does not answer in time,
+   or fails with a server error, is answered with the last answer it gave
+   instead — rewritten the same way (see [Listing fallback](#listing-fallback)).
 
 ## Module layout
 
@@ -54,6 +57,8 @@ cmd/aws-s3-reverse-proxy   the process: flags, secrets, listeners, shutdown
 
     internal/cache         cached upstream responses: freshness, invalidation
       internal/blobcache   the disk underneath it
+    internal/listcache     remembered listings, in memory, for when the
+                           object store does not answer
 ```
 
 Three seams keep the arrows pointing one way:
@@ -268,6 +273,19 @@ practice.
 The last three are expert knobs. The first six are the ones a deployment
 actually turns.
 
+### Listing fallback flags
+
+Off unless `--list-fallback` is set, and independent of `--cache-dir`: the
+fallback holds listings in memory, not objects on disk. See
+[Listing fallback](#listing-fallback).
+
+| Flag (env) | Default | Meaning |
+| --- | --- | --- |
+| `--list-fallback` (`LIST_FALLBACK`) | `false` | remember the last answer to each listing, and serve it when the object store does not answer |
+| `--list-fallback-timeout` (`LIST_FALLBACK_TIMEOUT`) | `1s` | how long a listing with a remembered answer waits for the object store before that answer is served instead |
+| `--list-fallback-max-age` (`LIST_FALLBACK_MAX_AGE`) | `1h` | how old a remembered listing may be and still be served |
+| `--list-fallback-max-bytes` (`LIST_FALLBACK_MAX_BYTES`) | 64 MiB | how much memory remembered listings may occupy |
+
 ### Hot reload
 
 The policy file is re-read on `SIGHUP` and, by default, on a timer. A reload
@@ -389,7 +407,7 @@ to the bucket.
 | Ranged reads | answered from a cached object, Range arithmetic and all — including after a revalidation. A ranged **miss** is proxied straight through and the whole object is fetched in the background, see below. |
 | `PutObject` | invalidates the object, and with `--cache-writes` the uploaded body is kept, so writing an object leaves it cached. |
 | `DeleteObject`, `DeleteObjects`, `CompleteMultipartUpload` | invalidate every key they touch. |
-| `ListObjectsV2` | **never cached.** A listing's body is filtered per access level on the way out, so a cached one would be an answer to one caller rather than a copy of anything. |
+| `ListObjectsV2` | **never answered from the cache.** A listing always goes to the object store. With `--list-fallback`, its answer is remembered for when the object store does not give one — see [Listing fallback](#listing-fallback). |
 | Multipart parts | not cached. The object does not exist until the upload is completed, and completing it invalidates the key. |
 
 An object marked `Cache-Control: no-store` or `private` is not stored: those
@@ -631,6 +649,76 @@ exist to hold the second half of that sentence — each one damages a store the
 way a particular failure would and checks that what comes back is a subset of
 what went in.
 
+## Listing fallback
+
+Set `--list-fallback` and a listing the object store does not answer is still
+answered: with the last answer the object store gave to the same listing. It
+is meant for an outage of the object store — a client that lists before it
+reads keeps working for as long as the objects it reads are in the cache, or
+are not needed.
+
+It is a fallback and nothing else. A listing **always** goes to the object
+store first, and the remembered answer is only used when that request:
+
+  * has not been answered within `--list-fallback-timeout` (`1s`) — the whole
+    answer, body included, or
+  * failed with a server error (`5xx`), or never got an answer at all — the
+    connection was refused, broke, or timed out.
+
+A refusal (`4xx`) is the object store answering, and is passed on. It also
+drops what was remembered for that listing: the bucket may be gone or the
+credentials changed, and the remembered answer describes a state the object
+store no longer agrees with. A listing nothing was remembered for is not cut
+off at the deadline; it waits for the object store exactly as it would without
+the fallback.
+
+A listing answered this way carries `X-Cache: FALLBACK` and an `Age` header
+with how old the answer is, and is logged as a warning with the reason.
+
+### What keeps it consistent
+
+A listing summarizes every key under its prefix, so any write under that
+prefix changes the answer. Three rules keep a remembered listing from ever
+contradicting what a client was told through this proxy:
+
+  * **A write drops every listing that would show it** — any `PutObject`,
+    `DeleteObject`, `DeleteObjects` or `CompleteMultipartUpload` under the
+    listing's prefix, and the in-place encryption of a legacy object — before
+    the client that made the write is told it succeeded. A listing remembered
+    from before a write can therefore not be served after it was
+    acknowledged.
+  * **A listing that overlapped a write is not remembered.** If a write under
+    its prefix was in flight at any point while the listing was, which side of
+    the write the object store answered from is not something the proxy can
+    know, so that answer is dropped and the one before it stays only if the
+    write turns out not to have happened.
+  * **A write that did not happen changes nothing.** One the object store
+    refused (`4xx`), or one that never reached it (the connection could not be
+    made), keeps the remembered listings — an outage is exactly when writes
+    fail, and dropping the fallback for every failed write would take it away
+    when it is needed. A `5xx` or a connection that broke after the request
+    was sent may have come after the object changed, and drops them.
+
+What is remembered is the object store's own response, before the tenant
+prefix is stripped out and before entries are filtered by access level. A
+remembered listing goes through the same rewrite a live one does, with the
+policy in force when it is served — so `ro` served a listing remembered from an
+`rws` request still does not see the carve-out only `rws` may read. The key is
+the upstream request, tenant prefix included, so two tenants listing the same
+prefix never share an answer.
+
+### What it cannot see
+
+Writes that do not pass through this process: another replica, another
+client, a lifecycle rule. A listing served from memory can miss those for up
+to `--list-fallback-max-age`, which is why that bound exists and why the
+fallback is off by default. With more than one replica, each one remembers and
+invalidates its own listings only.
+
+Nothing is persisted: a restart starts with no remembered listings, which is
+also the conservative answer to "what did I miss while I was down". Purging the
+cache (`POST /cache/purge`) empties the fallback too.
+
 ## Upstream encryption (SSE-C)
 
 Set `UPSTREAM_SSE_C_KEY` (or `UPSTREAM_SSE_C_KEY_FILE`) and every object is
@@ -868,7 +956,9 @@ level=warning msg="request denied" tenant=1f0c… access_level=ro operation=PutO
 (The identity's level is logged as `access_level`, because logrus already
 uses `level` for the severity of the line itself.) With a cache configured,
 every line also carries `cache=hit|revalidated|stale|miss|bypass`, which is
-what turns "the hit rate dropped" into a list of the requests that missed.
+what turns "the hit rate dropped" into a list of the requests that missed. A
+listing answered by the [listing fallback](#listing-fallback) carries
+`cache=fallback`.
 
 No credentials, signatures or `Authorization` header content appear in logs or
 in metric labels, at any verbosity. The tenant id is available as a metric
@@ -881,17 +971,22 @@ an unbounded label is an unbounded number of time series.
 | `s3proxy_batch_delete_denied_keys_total{tenant,level}` | keys refused inside a batch |
 | `s3proxy_proxied_request_duration_seconds{operation,decision}` | end-to-end latency |
 | `s3proxy_policy_reloads_total{outcome}` | reloads applied / rejected / unchanged |
-| `s3proxy_cache_lookups_total{operation,result}` | cache lookups: hit, revalidated, stale, miss, bypass |
+| `s3proxy_cache_lookups_total{operation,result}` | cache lookups: hit, revalidated, stale, miss, bypass; `fallback` for a listing answered from memory |
 | `s3proxy_cache_entries`, `s3proxy_cache_bytes`, `s3proxy_cache_capacity_bytes` | what the cache holds |
 | `s3proxy_cache_stores_total`, `s3proxy_cache_store_failures_total` | responses written, and the ones that could not be |
 | `s3proxy_cache_invalidations_total` | keys dropped because the object behind them was written |
 | `s3proxy_cache_evictions_total`, `s3proxy_cache_evicted_bytes_total` | reclaim, to stay within the size limit |
+| `s3proxy_list_fallback_entries`, `s3proxy_list_fallback_bytes`, `s3proxy_list_fallback_capacity_bytes` | what the listing fallback holds |
+| `s3proxy_list_fallback_stores_total`, `s3proxy_list_fallback_store_failures_total` | listings remembered, and the ones that were not because a write overlapped them |
+| `s3proxy_list_fallback_invalidations_total` | remembered listings dropped because a write may have changed them |
 
-The cache series appear only when a cache is configured: a deployment without
-one exports nothing rather than a set of zeros that read like an idle cache.
+The cache series appear only when a cache is configured, and the listing
+fallback's only when it is: a deployment without one exports nothing rather
+than a set of zeros that read like an idle cache.
 Every object **read** also carries an `X-Cache` header — `HIT`, `REVALIDATED`,
 `STALE`, `MISS`, `BYPASS` — so a hit rate is answerable from one request and
-not only from a dashboard. Writes and listings carry none: they are not
+not only from a dashboard. Writes and listings carry none — except a listing
+answered by the fallback, which says `FALLBACK` — since they are not
 lookups, and counting them as one would put every upload in the metric as a
 bypass. `REVALIDATED` against `STALE` is the pair worth
 watching when tuning `--cache-max-age`: the first cost a round trip, the
@@ -905,9 +1000,11 @@ second cost a transfer.
   * `CopyObject`, client-provided SSE-C keys, key rotation, per-tenant keys,
     and a bulk migration of plaintext objects to the SSE-C key.
   * Bucket-level administration through the proxy.
-  * Caching listings. It would have to be an index the proxy answers
-    `ListObjectsV2` from, not a stored response, because a listing is filtered
-    per access level on the way out.
+  * Answering listings from a cache while the object store is up. A listing
+    summarizes every key under its prefix, and every write anywhere under it
+    would be a window in which clients are told something that is no longer
+    true. The [listing fallback](#listing-fallback) only answers when the
+    object store does not.
 
 ## Releases
 

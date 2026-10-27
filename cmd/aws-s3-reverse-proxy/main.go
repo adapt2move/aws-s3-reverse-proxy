@@ -22,6 +22,7 @@ import (
 
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/cache"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/config"
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/listcache"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/observability"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/policy"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/proxy"
@@ -56,7 +57,7 @@ func main() {
 	var ready atomic.Bool
 	ready.Store(true)
 
-	servers := listeners(opts, handler, objectCache, &ready)
+	servers := listeners(opts, handler, objectCache, handler.ListFallback(), &ready)
 
 	<-ctx.Done()
 	stop() // a second signal terminates immediately instead of hanging
@@ -122,6 +123,11 @@ func buildProxy(opts config.Options) (*proxy.Handler, *policy.Store, *cache.Cach
 	}
 	store.OnReload = reportReload(store)
 
+	listings, err := buildListFallback(opts)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
 	objectCache, err := buildCache(opts)
 	if err != nil {
 		return nil, nil, nil, err
@@ -144,12 +150,14 @@ func buildProxy(opts config.Options) (*proxy.Handler, *policy.Store, *cache.Cach
 			DeleteBody:  opts.MaxDeleteBodySize,
 			RewriteBody: opts.MaxRewriteBodySize,
 		},
-		TenantMetricLabel: opts.TenantMetricLabel,
-		Cache:             objectCache,
-		CacheWrites:       opts.CacheWrites,
-		CacheRangeFills:   opts.CacheRangeFills,
-		UpstreamSSECKey:   opts.UpstreamSSECKey,
-		RepairPlaintext:   opts.UpstreamSSECRepair,
+		TenantMetricLabel:   opts.TenantMetricLabel,
+		Cache:               objectCache,
+		CacheWrites:         opts.CacheWrites,
+		CacheRangeFills:     opts.CacheRangeFills,
+		ListFallback:        listings,
+		ListFallbackTimeout: opts.ListFallbackTimeout,
+		UpstreamSSECKey:     opts.UpstreamSSECKey,
+		RepairPlaintext:     opts.UpstreamSSECRepair,
 	})
 	if err != nil {
 		if objectCache != nil {
@@ -201,6 +209,42 @@ func buildCache(opts config.Options) (*cache.Cache, error) {
 	return c, nil
 }
 
+// buildListFallback creates the listing fallback, or returns nil when it was
+// not asked for.
+//
+// Each bound is required rather than defaulted away: a timeout of zero would
+// answer every listing from memory, and an age of zero would never answer
+// one, and neither is what somebody who turned this on meant.
+func buildListFallback(opts config.Options) (*listcache.Cache, error) {
+	if !opts.ListFallback {
+		return nil, nil
+	}
+	switch {
+	case opts.ListFallbackTimeout <= 0:
+		return nil, errors.New("--list-fallback-timeout must be positive")
+	case opts.ListFallbackMaxAge <= 0:
+		return nil, errors.New("--list-fallback-max-age must be positive")
+	case opts.ListFallbackMaxBytes <= 0:
+		return nil, errors.New("--list-fallback-max-bytes must be positive")
+	}
+	listings := listcache.New(listcache.Options{
+		MaxBytes: opts.ListFallbackMaxBytes,
+		MaxAge:   opts.ListFallbackMaxAge,
+	})
+	observability.RegisterListFallbackStats(func() observability.ListFallbackStats {
+		s := listings.Stats()
+		return observability.ListFallbackStats{
+			Entries:       s.Entries,
+			Bytes:         s.Bytes,
+			Capacity:      s.Capacity,
+			Stored:        s.Stored,
+			Dropped:       s.Dropped,
+			Invalidations: s.Invalidations,
+		}
+	})
+	return listings, nil
+}
+
 // cacheLabel names the upstream encryption configuration the cache's entries
 // depend on.
 //
@@ -223,7 +267,7 @@ func cacheLabel(opts config.Options) string {
 // API: on that one, a path like /healthz is indistinguishable from a bucket
 // named "healthz". They may share one with each other, which is what the
 // address-keyed mux below allows.
-func listeners(opts config.Options, handler http.Handler, objectCache *cache.Cache, ready *atomic.Bool) []*http.Server {
+func listeners(opts config.Options, handler http.Handler, objectCache *cache.Cache, listings *listcache.Cache, ready *atomic.Bool) []*http.Server {
 	var servers []*http.Server
 
 	if addr := opts.PprofListenAddr; isListenAddr(addr) {
@@ -252,9 +296,16 @@ func listeners(opts config.Options, handler http.Handler, objectCache *cache.Cac
 	if addr := opts.HealthListenAddr; isListenAddr(addr) {
 		observability.RegisterHealth(adminMux(addr), ready)
 		log.Infof("Serving /healthz and /readyz on %s", addr)
+		var purge []cache.PurgeTarget
 		if objectCache != nil {
-			adminMux(addr).Handle("/cache/purge", cache.PurgeHandler(objectCache, opts.CachePurgeToken))
-			log.Infof("Serving POST %s/cache/purge to empty the object cache", addr)
+			purge = append(purge, objectCache.PurgeTarget())
+		}
+		if listings != nil {
+			purge = append(purge, cache.PurgeTarget{What: "listings", Size: listings.Size, Purge: listings.Purge})
+		}
+		if len(purge) > 0 {
+			adminMux(addr).Handle("/cache/purge", cache.PurgeHandler(opts.CachePurgeToken, purge...))
+			log.Infof("Serving POST %s/cache/purge to empty the object cache and the listing fallback", addr)
 		}
 	}
 	for addr, mux := range adminMuxes {
@@ -297,6 +348,7 @@ func logStartup(opts config.Options, handler *proxy.Handler, store *policy.Store
 	}
 	logEncryptionStartup(opts)
 	logCacheStartup(opts)
+	logListFallbackStartup(opts)
 }
 
 // logEncryptionStartup says what upstream encryption does and, as importantly,
@@ -360,6 +412,24 @@ func logCacheStartup(opts config.Options) {
 		log.Warnf("POST /cache/purge is unauthenticated (CACHE_PURGE_TOKEN is unset): anything that " +
 			"can reach the admin listener can empty the cache, and repeatedly doing so forces full " +
 			"re-fetches from the object store.")
+	}
+}
+
+// logListFallbackStartup says when a listing can be answered from memory, and
+// what such an answer can miss.
+func logListFallbackStartup(opts config.Options) {
+	if !opts.ListFallback {
+		return
+	}
+	log.Infof("Listing fallback on: a listing the object store does not answer within %s, or fails with a "+
+		"server error, is answered with the last answer it gave, if that is at most %s old (up to %d bytes in memory).",
+		opts.ListFallbackTimeout, opts.ListFallbackMaxAge, opts.ListFallbackMaxBytes)
+	log.Warnf("Writes through this proxy drop the remembered listings they affect; writes that bypass it — "+
+		"another replica, another client, a lifecycle rule — are not seen, and a listing served from memory "+
+		"can miss them for up to %s.", opts.ListFallbackMaxAge)
+	if !opts.CacheEnabled() && opts.CachePurgeToken == "" && isListenAddr(opts.HealthListenAddr) {
+		log.Warnf("POST /cache/purge is unauthenticated (CACHE_PURGE_TOKEN is unset): anything that " +
+			"can reach the admin listener can empty the listing fallback.")
 	}
 }
 
