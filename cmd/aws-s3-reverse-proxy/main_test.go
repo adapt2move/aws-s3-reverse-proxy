@@ -85,20 +85,6 @@ func TestStartupFailsOnAnUnusableCacheDirectory(t *testing.T) {
 	assert.Contains(t, err.Error(), "writable by the user this process runs as")
 }
 
-func TestStartupRejectsContradictoryCacheSizes(t *testing.T) {
-	opts := baseOptions(t)
-	opts.CacheDir = filepath.Join(t.TempDir(), "objects")
-	// An object that cannot share a segment with anything would make the
-	// segment layout pointless, so it is refused rather than quietly
-	// reinterpreted.
-	opts.CacheSegmentSize = 4 << 20
-	opts.CacheInlineMaxSize = 4 << 20
-
-	_, _, _, err := buildProxy(opts)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "InlineMaxSize")
-}
-
 func TestBuildProxyRejectsBrokenSubnets(t *testing.T) {
 	for _, subnet := range []string{"foobar", "", "127.0.0.1/XXX", "127.0.0.1", "256.0.0.1"} {
 		opts := baseOptions(t)
@@ -164,9 +150,7 @@ func sseKey(t *testing.T, b byte) *ssec.Key {
 }
 
 // A customer key over plain http would cross the network in the clear on
-// every request. It fails at startup — and before the cache is opened, which
-// would otherwise already have discarded what an unencrypted deployment had
-// cached under the new key's label.
+// every request. It fails at startup, before anything is opened.
 func TestStartupRefusesAKeyOverHTTP(t *testing.T) {
 	opts := baseOptions(t)
 	opts.UpstreamEndpoint = "http://minio:9000"
@@ -187,15 +171,14 @@ func TestStartupRefusesAKeyOverHTTP(t *testing.T) {
 
 // What the cache holds was read with one key. A restart with another one — or
 // with none — must not look healthy only because the cache still answers for
-// objects the store would now refuse to decrypt.
-func TestTheCacheIsEmptiedWhenTheKeyChanges(t *testing.T) {
+// objects the store would now refuse to decrypt. Every start begins empty, so
+// it cannot, whatever the key did in between.
+func TestARestartNeverServesWhatAnEarlierProcessCached(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "objects")
-	// The cache is opened the way buildCache opens it, label and all; going
-	// through buildCache itself would register its metrics a second time.
-	start := func(key *ssec.Key) (*cache.Cache, func()) {
-		opts := baseOptions(t)
-		opts.UpstreamSSECKey = key
-		objectCache, err := cache.New(cache.Options{Dir: dir, Label: cacheLabel(opts)})
+	// The cache is opened the way buildCache opens it; going through
+	// buildCache itself would register its metrics a second time.
+	start := func() (*cache.Cache, func()) {
+		objectCache, err := cache.New(cache.Options{Dir: dir})
 		require.NoError(t, err)
 		return objectCache, func() { require.NoError(t, objectCache.Close()) }
 	}
@@ -206,20 +189,12 @@ func TestTheCacheIsEmptiedWhenTheKeyChanges(t *testing.T) {
 		require.NoError(t, w.Commit(http.Header{}))
 	}
 
-	c, stop := start(sseKey(t, 1))
+	c, stop := start()
 	store(c)
+	assert.True(t, c.Has("bucket/tenant/object"))
 	stop()
 
-	c, stop = start(sseKey(t, 1))
-	assert.True(t, c.Has("bucket/tenant/object"), "the same key keeps the cache")
-	stop()
-
-	c, stop = start(sseKey(t, 2))
-	assert.False(t, c.Has("bucket/tenant/object"), "another key empties it")
-	store(c)
-	stop()
-
-	c, stop = start(nil)
-	assert.False(t, c.Has("bucket/tenant/object"), "and so does removing the key")
+	c, stop = start()
+	assert.False(t, c.Has("bucket/tenant/object"), "a restart starts empty, with the same key or another one")
 	stop()
 }

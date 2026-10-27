@@ -37,8 +37,6 @@ func newCache(t *testing.T, tune ...func(*Options)) (*Cache, *clock) {
 	opts := Options{
 		Dir:           t.TempDir(),
 		MaxBytes:      4 << 20,
-		SegmentSize:   64 << 10,
-		InlineMaxSize: 8 << 10,
 		MaxObjectSize: 1 << 20,
 		Now:           tick.Now,
 		Logf:          func(format string, args ...any) { t.Logf("cache: "+format, args...) },
@@ -408,7 +406,7 @@ func TestStorableHonoursNoStoreAndPrivate(t *testing.T) {
 func TestCorruptMetadataIsDiscarded(t *testing.T) {
 	c, _ := newCache(t)
 
-	// The payload and what is recorded about it are committed as one record,
+	// The payload and what is recorded about it are committed as one file,
 	// so they cannot disagree — but if they ever did, the entry has to go
 	// rather than be served.
 	w, err := c.store.Put("k", 4)
@@ -423,9 +421,13 @@ func TestCorruptMetadataIsDiscarded(t *testing.T) {
 	assert.Equal(t, Miss, result, "and it is gone, not merely refused")
 }
 
-func TestSurvivesAReopen(t *testing.T) {
+// Every start is a cold start. The directory is meant to live as long as the
+// process does, and what an earlier process left in it is discarded rather
+// than trusted — so a restart can never serve an entry that the previous run
+// had already invalidated, or one cached under another configuration.
+func TestStartsEmptyAfterAReopen(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{Dir: dir, MaxBytes: 4 << 20, SegmentSize: 64 << 10, InlineMaxSize: 8 << 10}
+	opts := Options{Dir: dir, MaxBytes: 4 << 20}
 	c, err := New(opts)
 	require.NoError(t, err)
 	store(t, c, "k", objectHeader(), []byte("payload"))
@@ -435,12 +437,16 @@ func TestSurvivesAReopen(t *testing.T) {
 	require.NoError(t, err)
 	defer c.Close()
 	entry, result := c.Get("k")
+	assert.Nil(t, entry)
+	assert.Equal(t, Miss, result)
+
+	store(t, c, "k", objectHeader(), []byte("fresh"))
+	entry, result = c.Get("k")
 	require.Equal(t, Hit, result)
 	defer entry.Close()
-	assert.Equal(t, `"d41d8cd98f00b204e9800998ecf8427e"`, entry.ETag())
 	body, err := io.ReadAll(entry.Body())
 	require.NoError(t, err)
-	assert.Equal(t, "payload", string(body))
+	assert.Equal(t, "fresh", string(body))
 }
 
 func TestReadsAreBypassedWhileAWriteIsInFlight(t *testing.T) {

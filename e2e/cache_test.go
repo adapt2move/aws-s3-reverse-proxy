@@ -29,7 +29,7 @@ import (
 // records for an upload is the one MinIO would report for the object
 // afterwards. A stub cannot be written to behind the proxy's back, so it
 // cannot show what happens when something else changes an object. And a stub
-// process does not restart with its disk intact.
+// process does not restart on a volume that still holds what it wrote.
 
 // cacheSetup prepares a caching deployment, and skips everything here on one
 // that has no cache.
@@ -425,37 +425,38 @@ func TestOneTenantsWarmCacheIsAnothersMiss(t *testing.T) {
 	}
 }
 
-// A restart is the one part of recovery a unit test can only simulate: this
-// is a real process that really stopped, with a real directory of segments
-// and blob files left behind for the next one to replay.
-func TestTheCacheSurvivesARestart(t *testing.T) {
+// Every start is a cold start. This is a real process that really stopped,
+// on a volume that still holds the files it wrote — what a container restart
+// inside a pod leaves on an emptyDir. The new process has to throw them away
+// rather than serve them: the object was replaced in the meantime, and only a
+// cache that started empty answers with the new version.
+func TestTheCacheStartsEmptyAfterARestart(t *testing.T) {
 	env := cacheSetup(t)
 	if env.CacheRestartCmd == "" {
 		t.Skip("E2E_CACHE_RESTART_CMD is not set; this runner cannot restart the proxy")
 	}
-	key := "datasets/cache/survives-restart.csv"
-	want := []byte("written before the restart\n")
-	putDirectly(t, env, env.TenantA, key, want)
+	key := "datasets/cache/across-restart.csv"
+	putDirectly(t, env, env.TenantA, key, []byte("written before the restart\n"))
 
 	read(t, env, env.TenantA, env.ReadLevel, key, nil)
 	resp, _ := read(t, env, env.TenantA, env.ReadLevel, key, nil)
 	requireCache(t, resp, "HIT", "a warm read before the restart")
 
+	want := []byte("written behind the proxy's back\n")
+	putDirectly(t, env, env.TenantA, key, want)
 	out, err := exec.Command("sh", "-c", env.CacheRestartCmd).CombinedOutput()
 	if err != nil {
 		t.Fatalf("restarting the proxy: %v\n%s", err, out)
 	}
 	waitReady(t, env)
 
-	// Nothing was fetched in between, so a hit here can only have come off
-	// the disk the previous process left behind.
 	resp, body := read(t, env, env.TenantA, env.ReadLevel, key, nil)
-	if got := resp.Header.Get("X-Cache"); got != "HIT" && got != "REVALIDATED" {
-		t.Fatalf("after a restart the cache reports %q; it started cold", got)
-	}
+	requireCache(t, resp, "MISS", "the first read after a restart")
 	if !bytes.Equal(body, want) {
-		t.Fatalf("the recovered object reads back as %q", body)
+		t.Fatalf("after a restart the object reads back as %q", body)
 	}
+	resp, _ = read(t, env, env.TenantA, env.ReadLevel, key, nil)
+	requireCache(t, resp, "HIT", "and the cache fills again")
 }
 
 func waitReady(t *testing.T, env Env) {

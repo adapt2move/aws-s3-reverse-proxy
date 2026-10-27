@@ -101,10 +101,9 @@ type Env struct {
 	// /cache/purge. Empty means it accepts an unauthenticated purge.
 	CachePurgeToken string
 
-	// CacheRestartCmd, when set, restarts the proxy under test with its
-	// cache directory intact. It is what lets the suite check that a cache
-	// survives a restart, which is the one part of recovery a unit test can
-	// only simulate.
+	// CacheRestartCmd, when set, restarts the proxy under test on the same
+	// cache directory. It is what lets the suite check that a new process
+	// discards what the old one left there instead of serving it.
 	CacheRestartCmd string
 
 	// SSECKey, when set, is the Base64 customer key the deployment encrypts

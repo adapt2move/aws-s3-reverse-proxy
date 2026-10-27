@@ -53,7 +53,7 @@ cmd/aws-s3-reverse-proxy   the process: flags, secrets, listeners, shutdown
     internal/observability access log, metrics, health probes
 
     internal/cache         cached upstream responses: freshness, invalidation
-      internal/blobcache   the disk underneath it
+      internal/filestore   the disk underneath it
 ```
 
 Three seams keep the arrows pointing one way:
@@ -69,7 +69,7 @@ Three seams keep the arrows pointing one way:
   lets the authorization model be tested without either.
 
 The two cache packages keep the same discipline. `internal/cache` knows what
-an HTTP response is and when one goes stale; `internal/blobcache` knows only
+an HTTP response is and when one goes stale; `internal/filestore` knows only
 opaque keys and opaque payloads. Neither knows what S3 is, which tenant asked,
 or whether anyone was allowed to — see [Caching](#caching).
 
@@ -255,18 +255,20 @@ practice.
 
 | Flag (env) | Default | Meaning |
 | --- | --- | --- |
-| `--cache-dir` (`CACHE_DIR`) | *off* | directory to cache object reads in; empty disables caching entirely |
+| `--cache-dir` (`CACHE_DIR`) | *off* | directory to cache object reads in, emptied at every start; empty disables caching entirely |
 | `--cache-max-bytes` (`CACHE_MAX_BYTES`) | 1 GiB | how much disk the cache may use |
 | `--cache-max-object-size` (`CACHE_MAX_OBJECT_SIZE`) | 64 MiB | largest object accepted; bigger ones are proxied without being stored |
 | `--cache-max-age` (`CACHE_MAX_AGE`) | `10m` | how long an object is served before it is checked against the object store; `0s` disables expiry entirely |
 | `--cache-writes` (`CACHE_WRITES`) | `true` | also cache the body of an accepted upload |
 | `--cache-range-fills` (`CACHE_RANGE_FILLS`) | `true` | fetch the whole object in the background when a ranged read misses |
-| `--cache-max-entries` (`CACHE_MAX_ENTRIES`) | `0` | object count limit; `0` for none. Budget ~100 bytes of memory each |
-| `--cache-segment-size` (`CACHE_SEGMENT_SIZE`) | 256 MiB | size of the append-only segment files, and the granularity disk is reclaimed at |
-| `--cache-inline-max-size` (`CACHE_INLINE_MAX_SIZE`) | 1 MiB | objects up to this size share a segment; larger ones get a file of their own |
+| `--cache-max-entries` (`CACHE_MAX_ENTRIES`) | `0` | object count limit; `0` for none. Budget ~150 bytes of memory each, plus the length of its key |
 
-The last three are expert knobs. The first six are the ones a deployment
+The last one is an expert knob. The first six are the ones a deployment
 actually turns.
+
+`--cache-segment-size` and `--cache-inline-max-size` are retired along with
+the segment files they sized. They are still accepted so that a deployment
+setting them keeps starting, have no effect, and log a warning at startup.
 
 ### Hot reload
 
@@ -380,6 +382,10 @@ none of this code runs.
 It is aimed at a workload of many small files read over and over — Parquet and
 DuckDB files behind a query engine — on a proxy that is the only thing writing
 to the bucket.
+
+The directory is meant to be a local volume that lives as long as the pod,
+an `emptyDir` on local NVMe, and it is **emptied at every start**: nothing
+cached survives a restart. See [The disk underneath](#the-disk-underneath).
 
 ### What it does and does not cache
 
@@ -568,19 +574,19 @@ The cache directory holds tenant object data at rest, which the proxy
 otherwise never does. It is created `0700`; encryption at rest is the
 operator's to arrange, and it wants a volume of its own.
 
-**Size the volume above `--cache-max-bytes`, not at it.** Three things sit
-outside that budget: the segment being appended to is preallocated at its full
-`--cache-segment-size` (256 MiB by default) the moment the process starts, so
-the volume is that much occupied before anything is cached; writes in flight
-claim disk they have not committed, up to half the budget or one
-`--cache-max-object-size`, whichever is larger; and eviction runs after a
-write rather than before one. Budgeting the volume at roughly
-`--cache-max-bytes` plus a segment plus that allowance leaves "the volume
-filled up" as an eviction that happens slightly late rather than a write that
-fails.
+**Size the volume above `--cache-max-bytes`, not at it.** Two things sit
+outside that budget: writes in flight claim disk they have not committed, up
+to half the budget or one `--cache-max-object-size`, whichever is larger; and
+eviction runs after a write rather than before one, with the evicted files
+removed in the background a moment later. Budgeting the volume at roughly
+`--cache-max-bytes` plus that allowance leaves "the volume filled up" as an
+eviction that happens slightly late rather than a write that fails. On an
+`emptyDir`, that figure is the `sizeLimit`: past it, the kubelet evicts the
+pod.
 
-**It also has to belong to the user the proxy runs as.** The container image
-runs as `proxyuser`, and both a Kubernetes PVC and a Docker volume are handed
+**It also has to belong to the user the proxy runs as.** An `emptyDir` is
+created world-writable and needs nothing. The container image runs as
+`proxyuser`, though, and both a Kubernetes PVC and a Docker volume are handed
 over owned by root — so the proxy cannot create anything in one and refuses to
 start rather than serve without the cache it was told to use. On Kubernetes
 set `fsGroup` in the pod's security context; elsewhere `chown` the directory
@@ -589,47 +595,56 @@ before the process starts. `e2e/docker-compose.yml` does the latter, in the
 
 ### The disk underneath
 
-`internal/blobcache` is what holds the bytes: a size-bounded blob store built
-for a network-attached volume, where an fsync is a round trip and so is a file
-create.
+`internal/filestore` is what holds the bytes: one file per cached object, an
+index of them in memory, and nothing else. It is built for a local NVMe volume
+that belongs to the process for as long as the process runs, where creating a
+file costs microseconds and nothing about the disk has to be worked around.
 
-  * Objects up to `--cache-inline-max-size` are **appended to shared segment
-    files** rather than stored one file per key. A write is one buffered
-    append, not create + write + rename with an inode update behind each, and
-    concurrent writes fold into a single `write()`.
-  * Larger objects get **a file of their own**, streamed rather than buffered:
-    one big object would otherwise monopolise the append point and make its
-    segment unreclaimable.
-  * **Nothing on the hot path is fsynced.** A cache does not need durability,
-    it needs to never be wrong, and only the second one is free. Correctness
-    after a crash comes from per-record checksums: a record that was torn, or
-    that the filesystem zero-filled — the shape ext4's delayed allocation
-    leaves behind — is a miss, and a miss is always safe because the truth
-    lives upstream.
-  * The two fsyncs that remain are amortised past noticing: sealing a full
-    segment, and committing one large object alongside its own megabytes.
-    Deletions are synced too, because a resurrected key is the one kind of
-    staleness the store can prevent on its own.
-  * Reclaim is **segment-granular** — records are never rewritten, so write
-    amplification is exactly 1.0 and one `unlink` returns a whole segment.
-    Victims come from a bounded sample, so eviction costs the same whether the
-    store holds a thousand files or a million.
+  * **Every object is a file of its own**, named by a sequence number and
+    spread over 256 subdirectories. The payload starts at offset 0; the
+    stored headers and the key follow it, because an upload's ETag is only
+    known once the upload has landed.
+  * **A write is published by the index, not by the filesystem.** Nothing
+    points at a file until its commit, and a file name is never reused, so no
+    reader sees a half-written object and a new version of a key is a new
+    file. A reader that already opened the old one reads it to the end.
+  * **Nothing is fsynced.** The files only have to be readable by the
+    process that wrote them, and the page cache already guarantees that.
+  * **An invalidation cannot be lost.** Deleting a key takes it out of the
+    index under a lock, which cannot fail; the file is unlinked afterwards, in
+    the background. There is no queue that could be full and no disk state
+    that could refuse it, so after a write through this proxy, no read through
+    it finds the version the write replaced.
+  * **Eviction is least recently used, per object.** Disk is counted in whole
+    4 KiB blocks, because that is what a file occupies: a cache of 200-byte
+    objects counted at 200 bytes each would overrun its budget many times
+    over.
 
-Measured against the obvious alternative on the same volume
-(`go test ./internal/blobcache -bench Put`):
+#### Every start is a cold start
 
-| payload | blobcache | file per entry | file per entry + fsync |
-| --- | --- | --- | --- |
-| 512 B | 6.5 µs | 367 µs | 746 µs |
-| 4 KiB | 18 µs | 276 µs | 790 µs |
-| 64 KiB | 125 µs | 459 µs | 1069 µs |
+Opening the cache empties its directory. Nothing a previous process wrote is
+read back: there is **no startup scan**, no on-disk index and no recovery, and
+that is deliberate. A new pod gets an empty `emptyDir` anyway. The one case in
+which old files are still there is a container restarted inside the same pod,
+after a crash or an OOM kill, and those files are discarded rather than
+trusted: moved aside at start and removed in the background, so a large
+leftover directory does not hold up readiness.
 
-The durability contract is written down where it cannot be missed: a crash may
-lose any subset of recent entries, and the store must never return a payload
-that is not byte-for-byte what was written under that key. The recovery tests
-exist to hold the second half of that sentence — each one damages a store the
-way a particular failure would and checks that what comes back is a subset of
-what went in.
+A restart therefore costs a cold cache, and every object is fetched from the
+object store once more. Keeping the cache across restarts is not needed today.
+If it ever is, it takes two things this store does not have: a marker written
+after a `syncfs` at a clean shutdown, so that a start can tell complete files
+from ones the page cache never wrote out, and a scan of the directory at
+startup to rebuild the index.
+
+#### Keys
+
+The index maps the **whole key** to its file: bucket, injected tenant prefix
+and object key, exactly as `internal/proxy` built it. Nothing is hashed: two
+tenants' `data/a.parquet` are two entries because their keys differ, and no
+collision can ever merge them. Each file also records the key it was
+written for, and every read compares it: an index entry that pointed at
+another key's file would be a miss, never that key's bytes.
 
 ## Upstream encryption (SSE-C)
 

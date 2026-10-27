@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/Kriechi/aws-s3-reverse-proxy/internal/blobcache"
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/filestore"
 )
 
 // Writer captures one upstream response on its way to a client.
@@ -18,7 +18,7 @@ import (
 type Writer struct {
 	c   *Cache
 	key string
-	w   *blobcache.Writer
+	w   *filestore.Writer
 
 	// expect is the payload length the response announced, or negative if
 	// it announced none. It is what makes a truncated download detectable:
@@ -53,8 +53,8 @@ func (w *Writer) Write(p []byte) (int, error) {
 //
 // It refuses in three cases, and all three are ordinary: the body was shorter
 // than it announced, the object was invalidated while this response was in
-// flight, or the store was too busy to take it. None of them is a reason for
-// the caller to do anything.
+// flight, or the store refused it (closed, or the disk failed). None of them is
+// a reason for the caller to do anything.
 func (w *Writer) Commit(header http.Header) error {
 	if w.done {
 		return nil

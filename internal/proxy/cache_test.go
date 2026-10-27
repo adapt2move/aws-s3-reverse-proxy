@@ -24,8 +24,6 @@ func newCachingProxy(t *testing.T, tweaks ...func(*Config)) (*Handler, *fakeUpst
 	objectCache, err := cache.New(cache.Options{
 		Dir:           t.TempDir(),
 		MaxBytes:      8 << 20,
-		SegmentSize:   256 << 10,
-		InlineMaxSize: 32 << 10,
 		MaxObjectSize: 1 << 20,
 	})
 	require.NoError(t, err)
@@ -145,6 +143,37 @@ func TestOneTenantCannotBeServedAnothersCachedObject(t *testing.T) {
 	assert.Contains(t, body, tenantB)
 	assert.NotContains(t, body, tenantA)
 	assert.Equal(t, 2, upstream.count())
+
+	// Both are cached now, side by side, and each answers only its own
+	// tenant — in either order, and for a ranged read as much as a whole one.
+	for _, tc := range []struct{ tenant, other string }{{tenantB, tenantA}, {tenantA, tenantB}} {
+		hit := getObject(t, h, tc.tenant, "rw", "/bucket/datasets/shared.csv", nil)
+		require.Equal(t, http.StatusOK, hit.StatusCode)
+		assert.Equal(t, "HIT", hit.Header.Get("X-Cache"))
+		body := readBody(t, hit)
+		assert.Contains(t, body, tc.tenant)
+		assert.NotContains(t, body, tc.other)
+
+		ranged := getObject(t, h, tc.tenant, "rw", "/bucket/datasets/shared.csv", http.Header{"Range": {"bytes=10-"}})
+		require.Equal(t, http.StatusPartialContent, ranged.StatusCode)
+		assert.Equal(t, "HIT", ranged.Header.Get("X-Cache"))
+		assert.Contains(t, readBody(t, ranged), tc.tenant)
+	}
+	assert.Equal(t, 2, upstream.count(), "and neither went back to the object store")
+
+	// A write by one tenant replaces its own entry and nobody else's.
+	put := do(t, h, clientRequest{
+		method: http.MethodPut, target: "/bucket/datasets/shared.csv",
+		body: []byte("replaced by tenant a"), tenant: tenantA, level: "rw",
+	}).Result()
+	require.Equal(t, http.StatusOK, put.StatusCode)
+	mine := getObject(t, h, tenantA, "rw", "/bucket/datasets/shared.csv", nil)
+	assert.Equal(t, "HIT", mine.Header.Get("X-Cache"))
+	assert.Equal(t, "replaced by tenant a", readBody(t, mine))
+	theirs := getObject(t, h, tenantB, "rw", "/bucket/datasets/shared.csv", nil)
+	assert.Equal(t, "HIT", theirs.Header.Get("X-Cache"))
+	assert.Contains(t, readBody(t, theirs), tenantB)
+	assert.Equal(t, 3, upstream.count(), "the upload, and nothing else")
 }
 
 func TestAnUploadLeavesTheObjectCached(t *testing.T) {
@@ -377,7 +406,7 @@ func expiringProxy(t *testing.T, maxAge time.Duration) (*Handler, *fakeUpstream,
 	var mu sync.Mutex
 	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 	objectCache, err := cache.New(cache.Options{
-		Dir: t.TempDir(), MaxBytes: 8 << 20, SegmentSize: 256 << 10, InlineMaxSize: 32 << 10,
+		Dir: t.TempDir(), MaxBytes: 8 << 20,
 		MaxObjectSize: 1 << 20,
 		MaxAge:        maxAge,
 		Now: func() time.Time {

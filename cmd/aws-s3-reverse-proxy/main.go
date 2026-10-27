@@ -78,10 +78,9 @@ func main() {
 	// what they started — before the cache does.
 	handler.Close()
 	if objectCache != nil {
-		// After the listeners, so that a request still streaming out of the
-		// cache is not reading from a file that just closed. Closing it
-		// seals what was being written, which is what keeps the next start
-		// from having to read the whole thing back.
+		// After the listeners, so that nothing is still being written into
+		// the cache when it stops. What it holds stays on disk until the
+		// next start, which discards it.
 		if err := objectCache.Close(); err != nil {
 			log.WithError(err).Warn("cache did not close cleanly")
 		}
@@ -106,9 +105,8 @@ func buildProxy(opts config.Options) (*proxy.Handler, *policy.Store, *cache.Cach
 	if opts.UpstreamAccessKeyID == "" || opts.UpstreamSecretAccessKey == "" {
 		return nil, nil, nil, errors.New("no upstream credentials configured")
 	}
-	// Checked here as well as in proxy.New, because it has to fail before
-	// the cache is opened: opening it under the key's label would already
-	// have discarded what an unencrypted deployment had cached.
+	// Checked here as well as in proxy.New, so that a deployment that would
+	// send the key in the clear stops before anything is opened.
 	if opts.UpstreamSSECKey != nil && scheme != "https" {
 		return nil, nil, nil, errors.New("UPSTREAM_SSE_C_KEY requires an https upstream endpoint: the key would otherwise cross the network in the clear")
 	}
@@ -175,10 +173,7 @@ func buildCache(opts config.Options) (*cache.Cache, error) {
 		MaxBytes:      opts.CacheMaxBytes,
 		MaxEntries:    opts.CacheMaxEntries,
 		MaxObjectSize: opts.CacheMaxObjectSize,
-		SegmentSize:   opts.CacheSegmentSize,
-		InlineMaxSize: opts.CacheInlineMaxSize,
 		MaxAge:        opts.CacheMaxAge,
-		Label:         cacheLabel(opts),
 		Logf:          func(format string, args ...any) { log.Warnf(format, args...) },
 	})
 	if err != nil {
@@ -195,25 +190,9 @@ func buildCache(opts config.Options) (*cache.Cache, error) {
 			Invalidations: s.Invalidations,
 			Evictions:     s.Evictions,
 			EvictedBytes:  s.EvictedBytes,
-			WritesDropped: s.WritesDropped,
 		}
 	})
 	return c, nil
-}
-
-// cacheLabel names the upstream encryption configuration the cache's entries
-// depend on.
-//
-// An entry is a copy of what the object store returned, and with a customer
-// key that depends on the key: a restart with a different one, or with none,
-// must not look healthy only because the cache still answers for objects the
-// store would now refuse to decrypt. Any change of label empties the cache.
-// No key is the empty label, which keeps a cache written before this existed.
-func cacheLabel(opts config.Options) string {
-	if opts.UpstreamSSECKey == nil {
-		return ""
-	}
-	return "upstream-sse-c:" + opts.UpstreamSSECKey.Label()
 }
 
 // listeners starts every server this process serves on and returns them in
@@ -340,8 +319,12 @@ func logCacheStartup(opts config.Options) {
 		log.Infof("Object cache disabled; every read goes to the object store.")
 		return
 	}
-	log.Infof("Caching object reads in %s: up to %d bytes, objects up to %d bytes.",
+	log.Infof("Caching object reads in %s: up to %d bytes, objects up to %d bytes. "+
+		"The directory is emptied now and at every start; nothing cached survives a restart.",
 		opts.CacheDir, opts.CacheMaxBytes, opts.CacheMaxObjectSize)
+	for _, flag := range opts.RetiredCacheFlags {
+		log.Warnf("%s has no effect any more: the cache keeps one file per object. Remove it.", flag)
+	}
 	if opts.CacheMaxAge > 0 {
 		log.Infof("After %s a cached object is checked against the object store, and only re-fetched if it changed.",
 			opts.CacheMaxAge)
