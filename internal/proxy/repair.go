@@ -550,7 +550,7 @@ func (r *repairer) rewrite(ctx context.Context, target *url.URL, st *requestStat
 	defer cancel()
 	err = r.completeUpload(finishing, target, uploadID, parts, state.etag)
 	mutation.End()
-	listing.End(false)
+	r.h.endListingWrite(listing, false)
 	if err != nil {
 		return err
 	}
@@ -869,7 +869,7 @@ func (h *Handler) invalidate(st *requestState) {
 	}
 	if h.cfg.ListFallback != nil {
 		if key := cacheKeyFor(st); key != "" {
-			h.cfg.ListFallback.Invalidate(key)
+			h.listingRefresh.schedule(h.cfg.ListFallback.Invalidate(key))
 		}
 	}
 }

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,13 +14,16 @@ import (
 )
 
 // newFallbackProxy is the deployment with the listing fallback turned on and
-// nothing else changed.
-func newFallbackProxy(t *testing.T, timeout time.Duration) (*Handler, *fakeUpstream, *outage) {
+// nothing else changed. Background refreshes are off unless a tweak turns
+// them on, so that what a write drops stays dropped where a test is about
+// the dropping.
+func newFallbackProxy(t *testing.T, timeout time.Duration, tweaks ...func(*Config)) (*Handler, *fakeUpstream, *outage) {
 	t.Helper()
-	h, upstream := newTestProxy(t, func(cfg *Config) {
+	h, upstream := newTestProxy(t, append([]func(*Config){func(cfg *Config) {
 		cfg.ListFallback = listcache.New(listcache.Options{MaxBytes: 1 << 20, MaxAge: time.Hour})
 		cfg.ListFallbackTimeout = timeout
-	})
+	}}, tweaks...)...)
+	t.Cleanup(h.Close)
 	o := &outage{}
 	upstream.mu.Lock()
 	upstream.respond = o.serve
@@ -36,6 +40,10 @@ type outage struct {
 	listDelay  time.Duration
 	hangUp     bool
 	putStatus  int
+	putDelay   time.Duration
+	// written are the upstream keys accepted since, listed after the two
+	// that are always there.
+	written []string
 }
 
 func (o *outage) set(change func(*outage)) {
@@ -47,13 +55,17 @@ func (o *outage) set(change func(*outage)) {
 func (o *outage) serve(w http.ResponseWriter, r *http.Request) {
 	o.mu.Lock()
 	listStatus, delay, hangUp, putStatus := o.listStatus, o.listDelay, o.hangUp, o.putStatus
+	putDelay := o.putDelay
+	written := append([]string(nil), o.written...)
 	o.mu.Unlock()
 
 	if r.Method == http.MethodPut {
+		time.Sleep(putDelay)
 		if putStatus != 0 {
 			w.WriteHeader(putStatus)
 			return
 		}
+		o.set(func(o *outage) { o.written = append(o.written, strings.TrimPrefix(r.URL.Path, "/bucket/")) })
 		w.Header().Set("Etag", `"new"`)
 		w.WriteHeader(http.StatusOK)
 		return
@@ -79,13 +91,37 @@ func (o *outage) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prefix := r.URL.Query().Get("prefix")
+	var extra strings.Builder
+	for _, key := range written {
+		if strings.HasPrefix(key, prefix) {
+			extra.WriteString(`<Contents><Key>` + key + `</Key><Size>1</Size></Contents>`)
+		}
+	}
 	w.Header().Set("Content-Type", "application/xml")
 	w.Header().Set("X-Amz-Request-Id", "live-request")
 	_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>` +
 		`<ListBucketResult><Name>bucket</Name><Prefix>` + prefix + `</Prefix>` +
 		`<Contents><Key>` + prefix + `2026/a.csv</Key><Size>10</Size></Contents>` +
 		`<Contents><Key>` + prefix + `2026/private/secret.csv</Key><Size>20</Size></Contents>` +
+		extra.String() +
 		`</ListBucketResult>`))
+}
+
+// listings counts the listing requests that reached the object store.
+func listings(u *fakeUpstream) int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	n := 0
+	for _, r := range u.requests {
+		if r.method == http.MethodGet && r.query.Has("list-type") {
+			n++
+		}
+	}
+	return n
+}
+
+func withRefreshDelay(delay time.Duration) func(*Config) {
+	return func(cfg *Config) { cfg.ListFallbackRefreshDelay = delay }
 }
 
 func list(t *testing.T, h *Handler, tenant, level string) *http.Response {
@@ -338,4 +374,117 @@ func TestACompletedMultipartUploadDropsTheRememberedListing(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, listedDuringCompletion.StatusCode,
 		"once the completion has been answered, the listing from before it is not an answer")
 	assert.Equal(t, http.StatusInternalServerError, list(t, h, tenantA, "rws").StatusCode)
+}
+
+// The point of refreshing: a write drops the listing, and once the writes
+// have settled the object store is asked again — so the fallback there is
+// is the object store's answer from after the write.
+func TestADroppedListingIsListedAgainOnceWritesSettle(t *testing.T) {
+	h, upstream, o := newFallbackProxy(t, time.Second, withRefreshDelay(20*time.Millisecond))
+	require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
+
+	require.Equal(t, http.StatusOK, put(t, h, "/bucket/datasets/2026/b.csv").StatusCode)
+	waitFor(t, "the background refresh", func() bool { return h.ListFallback().Stats().Refreshed == 1 })
+	assert.Equal(t, 2, listings(upstream))
+
+	o.set(func(o *outage) { o.listStatus = http.StatusInternalServerError })
+	remembered := list(t, h, tenantA, "rws")
+	require.Equal(t, http.StatusOK, remembered.StatusCode)
+	assert.Equal(t, "FALLBACK", remembered.Header.Get("X-Cache"))
+	body := readBody(t, remembered)
+	assert.Contains(t, body, "<Key>datasets/2026/b.csv</Key>", "the object written is in the answer remembered after it")
+	assert.NotContains(t, body, tenantA)
+}
+
+func TestABurstOfWritesCostsOneRefresh(t *testing.T) {
+	h, upstream, _ := newFallbackProxy(t, time.Second, withRefreshDelay(100*time.Millisecond))
+	require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
+
+	for _, name := range []string{"b", "c", "d", "e", "f"} {
+		require.Equal(t, http.StatusOK, put(t, h, "/bucket/datasets/2026/"+name+".csv").StatusCode)
+	}
+	waitFor(t, "the background refresh", func() bool { return h.ListFallback().Stats().Refreshed == 1 })
+	time.Sleep(250 * time.Millisecond)
+	assert.Equal(t, 2, listings(upstream), "one listing by the client, one after the burst")
+}
+
+// An object store that fails a refresh is in the outage the fallback is for;
+// asking it again and again would only add to the load.
+func TestARefreshThatFailsIsNotRetried(t *testing.T) {
+	h, upstream, o := newFallbackProxy(t, time.Second, withRefreshDelay(20*time.Millisecond))
+	require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
+
+	o.set(func(o *outage) { o.listStatus = http.StatusInternalServerError })
+	require.Equal(t, http.StatusOK, put(t, h, "/bucket/datasets/2026/b.csv").StatusCode)
+	waitFor(t, "the background refresh", func() bool { return listings(upstream) == 2 })
+	time.Sleep(200 * time.Millisecond)
+	assert.Equal(t, 2, listings(upstream))
+	assert.Equal(t, http.StatusInternalServerError, list(t, h, tenantA, "rws").StatusCode,
+		"and without a refreshed answer there is no fallback: the one from before the write is gone")
+}
+
+func TestContinuationPagesAreNotRefreshed(t *testing.T) {
+	h, upstream, _ := newFallbackProxy(t, time.Second, withRefreshDelay(20*time.Millisecond))
+	page := do(t, h, clientRequest{
+		method: http.MethodGet, target: "/bucket?list-type=2&prefix=datasets/&continuation-token=opaque",
+		tenant: tenantA, level: "rws",
+	}).Result()
+	require.Equal(t, http.StatusOK, page.StatusCode)
+
+	require.Equal(t, http.StatusOK, put(t, h, "/bucket/datasets/2026/b.csv").StatusCode)
+	time.Sleep(150 * time.Millisecond)
+	assert.Equal(t, 1, listings(upstream), "the token belongs to the listing as it was")
+}
+
+func TestAMultipartCompletionIsRefreshedAfterItsClaimEnds(t *testing.T) {
+	h, upstream, o := newFallbackProxy(t, time.Second, withRefreshDelay(20*time.Millisecond))
+	require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
+	upstream.mu.Lock()
+	upstream.respond = func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(`<CompleteMultipartUploadResult/>`))
+			return
+		}
+		o.serve(w, r)
+	}
+	upstream.mu.Unlock()
+
+	body := []byte(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"p1"</ETag></Part></CompleteMultipartUpload>`)
+	require.Equal(t, http.StatusOK, do(t, h, clientRequest{
+		method: http.MethodPost, target: "/bucket/datasets/2026/big.bin?uploadId=u1", body: body,
+		tenant: tenantA, level: "rw",
+	}).Code)
+	waitFor(t, "the background refresh", func() bool { return h.ListFallback().Stats().Refreshed == 1 })
+}
+
+func TestClosingTheHandlerStopsPendingRefreshes(t *testing.T) {
+	h, upstream, _ := newFallbackProxy(t, time.Second, withRefreshDelay(100*time.Millisecond))
+	require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
+	require.Equal(t, http.StatusOK, put(t, h, "/bucket/datasets/2026/b.csv").StatusCode)
+
+	h.Close()
+	time.Sleep(250 * time.Millisecond)
+	assert.Equal(t, 1, listings(upstream))
+}
+
+// A refresh that would overlap a write is put off rather than sent: its
+// answer could not be remembered. It is not forgotten either.
+func TestARefreshWaitsOutAWriteInFlight(t *testing.T) {
+	h, upstream, o := newFallbackProxy(t, time.Second, withRefreshDelay(20*time.Millisecond))
+	require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
+	require.Equal(t, http.StatusOK, put(t, h, "/bucket/datasets/2026/b.csv").StatusCode)
+
+	o.set(func(o *outage) { o.putDelay = 200 * time.Millisecond })
+	slow := make(chan int)
+	go func() { slow <- put(t, h, "/bucket/datasets/2026/c.csv").StatusCode }()
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, 1, listings(upstream), "nothing is listed while the write is in flight")
+	require.Equal(t, http.StatusOK, <-slow)
+
+	waitFor(t, "the background refresh", func() bool { return h.ListFallback().Stats().Refreshed == 1 })
+	o.set(func(o *outage) { o.listStatus = http.StatusInternalServerError })
+	body := readBody(t, list(t, h, tenantA, "rws"))
+	assert.Contains(t, body, "datasets/2026/b.csv")
+	assert.Contains(t, body, "datasets/2026/c.csv", "the answer is from after both writes")
 }

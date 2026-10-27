@@ -249,6 +249,7 @@ func TestStartupRejectsAListingFallbackWithoutBounds(t *testing.T) {
 		"timeout":   func(o *config.Options) { o.ListFallbackTimeout = 0 },
 		"max age":   func(o *config.Options) { o.ListFallbackMaxAge = 0 },
 		"max bytes": func(o *config.Options) { o.ListFallbackMaxBytes = 0 },
+		"refresh":   func(o *config.Options) { o.ListFallbackRefreshDelay = -time.Second },
 	} {
 		t.Run(name, func(t *testing.T) {
 			opts := baseOptions(t)

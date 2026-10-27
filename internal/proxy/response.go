@@ -58,13 +58,15 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 	// End, which also covers every request that never gets a response.
 	if st.operation.Kind != s3.CompleteMultipartUpload {
 		st.mutation.End()
-		st.listingWrite.End(writeRefused(resp.StatusCode))
+		h.endListingWrite(st.listingWrite, writeRefused(resp.StatusCode))
 	} else if h.cfg.ListFallback != nil && !writeRefused(resp.StatusCode) {
 		// The completion's body tells the client the object exists before
 		// ServeHTTP gets to end the claim, so the listings that would not
 		// show it go now. The claim itself stays: a listing answered while
 		// the object is still being assembled must not be remembered.
-		h.cfg.ListFallback.Invalidate(cacheKeyFor(st))
+		// What is dropped is refreshed once the claim is released, not now:
+		// an answer while the claim stands could not be remembered.
+		st.droppedListings = h.cfg.ListFallback.Invalidate(cacheKeyFor(st))
 	}
 	h.captureRead(resp, st)
 	// After the capture, which keeps the plaintext marker in the cache, and

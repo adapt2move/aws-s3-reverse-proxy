@@ -66,6 +66,9 @@ type Options struct {
 	ListFallbackTimeout  time.Duration
 	ListFallbackMaxAge   time.Duration
 	ListFallbackMaxBytes int64
+	// ListFallbackRefreshDelay is how long writes have to settle before the
+	// listings they dropped are listed again in the background; 0 disables.
+	ListFallbackRefreshDelay time.Duration
 
 	MaxClockSkew       time.Duration
 	MaxChunkedBodySize int64
@@ -128,6 +131,7 @@ func Parse() Options {
 	kingpin.Flag("list-fallback-timeout", "how long a listing with a remembered answer waits for the object store before that answer is served instead (env - LIST_FALLBACK_TIMEOUT)").Envar("LIST_FALLBACK_TIMEOUT").Default("1s").DurationVar(&opts.ListFallbackTimeout)
 	kingpin.Flag("list-fallback-max-age", "how old a remembered listing may be and still be served; it bounds how long a write that bypassed this proxy can be missing from one (env - LIST_FALLBACK_MAX_AGE)").Envar("LIST_FALLBACK_MAX_AGE").Default("1h").DurationVar(&opts.ListFallbackMaxAge)
 	kingpin.Flag("list-fallback-max-bytes", "how much memory remembered listings may occupy (env - LIST_FALLBACK_MAX_BYTES)").Envar("LIST_FALLBACK_MAX_BYTES").Default("67108864").Int64Var(&opts.ListFallbackMaxBytes)
+	kingpin.Flag("list-fallback-refresh-delay", "how long writes under a prefix have to settle before the remembered listings they dropped are listed again in the background; 0 leaves them dropped until a client lists them (env - LIST_FALLBACK_REFRESH_DELAY)").Envar("LIST_FALLBACK_REFRESH_DELAY").Default("1s").DurationVar(&opts.ListFallbackRefreshDelay)
 
 	kingpin.Flag("max-clock-skew", "how far X-Amz-Date may be from this clock in either direction (env - MAX_CLOCK_SKEW)").Envar("MAX_CLOCK_SKEW").Default("15m").DurationVar(&opts.MaxClockSkew)
 	kingpin.Flag("max-chunked-body-size", "cap on an aws-chunked body that has to be buffered to recover its checksum trailer (env - MAX_CHUNKED_BODY_SIZE)").Envar("MAX_CHUNKED_BODY_SIZE").Default("67108864").Int64Var(&opts.MaxChunkedBodySize)

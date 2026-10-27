@@ -151,6 +151,12 @@ type Config struct {
 	// waits for the object store before it is given that answer instead.
 	ListFallbackTimeout time.Duration
 
+	// ListFallbackRefreshDelay is how long writes under a prefix have to
+	// settle before the listings they dropped are asked for again in the
+	// background. Zero leaves a dropped listing dropped until a client lists
+	// it again. See listing_refresh.go.
+	ListFallbackRefreshDelay time.Duration
+
 	// UpstreamSSECKey, when set, is the customer key every object is stored
 	// under upstream (SSE-C). The proxy adds it to the object operations
 	// that take one — client requests and its own background requests alike
@@ -204,6 +210,10 @@ type Handler struct {
 	// repairs encrypts legacy plaintext objects in the background when a
 	// customer key is configured; nil otherwise.
 	repairs *repairer
+
+	// listingRefresh re-lists what writes dropped from the listing
+	// fallback; nil when there is no fallback or refreshing is off.
+	listingRefresh *listingRefresher
 }
 
 // New validates the configuration and wires up the shared reverse proxy.
@@ -253,6 +263,9 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.UpstreamSSECKey != nil {
 		h.repairs = newRepairer(h)
 	}
+	if cfg.ListFallback != nil && cfg.ListFallbackRefreshDelay > 0 {
+		h.listingRefresh = newListingRefresher(h, cfg.ListFallbackRefreshDelay)
+	}
 	h.proxy = &httputil.ReverseProxy{
 		// The request handed to ServeHTTP already carries the absolute
 		// upstream URL, so there is nothing left to direct.
@@ -278,10 +291,13 @@ func New(cfg Config) (*Handler, error) {
 }
 
 // Close stops the background work the handler started on its own — the
-// encryption repairs — and waits for it to let go of what it holds upstream.
-// Call it after the listeners have shut down and before the cache is closed.
+// encryption repairs and the listing refreshes — and waits for it to let go
+// of what it holds upstream. Call it after the listeners have shut down and
+// before the cache is closed.
 func (h *Handler) Close() {
+	// Repairs first: finishing one drops listings, which schedules refreshes.
 	h.repairs.close()
+	h.listingRefresh.close()
 }
 
 // ListFallback is the listing fallback this handler was configured with, or
@@ -310,7 +326,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if st.mutation != nil {
 		defer st.mutation.End()
 	}
-	defer func() { st.listingWrite.End(st.neverSent) }()
+	defer func() { h.endListingWrite(st.listingWrite, st.neverSent, st.droppedListings...) }()
 
 	if h.serveCachedRead(rec, r, proxyReq, st) {
 		entry.Cache = st.cacheResult
@@ -553,6 +569,10 @@ type requestState struct {
 	// listingWrite is this request's claim on the listings its write may
 	// change. Like mutation, it is released in ServeHTTP at the latest.
 	listingWrite *listcache.Write
+
+	// droppedListings are listings this request's write dropped before its
+	// claim was released, to be refreshed when it is.
+	droppedListings []listcache.Stale
 
 	// neverSent records that the upstream request failed before the object
 	// store could have received it.

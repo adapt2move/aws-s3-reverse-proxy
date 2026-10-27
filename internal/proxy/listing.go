@@ -37,6 +37,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/listcache"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/s3"
 )
 
@@ -72,7 +73,7 @@ type listingAnswer struct {
 func (h *Handler) forwardListing(req *http.Request, st *requestState) (*http.Response, error) {
 	key, scope := listingKeyFor(req.URL, st), listingScopeFor(st)
 	remembered := h.cfg.ListFallback.Get(key)
-	capture := h.cfg.ListFallback.Begin(key, scope)
+	capture := h.cfg.ListFallback.Begin(key, scope, req.URL.String())
 
 	ctx, cancel := context.WithCancel(req.Context())
 	defer cancel()
@@ -201,6 +202,13 @@ func (h *Handler) beginListingWrite(st *requestState, keys ...string) {
 		return
 	}
 	st.listingWrite = h.cfg.ListFallback.BeginWrite(keys...)
+}
+
+// endListingWrite releases a write's claim on the listing fallback, and has
+// what it dropped — now, or earlier — asked for again once writes have
+// settled.
+func (h *Handler) endListingWrite(w *listcache.Write, refused bool, dropped ...listcache.Stale) {
+	h.listingRefresh.schedule(append(w.End(refused), dropped...))
 }
 
 // writeRefused reports whether an upstream answer to a write says the write

@@ -30,6 +30,14 @@
 //     restart. A remembered listing can only miss what changed without
 //     passing through this process, and both bounds limit how much that can
 //     be.
+//
+// Dropping a listing on every write would leave a prefix that is written to
+// often without a fallback most of the time. So a write also reports the
+// listings it dropped, as Stale, and the caller may ask the object store for
+// them again in the background. The answer goes through the same capture as
+// any other — a write overlapping it keeps it from being remembered — so a
+// refreshed listing is the object store's answer and never one assembled
+// here.
 package listcache
 
 import (
@@ -76,6 +84,7 @@ type Cache struct {
 	captures map[*Capture]struct{}
 
 	stored        atomic.Uint64
+	refreshed     atomic.Uint64
 	dropped       atomic.Uint64
 	invalidations atomic.Uint64
 }
@@ -83,11 +92,28 @@ type Cache struct {
 type entry struct {
 	key      string
 	scope    string
+	origin   string
 	header   http.Header
 	body     []byte
 	storedAt time.Time
+	// lastUsed is when a client last asked for this listing. A refresh does
+	// not count: it keeps an answer current for clients, and one no client
+	// has asked for in MaxAge is not worth keeping current.
+	lastUsed time.Time
 	cost     int64
 	elem     *list.Element
+}
+
+// Stale is a remembered listing that a write just dropped, with what it takes
+// to ask the object store for it again.
+type Stale struct {
+	Key   string
+	Scope string
+	// Origin is what the caller passed to Begin to say where the listing
+	// came from — for the proxy, the upstream URL.
+	Origin string
+
+	lastUsed time.Time
 }
 
 // New creates an empty cache.
@@ -134,6 +160,7 @@ func (c *Cache) Get(key string) *Listing {
 		return nil
 	}
 	c.order.MoveToFront(e.elem)
+	e.lastUsed = c.now()
 	return &Listing{Header: e.header.Clone(), Body: e.body, Age: age}
 }
 
@@ -144,27 +171,63 @@ type Capture struct {
 	c        *Cache
 	key      string
 	scope    string
+	origin   string
 	poisoned bool
 	done     bool
+
+	// refresh marks a capture nobody asked for; lastUsed is carried over
+	// from the listing it refreshes rather than set to now.
+	refresh  bool
+	lastUsed time.Time
 }
 
-// Begin registers a listing that is about to be sent upstream. It has to be
-// called before the request is sent, not when the answer arrives: a write
-// that starts in between would otherwise go unnoticed.
-func (c *Cache) Begin(key, scope string) *Capture {
+// Begin registers a client's listing that is about to be sent upstream. It
+// has to be called before the request is sent, not when the answer arrives:
+// a write that starts in between would otherwise go unnoticed.
+//
+// origin is kept with the answer and handed back in Stale, so the listing can
+// be asked for again without the client.
+func (c *Cache) Begin(key, scope, origin string) *Capture {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	cp := &Capture{c: c, key: key, scope: scope}
-	for object := range c.writes {
-		if strings.HasPrefix(object, scope) {
-			// A write under this scope is in flight, so this answer may be
-			// from either side of it.
-			cp.poisoned = true
-			break
-		}
-	}
+	cp := &Capture{c: c, key: key, scope: scope, origin: origin, lastUsed: c.now()}
+	cp.poisoned = c.writingUnderLocked(scope)
 	c.captures[cp] = struct{}{}
 	return cp
+}
+
+// BeginRefresh registers a background listing of what a write dropped. It
+// reports false, and registers nothing, while a write under the listing's
+// scope is in flight: that answer could not be remembered anyway, and asking
+// for it would only cost a request.
+func (c *Cache) BeginRefresh(s Stale) (*Capture, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.writingUnderLocked(s.Scope) {
+		return nil, false
+	}
+	cp := &Capture{c: c, key: s.Key, scope: s.Scope, origin: s.Origin, refresh: true, lastUsed: s.lastUsed}
+	c.captures[cp] = struct{}{}
+	return cp, true
+}
+
+// writingUnderLocked reports whether a write under scope is in flight, so an
+// answer for it now may be from either side of that write.
+func (c *Cache) writingUnderLocked(scope string) bool {
+	for object := range c.writes {
+		if strings.HasPrefix(object, scope) {
+			return true
+		}
+	}
+	return false
+}
+
+// Overlapped reports whether a write under the capture's scope overlapped it,
+// which is the reason an answer the object store gave was not remembered.
+func (cp *Capture) Overlapped() bool {
+	cp.c.mu.Lock()
+	defer cp.c.mu.Unlock()
+	return cp.poisoned
 }
 
 // Commit remembers the object store's answer, unless a write under its scope
@@ -183,9 +246,11 @@ func (cp *Capture) Commit(header http.Header, body []byte) bool {
 	e := &entry{
 		key:      cp.key,
 		scope:    cp.scope,
+		origin:   cp.origin,
 		header:   header.Clone(),
 		body:     body,
 		storedAt: c.now(),
+		lastUsed: cp.lastUsed,
 	}
 	e.cost = costOf(e)
 	if e.cost > c.maxBytes {
@@ -211,6 +276,9 @@ func (cp *Capture) Commit(header http.Header, body []byte) bool {
 		c.removeLocked(c.order.Back().Value.(*entry))
 	}
 	c.stored.Add(1)
+	if cp.refresh {
+		c.refreshed.Add(1)
+	}
 	return true
 }
 
@@ -286,34 +354,42 @@ func (c *Cache) BeginWrite(keys ...string) *Write {
 // covering the keys kept. Any other outcome — success, a server error, a
 // connection that broke after the request was sent — may have changed the
 // objects, and they are dropped.
-func (w *Write) End(refused bool) {
+//
+// It returns the dropped listings worth asking for again: those a client has
+// asked for within MaxAge.
+func (w *Write) End(refused bool) []Stale {
 	if w == nil || w.ended {
-		return
+		return nil
 	}
 	w.ended = true
 	c := w.c
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var stale []Stale
 	for _, key := range w.keys {
 		if c.writes[key]--; c.writes[key] <= 0 {
 			delete(c.writes, key)
 		}
 		if !refused {
-			c.invalidateLocked(key)
+			stale = c.invalidateLocked(key, stale)
 		}
 	}
+	return stale
 }
 
 // Invalidate drops every listing covering these object keys, and keeps any
 // listing in flight under them from being remembered. It is for a change
-// this process learned about without having made it.
-func (c *Cache) Invalidate(keys ...string) {
+// this process learned about without having made it, and returns what End
+// would.
+func (c *Cache) Invalidate(keys ...string) []Stale {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var stale []Stale
 	for _, key := range keys {
 		c.poisonCapturesLocked(key)
-		c.invalidateLocked(key)
+		stale = c.invalidateLocked(key, stale)
 	}
+	return stale
 }
 
 // Purge forgets everything, including the listings still in flight.
@@ -339,7 +415,8 @@ func (c *Cache) poisonCapturesLocked(object string) {
 	}
 }
 
-func (c *Cache) invalidateLocked(object string) {
+func (c *Cache) invalidateLocked(object string, stale []Stale) []Stale {
+	now := c.now()
 	for scope, entries := range c.byScope {
 		if !strings.HasPrefix(object, scope) {
 			continue
@@ -347,8 +424,12 @@ func (c *Cache) invalidateLocked(object string) {
 		for _, e := range entries {
 			c.removeLocked(e)
 			c.invalidations.Add(1)
+			if e.origin != "" && now.Sub(e.lastUsed) <= c.maxAge {
+				stale = append(stale, Stale{Key: e.key, Scope: e.scope, Origin: e.origin, lastUsed: e.lastUsed})
+			}
 		}
 	}
+	return stale
 }
 
 func (c *Cache) removeLocked(e *entry) {
@@ -391,6 +472,7 @@ type Stats struct {
 	Bytes         int64
 	Capacity      int64
 	Stored        uint64
+	Refreshed     uint64
 	Dropped       uint64
 	Invalidations uint64
 }
@@ -404,6 +486,7 @@ func (c *Cache) Stats() Stats {
 		Bytes:         bytes,
 		Capacity:      c.maxBytes,
 		Stored:        c.stored.Load(),
+		Refreshed:     c.refreshed.Load(),
 		Dropped:       c.dropped.Load(),
 		Invalidations: c.invalidations.Load(),
 	}

@@ -150,14 +150,15 @@ func buildProxy(opts config.Options) (*proxy.Handler, *policy.Store, *cache.Cach
 			DeleteBody:  opts.MaxDeleteBodySize,
 			RewriteBody: opts.MaxRewriteBodySize,
 		},
-		TenantMetricLabel:   opts.TenantMetricLabel,
-		Cache:               objectCache,
-		CacheWrites:         opts.CacheWrites,
-		CacheRangeFills:     opts.CacheRangeFills,
-		ListFallback:        listings,
-		ListFallbackTimeout: opts.ListFallbackTimeout,
-		UpstreamSSECKey:     opts.UpstreamSSECKey,
-		RepairPlaintext:     opts.UpstreamSSECRepair,
+		TenantMetricLabel:        opts.TenantMetricLabel,
+		Cache:                    objectCache,
+		CacheWrites:              opts.CacheWrites,
+		CacheRangeFills:          opts.CacheRangeFills,
+		ListFallback:             listings,
+		ListFallbackTimeout:      opts.ListFallbackTimeout,
+		ListFallbackRefreshDelay: opts.ListFallbackRefreshDelay,
+		UpstreamSSECKey:          opts.UpstreamSSECKey,
+		RepairPlaintext:          opts.UpstreamSSECRepair,
 	})
 	if err != nil {
 		if objectCache != nil {
@@ -226,6 +227,8 @@ func buildListFallback(opts config.Options) (*listcache.Cache, error) {
 		return nil, errors.New("--list-fallback-max-age must be positive")
 	case opts.ListFallbackMaxBytes <= 0:
 		return nil, errors.New("--list-fallback-max-bytes must be positive")
+	case opts.ListFallbackRefreshDelay < 0:
+		return nil, errors.New("--list-fallback-refresh-delay must not be negative")
 	}
 	listings := listcache.New(listcache.Options{
 		MaxBytes: opts.ListFallbackMaxBytes,
@@ -238,6 +241,7 @@ func buildListFallback(opts config.Options) (*listcache.Cache, error) {
 			Bytes:         s.Bytes,
 			Capacity:      s.Capacity,
 			Stored:        s.Stored,
+			Refreshed:     s.Refreshed,
 			Dropped:       s.Dropped,
 			Invalidations: s.Invalidations,
 		}
@@ -427,6 +431,10 @@ func logListFallbackStartup(opts config.Options) {
 	log.Warnf("Writes through this proxy drop the remembered listings they affect; writes that bypass it — "+
 		"another replica, another client, a lifecycle rule — are not seen, and a listing served from memory "+
 		"can miss them for up to %s.", opts.ListFallbackMaxAge)
+	if opts.ListFallbackRefreshDelay > 0 {
+		log.Infof("Remembered listings a write dropped are listed again in the background once writes "+
+			"under them have settled for %s.", opts.ListFallbackRefreshDelay)
+	}
 	if !opts.CacheEnabled() && opts.CachePurgeToken == "" && isListenAddr(opts.HealthListenAddr) {
 		log.Warnf("POST /cache/purge is unauthenticated (CACHE_PURGE_TOKEN is unset): anything that " +
 			"can reach the admin listener can empty the listing fallback.")

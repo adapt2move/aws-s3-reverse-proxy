@@ -285,6 +285,7 @@ fallback holds listings in memory, not objects on disk. See
 | `--list-fallback-timeout` (`LIST_FALLBACK_TIMEOUT`) | `1s` | how long a listing with a remembered answer waits for the object store before that answer is served instead |
 | `--list-fallback-max-age` (`LIST_FALLBACK_MAX_AGE`) | `1h` | how old a remembered listing may be and still be served |
 | `--list-fallback-max-bytes` (`LIST_FALLBACK_MAX_BYTES`) | 64 MiB | how much memory remembered listings may occupy |
+| `--list-fallback-refresh-delay` (`LIST_FALLBACK_REFRESH_DELAY`) | `1s` | how long writes under a prefix have to settle before the listings they dropped are listed again in the background; `0s` disables |
 
 ### Hot reload
 
@@ -707,6 +708,43 @@ policy in force when it is served — so `ro` served a listing remembered from a
 the upstream request, tenant prefix included, so two tenants listing the same
 prefix never share an answer.
 
+### Keeping it warm under writes
+
+Dropping a listing on every write keeps the fallback consistent, and on its
+own it would leave a prefix that is written to often without one most of the
+time. So the listings a write dropped are listed again in the background, once
+writes under them have settled for `--list-fallback-refresh-delay`:
+
+```
+PUT abc/new.csv ──▶ acknowledged ──▶ listing of abc dropped
+                                      │  (more writes under abc: wait again,
+                                      │   at most 10× the delay in total)
+                                      ▼
+                      LIST abc upstream, in the background
+                                      │
+                 ┌────────────────────┼─────────────────────────┐
+             answered            a write overlapped it      failed / refused
+                 │                    │                         │
+            remembered          tried again later,         left dropped: the
+                                further apart each time    next client listing
+                                                           remembers it
+```
+
+The refreshed answer is the object store's, and it is captured exactly like a
+client's listing: a write that overlaps it keeps it from being remembered.
+Nothing is ever patched locally to match a write — the proxy cannot know what
+the object store would list (pagination, `delimiter`, `LastModified`, writes
+it did not see), and a listing it assembled itself would be wrong in exactly
+the cases nobody can check during an outage.
+
+Three bounds keep it cheap. A burst of writes under one prefix costs one
+listing after the last of them. Only listings a client asked for within
+`--list-fallback-max-age` are refreshed, and a refresh does not count as being
+asked for, so a listing nobody uses stops being kept current. And at most four
+refreshes run at a time. Pages reached through a `continuation-token` are not
+refreshed: the token belongs to the listing as it was, and the refreshed first
+page hands out a new one.
+
 ### What it cannot see
 
 Writes that do not pass through this process: another replica, another
@@ -978,6 +1016,7 @@ an unbounded label is an unbounded number of time series.
 | `s3proxy_cache_evictions_total`, `s3proxy_cache_evicted_bytes_total` | reclaim, to stay within the size limit |
 | `s3proxy_list_fallback_entries`, `s3proxy_list_fallback_bytes`, `s3proxy_list_fallback_capacity_bytes` | what the listing fallback holds |
 | `s3proxy_list_fallback_stores_total`, `s3proxy_list_fallback_store_failures_total` | listings remembered, and the ones that were not because a write overlapped them |
+| `s3proxy_list_fallback_refreshes_total` | listings remembered after a background refresh of what a write dropped |
 | `s3proxy_list_fallback_invalidations_total` | remembered listings dropped because a write may have changed them |
 
 The cache series appear only when a cache is configured, and the listing

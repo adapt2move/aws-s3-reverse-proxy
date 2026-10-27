@@ -133,6 +133,7 @@ type ListFallbackStats struct {
 	Bytes         int64
 	Capacity      int64
 	Stored        uint64
+	Refreshed     uint64
 	Dropped       uint64
 	Invalidations uint64
 }
@@ -158,6 +159,10 @@ func RegisterListFallbackStats(read func() ListFallbackStats) {
 			Name: "s3proxy_list_fallback_stores_total",
 			Help: "Listings remembered after the object store answered them.",
 		}, func() float64 { return float64(read().Stored) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "s3proxy_list_fallback_refreshes_total",
+			Help: "Listings remembered after being listed again in the background, because a write had dropped them.",
+		}, func() float64 { return float64(read().Refreshed) }),
 		prometheus.NewCounterFunc(prometheus.CounterOpts{
 			Name: "s3proxy_list_fallback_store_failures_total",
 			Help: "Listings not remembered: a write overlapped them, or they were too large.",
