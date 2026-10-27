@@ -58,6 +58,13 @@ type Options struct {
 	// MaxAge is how old a remembered listing may be and still be served.
 	MaxAge time.Duration
 
+	// UnresolvedHold is how long a write that was sent and never answered
+	// keeps listings under its keys from being remembered. Zero means
+	// MaxAge: the object store may still apply such a write, and a listing
+	// remembered before it does would be missing it for as long as it is
+	// served.
+	UnresolvedHold time.Duration
+
 	// Now is the clock, for tests.
 	Now func() time.Time
 }
@@ -67,6 +74,7 @@ type Options struct {
 type Cache struct {
 	maxBytes int64
 	maxAge   time.Duration
+	hold     time.Duration
 	now      func() time.Time
 
 	mu      sync.Mutex
@@ -121,9 +129,13 @@ func New(opts Options) *Cache {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	if opts.UnresolvedHold <= 0 {
+		opts.UnresolvedHold = opts.MaxAge
+	}
 	return &Cache{
 		maxBytes: opts.MaxBytes,
 		maxAge:   opts.MaxAge,
+		hold:     opts.UnresolvedHold,
 		now:      opts.Now,
 		entries:  make(map[string]*entry),
 		byScope:  make(map[string]map[string]*entry),
@@ -346,18 +358,34 @@ func (c *Cache) BeginWrite(keys ...string) *Write {
 	return &Write{c: c, keys: keys}
 }
 
+// Outcome is what became of a write, as far as the caller can tell.
+type Outcome int
+
+const (
+	// Refused means the object store did not apply the write: it refused
+	// it, or never received it. The listings covering its keys are kept.
+	Refused Outcome = iota
+	// Answered means the object store answered the write, whatever the
+	// answer was. Whatever it did to the objects is done, so the listings
+	// covering them are dropped and worth asking for again.
+	Answered
+	// Unresolved means the write was sent and never answered: the
+	// connection broke, the client gave up. The object store may still be
+	// applying it, and may finish at any time — a multipart completion of a
+	// large object takes minutes. The listings covering its keys are
+	// dropped, and the keys stay claimed for UnresolvedHold, so that no
+	// listing is remembered from before the write landed.
+	Unresolved
+)
+
 // End releases the keys. Calling it again does nothing, so a caller can end a
 // write as soon as it knows the outcome and still defer End as a backstop.
 //
-// refused reports that the object store is known not to have applied the
-// write: it refused it, or it never received it. Only then are the listings
-// covering the keys kept. Any other outcome — success, a server error, a
-// connection that broke after the request was sent — may have changed the
-// objects, and they are dropped.
-//
 // It returns the dropped listings worth asking for again: those a client has
-// asked for within MaxAge.
-func (w *Write) End(refused bool) []Stale {
+// asked for within MaxAge, and only for an answered write. Asking for them
+// after an unresolved one would remember whatever the object store lists
+// before the write lands.
+func (w *Write) End(outcome Outcome) []Stale {
 	if w == nil || w.ended {
 		return nil
 	}
@@ -367,14 +395,32 @@ func (w *Write) End(refused bool) []Stale {
 	defer c.mu.Unlock()
 	var stale []Stale
 	for _, key := range w.keys {
-		if c.writes[key]--; c.writes[key] <= 0 {
-			delete(c.writes, key)
+		if outcome != Unresolved {
+			if c.writes[key]--; c.writes[key] <= 0 {
+				delete(c.writes, key)
+			}
 		}
-		if !refused {
+		if outcome != Refused {
 			stale = c.invalidateLocked(key, stale)
 		}
 	}
+	if outcome == Unresolved {
+		keys := w.keys
+		time.AfterFunc(c.hold, func() { c.releaseWrites(keys) })
+		return nil
+	}
 	return stale
+}
+
+// releaseWrites gives back the claim an unresolved write kept.
+func (c *Cache) releaseWrites(keys []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, key := range keys {
+		if c.writes[key]--; c.writes[key] <= 0 {
+			delete(c.writes, key)
+		}
+	}
 }
 
 // Invalidate drops every listing covering these object keys, and keeps any
@@ -449,7 +495,9 @@ func (c *Cache) removeLocked(e *entry) {
 const entryOverhead = 256
 
 func costOf(e *entry) int64 {
-	cost := int64(entryOverhead + 2*len(e.key) + len(e.scope) + len(e.body))
+	// The body's capacity rather than its length: io.ReadAll leaves room it
+	// grew into, and that room is held for as long as the entry is.
+	cost := int64(entryOverhead + 2*len(e.key) + len(e.scope) + len(e.origin) + cap(e.body))
 	for name, values := range e.header {
 		cost += int64(len(name))
 		for _, v := range values {

@@ -214,6 +214,11 @@ type Handler struct {
 	// listingRefresh re-lists what writes dropped from the listing
 	// fallback; nil when there is no fallback or refreshing is off.
 	listingRefresh *listingRefresher
+
+	// listingWork is the background listing the fallback does — refreshes,
+	// and listings finished after their client was answered from memory;
+	// nil when there is no fallback.
+	listingWork *listingWork
 }
 
 // New validates the configuration and wires up the shared reverse proxy.
@@ -263,8 +268,11 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.UpstreamSSECKey != nil {
 		h.repairs = newRepairer(h)
 	}
-	if cfg.ListFallback != nil && cfg.ListFallbackRefreshDelay > 0 {
-		h.listingRefresh = newListingRefresher(h, cfg.ListFallbackRefreshDelay)
+	if cfg.ListFallback != nil {
+		h.listingWork = newListingWork()
+		if cfg.ListFallbackRefreshDelay > 0 {
+			h.listingRefresh = newListingRefresher(h, cfg.ListFallbackRefreshDelay)
+		}
 	}
 	h.proxy = &httputil.ReverseProxy{
 		// The request handed to ServeHTTP already carries the absolute
@@ -281,7 +289,7 @@ func New(cfg Config) (*Handler, error) {
 			if st := requestStateFrom(r.Context()); st != nil && neverSent(err) {
 				// The object store never saw this request, so a write in it
 				// changed nothing — see Write.End in internal/listcache.
-				st.neverSent = true
+				st.settleWrite(listcache.Refused)
 			}
 			log.WithError(err).Warn("upstream request failed")
 			s3.WriteError(w, http.StatusBadGateway, "InternalError", "The proxy could not reach the object store.")
@@ -296,8 +304,10 @@ func New(cfg Config) (*Handler, error) {
 // before the cache is closed.
 func (h *Handler) Close() {
 	// Repairs first: finishing one drops listings, which schedules refreshes.
+	// Then nothing new is scheduled, and what is running is cancelled.
 	h.repairs.close()
 	h.listingRefresh.close()
+	h.listingWork.close()
 }
 
 // ListFallback is the listing fallback this handler was configured with, or
@@ -326,7 +336,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if st.mutation != nil {
 		defer st.mutation.End()
 	}
-	defer func() { h.endListingWrite(st.listingWrite, st.neverSent, st.droppedListings...) }()
+	defer func() { h.endListingWrite(st.listingWrite, st.listingWriteOutcome(), st.droppedListings...) }()
 
 	if h.serveCachedRead(rec, r, proxyReq, st) {
 		entry.Cache = st.cacheResult
@@ -447,7 +457,7 @@ func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, entry *observa
 			st.mutation = nil
 		}
 		// Nothing is going upstream, so nothing can have changed.
-		st.listingWrite.End(true)
+		st.listingWrite.End(listcache.Refused)
 		if errors.Is(err, errAllKeysDenied) {
 			// Nothing survived authorization, so there is no upstream call
 			// to make — answer with the per-key AccessDenied entries S3
@@ -574,9 +584,12 @@ type requestState struct {
 	// claim was released, to be refreshed when it is.
 	droppedListings []listcache.Stale
 
-	// neverSent records that the upstream request failed before the object
-	// store could have received it.
-	neverSent bool
+	// writeOutcome is what became of this request's write, once
+	// writeSettled says it is known: refused, never received, or answered.
+	// A write still unsettled when the request is over was sent and never
+	// answered. See settleWrite.
+	writeOutcome listcache.Outcome
+	writeSettled bool
 }
 
 type requestStateKey struct{}

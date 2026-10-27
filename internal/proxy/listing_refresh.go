@@ -23,10 +23,11 @@ package proxy
 //   - Only listings a client asked for within the fallback's maximum age are
 //     refreshed. A refresh does not count as use, so one nobody needs stops
 //     being kept current.
-//   - At most listingRefreshSlots run at a time, and one that fails is not
-//     retried: an object store that cannot answer a listing now is the
-//     outage the fallback is for, and the next client listing that succeeds
-//     remembers the answer anyway.
+//   - At most listingWorkSlots run at a time, together with the listings
+//     finished after their client was answered from memory, and one that
+//     fails is not retried: an object store that cannot answer a listing now
+//     is the outage the fallback is for, and the next client listing that
+//     succeeds remembers the answer anyway.
 
 import (
 	"context"
@@ -46,31 +47,83 @@ const (
 	// off a refresh, as a multiple of the settle delay.
 	listingRefreshMaxWait = 10
 
-	// listingRefreshSlots caps the refreshes in flight. They are work
-	// nobody asked for, like the cache's background fills.
-	listingRefreshSlots = 4
+	// listingWorkSlots caps the background listings in flight: refreshes,
+	// and listings finished after their client was answered from memory.
+	// They are work nobody is waiting for, like the cache's background
+	// fills.
+	listingWorkSlots = 4
 
-	// listingRefreshTimeout bounds one refresh. Nobody is waiting for it,
-	// so it can be generous; it is bounded so that a hung object store does
-	// not hold a slot forever.
-	listingRefreshTimeout = 30 * time.Second
+	// listingWorkTimeout bounds one background listing. Nobody is waiting
+	// for it, so it can be generous; it is bounded so that a hung object
+	// store does not hold a slot forever.
+	listingWorkTimeout = 30 * time.Second
 
 	// listingRefreshMaxBackoff caps how far a refresh that keeps being
 	// overlapped by writes is pushed back.
 	listingRefreshMaxBackoff = time.Minute
 )
 
+// listingWork is the background listing the fallback does on its own. Its
+// context is what lets Close stop it: during an object store hang, which is
+// when there is most of it, waiting it out would keep shutdown waiting too.
+type listingWork struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	slots  chan struct{}
+
+	mu      sync.Mutex
+	closed  bool
+	running sync.WaitGroup
+}
+
+func newListingWork() *listingWork {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &listingWork{ctx: ctx, cancel: cancel, slots: make(chan struct{}, listingWorkSlots)}
+}
+
+// tryStart takes a slot for one piece of background work, and reports false
+// when there is none free or the work is shutting down. done gives it back.
+func (w *listingWork) tryStart() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return false
+	}
+	select {
+	case w.slots <- struct{}{}:
+		w.running.Add(1)
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *listingWork) done() {
+	<-w.slots
+	w.running.Done()
+}
+
+// close cancels what is running and waits for it to let go.
+func (w *listingWork) close() {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	w.closed = true
+	w.mu.Unlock()
+	w.cancel()
+	w.running.Wait()
+}
+
 // listingRefresher re-lists, in the background, what writes dropped from the
 // listing fallback.
 type listingRefresher struct {
 	h     *Handler
 	delay time.Duration
-	slots chan struct{}
 
 	mu      sync.Mutex
 	pending map[string]*pendingRefresh
 	closed  bool
-	running sync.WaitGroup
 }
 
 // pendingRefresh is one listing waiting for its writes to settle.
@@ -86,7 +139,6 @@ func newListingRefresher(h *Handler, delay time.Duration) *listingRefresher {
 	return &listingRefresher{
 		h:       h,
 		delay:   delay,
-		slots:   make(chan struct{}, listingRefreshSlots),
 		pending: make(map[string]*pendingRefresh),
 	}
 }
@@ -144,21 +196,17 @@ func (r *listingRefresher) fire(key string) {
 		r.mu.Unlock()
 		return
 	}
-	select {
-	case r.slots <- struct{}{}:
-	default:
-		// As many refreshes as this proxy is willing to run are running.
-		// This one waits its turn rather than being forgotten.
+	if !r.h.listingWork.tryStart() {
+		// As much background listing as this proxy is willing to do is
+		// running. This one waits its turn rather than being forgotten.
 		p.timer.Reset(r.delay)
 		r.mu.Unlock()
 		return
 	}
 	delete(r.pending, key)
-	r.running.Add(1)
 	r.mu.Unlock()
 
-	defer r.running.Done()
-	defer func() { <-r.slots }()
+	defer r.h.listingWork.done()
 	if r.refresh(p.stale) {
 		return
 	}
@@ -191,7 +239,7 @@ func (r *listingRefresher) refresh(s listcache.Stale) bool {
 	if !ok {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), listingRefreshTimeout)
+	ctx, cancel := context.WithTimeout(h.listingWork.ctx, listingWorkTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.Origin, nil)
 	if err != nil {
@@ -204,7 +252,7 @@ func (r *listingRefresher) refresh(s listcache.Stale) bool {
 		return true
 	}
 	answer := h.fetchListing(req, h.cfg.Limits.RewriteBody)
-	if answer.err != nil || answer.resp.StatusCode >= 300 {
+	if !answer.isListing() {
 		capture.Abort()
 		if answer.err != nil {
 			log.WithError(answer.err).Debug("a background listing refresh failed")
@@ -219,7 +267,8 @@ func (r *listingRefresher) refresh(s listcache.Stale) bool {
 	return !capture.Overlapped()
 }
 
-// close stops what is pending and waits for what is running.
+// close stops what is pending. What is running belongs to listingWork,
+// which Close stops after this.
 func (r *listingRefresher) close() {
 	if r == nil {
 		return
@@ -231,5 +280,4 @@ func (r *listingRefresher) close() {
 		delete(r.pending, key)
 	}
 	r.mu.Unlock()
-	r.running.Wait()
 }

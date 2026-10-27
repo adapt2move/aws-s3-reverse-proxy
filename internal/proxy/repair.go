@@ -550,7 +550,12 @@ func (r *repairer) rewrite(ctx context.Context, target *url.URL, st *requestStat
 	defer cancel()
 	err = r.completeUpload(finishing, target, uploadID, parts, state.etag)
 	mutation.End()
-	r.h.endListingWrite(listing, false)
+	outcome := listcache.Answered
+	if err != nil {
+		// Whether the completion landed is not known, and it may still.
+		outcome = listcache.Unresolved
+	}
+	r.h.endListingWrite(listing, outcome)
 	if err != nil {
 		return err
 	}

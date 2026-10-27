@@ -11,10 +11,16 @@ store first, and the remembered answer is only used when that request:
 
   * has not been answered within `--list-fallback-timeout` (`1s`) — the whole
     answer, body included, or
-  * failed with a server error (`5xx`), or never got an answer at all — the
-    connection was refused, broke, or timed out.
+  * failed with a server error (`5xx`), was throttled (`429`, `408`), or never
+    got an answer at all — the connection was refused, broke, or timed out.
 
-A refusal (`4xx`) is the object store answering, and is passed on. It also
+A listing cut off at the deadline is not abandoned: it runs to the end in the
+background, and its answer becomes the remembered one. An object store that is
+healthy but slower than the deadline therefore still keeps the fallback
+current, one listing behind. At most four such listings run at once; one that
+finds no slot is cancelled.
+
+Any other refusal (`4xx`) is the object store answering, and is passed on. It also
 drops what was remembered for that listing: the bucket may be gone or the
 credentials changed, and the remembered answer describes a state the object
 store no longer agrees with. A listing nothing was remembered for is not cut
@@ -40,7 +46,7 @@ fallback holds listings in memory, not objects on disk.
 ## What keeps it consistent
 
 A listing summarizes every key under its prefix, so any write under that
-prefix changes the answer. Three rules keep a remembered listing from ever
+prefix changes the answer. Four rules keep a remembered listing from ever
 contradicting what a client was told through this proxy:
 
   * **A write drops every listing that would show it** — any `PutObject`,
@@ -58,8 +64,15 @@ contradicting what a client was told through this proxy:
     refused (`4xx`), or one that never reached it (the connection could not be
     made), keeps the remembered listings — an outage is exactly when writes
     fail, and dropping the fallback for every failed write would take it away
-    when it is needed. A `5xx` or a connection that broke after the request
-    was sent may have come after the object changed, and drops them.
+    when it is needed. A `5xx` may have come after the object changed, and
+    drops them.
+  * **A write nobody got an answer to stays claimed.** When the connection
+    breaks after the request was sent, or the client gives up, the object
+    store may still apply the write later — a multipart completion of a large
+    object takes minutes. Such a write drops the listings that would show it
+    and keeps its keys claimed for `--list-fallback-max-age`: no listing under
+    them is remembered in that time, and nothing is refreshed, since either
+    could capture the state from before the write landed.
 
 What is remembered is the object store's own response, before the tenant
 prefix is stripped out and before entries are filtered by access level. A
@@ -98,7 +111,8 @@ the object store would list (pagination, `delimiter`, `LastModified`, writes
 it did not see), and a listing it assembled itself would be wrong in exactly
 the cases nobody can check during an outage.
 
-Three bounds keep it cheap. A burst of writes under one prefix costs one
+Three bounds keep it cheap, and none of it delays shutdown: closing the proxy
+cancels what is still running. A burst of writes under one prefix costs one
 listing after the last of them. Only listings a client asked for within
 `--list-fallback-max-age` are refreshed, and a refresh does not count as being
 asked for, so a listing nobody uses stops being kept current. And at most four

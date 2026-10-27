@@ -75,35 +75,29 @@ func (h *Handler) forwardListing(req *http.Request, st *requestState) (*http.Res
 	remembered := h.cfg.ListFallback.Get(key)
 	capture := h.cfg.ListFallback.Begin(key, scope, req.URL.String())
 
-	ctx, cancel := context.WithCancel(req.Context())
-	defer cancel()
+	if remembered == nil {
+		// With nothing to fall back on, there is nothing to gain from giving
+		// up early: the request waits for the object store like any other.
+		answer := h.fetchListing(req, st.maxRewriteSize)
+		answer.settle(capture)
+		return answer.resp, answer.err
+	}
+
+	// The listing may outlive this request — see finishInBackground — so it
+	// runs on the background work's context rather than the client's.
+	ctx, cancel := context.WithTimeout(h.listingWork.ctx, listingWorkTimeout)
 	answers := make(chan listingAnswer, 1)
 	go func() { answers <- h.fetchListing(req.WithContext(ctx), st.maxRewriteSize) }()
-
-	// With nothing to fall back on, there is nothing to gain from giving up
-	// early: the request waits for the object store like any other, and a nil
-	// channel never fires.
-	var deadline <-chan time.Time
-	if remembered != nil {
-		timer := time.NewTimer(h.cfg.ListFallbackTimeout)
-		defer timer.Stop()
-		deadline = timer.C
-	}
+	timer := time.NewTimer(h.cfg.ListFallbackTimeout)
+	defer timer.Stop()
 
 	select {
 	case answer := <-answers:
-		switch {
-		case answer.err == nil && answer.resp.StatusCode < 300:
-			capture.Commit(listingHeaders(answer.resp.Header), answer.body)
-			return answer.resp, nil
-		case answer.err == nil && answer.resp.StatusCode < 500:
-			capture.Discard()
-			return answer.resp, nil
-		}
-		capture.Abort()
-		// A client that went away is not an outage, and neither is a listing
-		// too large to rewrite: the object store did answer that one.
-		if remembered == nil || req.Context().Err() != nil || errors.Is(answer.err, errListingTooLarge) {
+		cancel()
+		answer.settle(capture)
+		// A listing too large to rewrite is not an outage: the object store
+		// did answer that one.
+		if !answer.failed() || errors.Is(answer.err, errListingTooLarge) {
 			return answer.resp, answer.err
 		}
 		logger := h.objectLog(st)
@@ -115,8 +109,13 @@ func (h *Handler) forwardListing(req *http.Request, st *requestState) (*http.Res
 		}
 		logger.Warnf("the object store %s a listing; serving the one it gave %s ago",
 			reason, remembered.Age.Truncate(time.Second))
-	case <-deadline:
-		capture.Abort()
+	case <-req.Context().Done():
+		// A client that went away is not an outage. The object store may
+		// still be about to answer, and that answer is worth keeping.
+		h.finishInBackground(capture, answers, cancel)
+		return nil, req.Context().Err()
+	case <-timer.C:
+		h.finishInBackground(capture, answers, cancel)
 		h.objectLog(st).Warnf("the object store did not answer a listing within %s; serving the one it gave %s ago",
 			h.cfg.ListFallbackTimeout, remembered.Age.Truncate(time.Second))
 	}
@@ -137,6 +136,62 @@ func (h *Handler) forwardListing(req *http.Request, st *requestState) (*http.Res
 		ContentLength: int64(len(remembered.Body)),
 		Request:       req,
 	}, nil
+}
+
+// finishInBackground lets a listing the client stopped waiting for run to the
+// end, and remembers its answer.
+//
+// Without it, an object store that is healthy but slower than the deadline
+// would never update what is remembered: every listing would be cut off and
+// answered from memory, until the remembered answer was too old to serve. With
+// it, each listing leaves the object store's current answer for the next one.
+// When there is no slot for it — a hang leaves many listings waiting at once —
+// it is cancelled, which is what happened to all of them before.
+func (h *Handler) finishInBackground(capture *listcache.Capture, answers <-chan listingAnswer, cancel context.CancelFunc) {
+	if !h.listingWork.tryStart() {
+		cancel()
+		capture.Abort()
+		return
+	}
+	go func() {
+		defer h.listingWork.done()
+		defer cancel()
+		answer := <-answers
+		answer.settle(capture)
+	}()
+}
+
+// failed reports whether the object store gave no answer worth passing on: an
+// error, a server error, or a refusal that only says it is overloaded or slow
+// right now. Those are what the fallback answers in its place, and none of
+// them says anything about the listing remembered.
+func (a listingAnswer) failed() bool {
+	if a.err != nil {
+		return true
+	}
+	switch status := a.resp.StatusCode; {
+	case status >= 500, status == http.StatusTooManyRequests, status == http.StatusRequestTimeout:
+		return true
+	}
+	return false
+}
+
+// isListing reports whether the object store answered with a listing.
+func (a listingAnswer) isListing() bool {
+	return a.err == nil && a.resp.StatusCode < 300
+}
+
+// settle records an answer in the fallback: a listing is remembered, a
+// refusal forgets what was remembered, and a failure leaves it alone.
+func (a listingAnswer) settle(capture *listcache.Capture) {
+	switch {
+	case a.isListing():
+		capture.Commit(listingHeaders(a.resp.Header), a.body)
+	case a.failed():
+		capture.Abort()
+	default:
+		capture.Discard()
+	}
 }
 
 // errListingTooLarge is a listing larger than the rewrite may buffer. It is
@@ -206,16 +261,39 @@ func (h *Handler) beginListingWrite(st *requestState, keys ...string) {
 
 // endListingWrite releases a write's claim on the listing fallback, and has
 // what it dropped — now, or earlier — asked for again once writes have
-// settled.
-func (h *Handler) endListingWrite(w *listcache.Write, refused bool, dropped ...listcache.Stale) {
-	h.listingRefresh.schedule(append(w.End(refused), dropped...))
+// settled. An unresolved write has nothing asked for again: the object store
+// may not have applied it yet.
+func (h *Handler) endListingWrite(w *listcache.Write, outcome listcache.Outcome, dropped ...listcache.Stale) {
+	stale := w.End(outcome)
+	if outcome == listcache.Answered {
+		stale = append(stale, dropped...)
+	}
+	h.listingRefresh.schedule(stale)
 }
 
-// writeRefused reports whether an upstream answer to a write says the write
-// did not happen. A 4xx is the object store refusing it; a 5xx may have come
-// after the object changed, and anything else means it did.
-func writeRefused(status int) bool {
-	return status >= 400 && status < 500
+// writeOutcome is what an upstream answer to a write says about it. A 4xx is
+// the object store refusing it; a 5xx may have come after the object changed,
+// and anything else means it did.
+func writeOutcome(status int) listcache.Outcome {
+	if status >= 400 && status < 500 {
+		return listcache.Refused
+	}
+	return listcache.Answered
+}
+
+// settleWrite records what became of this request's write, for the claim
+// ServeHTTP releases. Until it is called the write counts as unresolved.
+func (st *requestState) settleWrite(outcome listcache.Outcome) {
+	st.writeOutcome, st.writeSettled = outcome, true
+}
+
+// listingWriteOutcome is what became of this request's write, as far as it
+// is known when the request is over.
+func (st *requestState) listingWriteOutcome() listcache.Outcome {
+	if st.writeSettled {
+		return st.writeOutcome
+	}
+	return listcache.Unresolved
 }
 
 // neverSent reports whether an upstream request failed before the object

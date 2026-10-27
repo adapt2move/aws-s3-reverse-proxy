@@ -73,7 +73,7 @@ func TestAWriteDropsTheListingsThatCoverIt(t *testing.T) {
 
 	w := c.BeginWrite("bucket/t/data/2026/a.csv")
 	assert.NotNil(t, c.Get("covering"), "until the object store has answered, the write has not happened")
-	w.End(false)
+	w.End(Answered)
 
 	assert.Nil(t, c.Get("covering"))
 	assert.Nil(t, c.Get("covering-root"))
@@ -87,7 +87,7 @@ func TestAWriteDropsTheListingsThatCoverIt(t *testing.T) {
 func TestARefusedWriteKeepsTheListings(t *testing.T) {
 	c, _ := newTestCache(t)
 	remember(t, c, "k", "bucket/t/data/", "<a/>")
-	c.BeginWrite("bucket/t/data/a.csv").End(true)
+	c.BeginWrite("bucket/t/data/a.csv").End(Refused)
 	assert.NotNil(t, c.Get("k"))
 }
 
@@ -99,7 +99,7 @@ func TestAListingThatOverlapsAWriteIsNotRemembered(t *testing.T) {
 		c, _ := newTestCache(t)
 		listing := c.Begin("k", "bucket/t/data/", "")
 		w := c.BeginWrite("bucket/t/data/a.csv")
-		w.End(false)
+		w.End(Answered)
 		assert.False(t, listing.Commit(xmlHeader, []byte("<old/>")))
 		assert.Nil(t, c.Get("k"))
 	})
@@ -107,7 +107,7 @@ func TestAListingThatOverlapsAWriteIsNotRemembered(t *testing.T) {
 		c, _ := newTestCache(t)
 		w := c.BeginWrite("bucket/t/data/a.csv")
 		listing := c.Begin("k", "bucket/t/data/", "")
-		w.End(false)
+		w.End(Answered)
 		assert.False(t, listing.Commit(xmlHeader, []byte("<old/>")))
 	})
 	t.Run("even when the write is refused in the end", func(t *testing.T) {
@@ -115,18 +115,18 @@ func TestAListingThatOverlapsAWriteIsNotRemembered(t *testing.T) {
 		// listing may already have been answered with it half-applied.
 		c, _ := newTestCache(t)
 		listing := c.Begin("k", "bucket/t/data/", "")
-		c.BeginWrite("bucket/t/data/a.csv").End(true)
+		c.BeginWrite("bucket/t/data/a.csv").End(Refused)
 		assert.False(t, listing.Commit(xmlHeader, []byte("<old/>")))
 	})
 	t.Run("a write elsewhere does not get in the way", func(t *testing.T) {
 		c, _ := newTestCache(t)
 		listing := c.Begin("k", "bucket/t/data/", "")
-		c.BeginWrite("bucket/t/logs/a.log").End(false)
+		c.BeginWrite("bucket/t/logs/a.log").End(Answered)
 		assert.True(t, listing.Commit(xmlHeader, []byte("<new/>")))
 	})
 	t.Run("a listing after the write has ended is remembered", func(t *testing.T) {
 		c, _ := newTestCache(t)
-		c.BeginWrite("bucket/t/data/a.csv").End(false)
+		c.BeginWrite("bucket/t/data/a.csv").End(Answered)
 		assert.True(t, c.Begin("k", "bucket/t/data/", "").Commit(xmlHeader, []byte("<new/>")))
 	})
 }
@@ -184,10 +184,10 @@ func TestMemoryStaysWithinItsLimit(t *testing.T) {
 func TestEndIsIdempotentAndNilSafe(t *testing.T) {
 	c, _ := newTestCache(t)
 	w := c.BeginWrite("bucket/t/a")
-	w.End(false)
-	w.End(false)
+	w.End(Answered)
+	w.End(Answered)
 	var none *Write
-	none.End(false)
+	none.End(Answered)
 	assert.Nil(t, c.BeginWrite())
 
 	c.mu.Lock()
@@ -203,15 +203,15 @@ func TestAWriteReportsTheListingsItDropped(t *testing.T) {
 	remember(t, c, "covering", "bucket/t/data/", "<a/>")
 	remember(t, c, "sibling", "bucket/t/logs/", "<a/>")
 
-	stale := c.BeginWrite("bucket/t/data/a.csv").End(false)
+	stale := c.BeginWrite("bucket/t/data/a.csv").End(Answered)
 	require.Len(t, stale, 1)
 	assert.Equal(t, "covering", stale[0].Key)
 	assert.Equal(t, "bucket/t/data/", stale[0].Scope)
 	assert.Equal(t, "origin-of-covering", stale[0].Origin)
 
-	assert.Empty(t, c.BeginWrite("bucket/t/data/b.csv").End(false), "nothing is left to drop")
+	assert.Empty(t, c.BeginWrite("bucket/t/data/b.csv").End(Answered), "nothing is left to drop")
 	remember(t, c, "covering", "bucket/t/data/", "<a/>")
-	assert.Empty(t, c.BeginWrite("bucket/t/data/c.csv").End(true), "a refused write drops nothing")
+	assert.Empty(t, c.BeginWrite("bucket/t/data/c.csv").End(Refused), "a refused write drops nothing")
 	assert.Len(t, c.Invalidate("bucket/t/data/c.csv"), 1)
 }
 
@@ -220,7 +220,7 @@ func TestAWriteReportsTheListingsItDropped(t *testing.T) {
 func TestOnlyListingsInUseAreWorthRefreshing(t *testing.T) {
 	c, clk := newTestCache(t)
 	remember(t, c, "k", "bucket/t/", "<a/>")
-	stale := c.BeginWrite("bucket/t/a").End(false)
+	stale := c.BeginWrite("bucket/t/a").End(Answered)
 	require.Len(t, stale, 1)
 
 	// Refreshed, then left alone by clients for longer than MaxAge.
@@ -229,34 +229,70 @@ func TestOnlyListingsInUseAreWorthRefreshing(t *testing.T) {
 	require.True(t, refresh.Commit(xmlHeader, []byte("<b/>")))
 	assert.Equal(t, uint64(1), c.Stats().Refreshed)
 	clk.advance(30 * time.Minute)
-	stale = c.BeginWrite("bucket/t/b").End(false)
+	stale = c.BeginWrite("bucket/t/b").End(Answered)
 	require.Len(t, stale, 1, "still within MaxAge of the last client")
 	refresh, _ = c.BeginRefresh(stale[0])
 	require.True(t, refresh.Commit(xmlHeader, []byte("<c/>")))
 
 	clk.advance(31 * time.Minute)
-	assert.Empty(t, c.BeginWrite("bucket/t/c").End(false),
+	assert.Empty(t, c.BeginWrite("bucket/t/c").End(Answered),
 		"a refresh does not count as use: an hour after the last client, it stops")
 
 	// A client asking again makes it worth keeping current again.
 	remember(t, c, "k", "bucket/t/", "<d/>")
-	assert.Len(t, c.BeginWrite("bucket/t/d").End(false), 1)
+	assert.Len(t, c.BeginWrite("bucket/t/d").End(Answered), 1)
 }
 
 func TestARefreshWaitsForWritesInFlight(t *testing.T) {
 	c, _ := newTestCache(t)
 	remember(t, c, "k", "bucket/t/", "<a/>")
-	stale := c.BeginWrite("bucket/t/a").End(false)
+	stale := c.BeginWrite("bucket/t/a").End(Answered)
 	require.Len(t, stale, 1)
 
 	w := c.BeginWrite("bucket/t/b")
 	_, ok := c.BeginRefresh(stale[0])
 	assert.False(t, ok, "while a write is in flight the answer could not be remembered anyway")
-	w.End(false)
+	w.End(Answered)
 
 	refresh, ok := c.BeginRefresh(stale[0])
 	require.True(t, ok)
-	c.BeginWrite("bucket/t/c").End(true)
+	c.BeginWrite("bucket/t/c").End(Refused)
 	assert.False(t, refresh.Commit(xmlHeader, []byte("<b/>")))
 	assert.True(t, refresh.Overlapped(), "and says why, so the caller can try again later")
+}
+
+// A write that was sent and never answered may still land, minutes later.
+// Until the hold has passed, nothing under it is remembered, and nothing is
+// handed back to be refreshed: a refresh would remember the listing from
+// before it landed.
+func TestAnUnresolvedWriteHoldsItsKeys(t *testing.T) {
+	clk := &clock{now: time.Unix(1_700_000_000, 0)}
+	c := New(Options{MaxBytes: 1 << 20, MaxAge: time.Hour, UnresolvedHold: 50 * time.Millisecond, Now: clk.Now})
+	remember(t, c, "k", "bucket/t/", "<a/>")
+
+	assert.Empty(t, c.BeginWrite("bucket/t/a").End(Unresolved), "nothing to refresh")
+	assert.Nil(t, c.Get("k"), "but dropped all the same")
+	assert.False(t, c.Begin("k", "bucket/t/", "").Commit(xmlHeader, []byte("<before/>")),
+		"a listing now may be from before the write lands")
+	_, ok := c.BeginRefresh(Stale{Key: "k", Scope: "bucket/t/"})
+	assert.False(t, ok)
+
+	require.Eventually(t, func() bool {
+		return c.Begin("k", "bucket/t/", "").Commit(xmlHeader, []byte("<after/>"))
+	}, time.Second, 10*time.Millisecond, "after the hold the claim is given back")
+}
+
+func TestTheHoldDefaultsToMaxAge(t *testing.T) {
+	c := New(Options{MaxBytes: 1 << 20, MaxAge: time.Hour})
+	assert.Equal(t, time.Hour, c.hold)
+}
+
+// What an entry costs is what it holds on to: the origin it was listed from,
+// and the whole buffer the body was read into.
+func TestAnEntryCostsWhatItHolds(t *testing.T) {
+	c, _ := newTestCache(t)
+	body := make([]byte, 100, 4096)
+	origin := "http://store/bucket?list-type=2&prefix=" + string(make([]byte, 500))
+	require.True(t, c.Begin("k", "bucket/t/", origin).Commit(xmlHeader, body))
+	assert.GreaterOrEqual(t, c.Stats().Bytes, int64(4096+len(origin)))
 }

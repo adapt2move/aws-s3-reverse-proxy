@@ -41,6 +41,7 @@ type outage struct {
 	hangUp     bool
 	putStatus  int
 	putDelay   time.Duration
+	putHangUp  bool
 	// written are the upstream keys accepted since, listed after the two
 	// that are always there.
 	written []string
@@ -55,12 +56,19 @@ func (o *outage) set(change func(*outage)) {
 func (o *outage) serve(w http.ResponseWriter, r *http.Request) {
 	o.mu.Lock()
 	listStatus, delay, hangUp, putStatus := o.listStatus, o.listDelay, o.hangUp, o.putStatus
-	putDelay := o.putDelay
+	putDelay, putHangUp := o.putDelay, o.putHangUp
 	written := append([]string(nil), o.written...)
 	o.mu.Unlock()
 
 	if r.Method == http.MethodPut {
 		time.Sleep(putDelay)
+		if putHangUp {
+			// The request arrived; the answer never does.
+			if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				_ = conn.Close()
+			}
+			return
+		}
 		if putStatus != 0 {
 			w.WriteHeader(putStatus)
 			return
@@ -492,4 +500,75 @@ func TestARefreshWaitsOutAWriteInFlight(t *testing.T) {
 	body := readBody(t, list(t, h, tenantA, "rws"))
 	assert.Contains(t, body, "datasets/2026/b.csv")
 	assert.Contains(t, body, "datasets/2026/c.csv", "the answer is from after both writes")
+}
+
+// A healthy object store that is slower than the deadline still updates what
+// is remembered: the listing the client stopped waiting for runs to the end.
+func TestASlowObjectStoreStillUpdatesTheRememberedListing(t *testing.T) {
+	h, _, o := newFallbackProxy(t, 50*time.Millisecond)
+	o.set(func(o *outage) { o.listDelay = 200 * time.Millisecond })
+	require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
+	require.Equal(t, uint64(1), h.ListFallback().Stats().Stored)
+
+	// Written past the proxy, so nothing here drops the remembered listing.
+	o.set(func(o *outage) { o.written = append(o.written, tenantA+"/datasets/2026/outside.csv") })
+	first := list(t, h, tenantA, "rws")
+	assert.Equal(t, "FALLBACK", first.Header.Get("X-Cache"))
+	assert.NotContains(t, readBody(t, first), "outside.csv")
+
+	waitFor(t, "the cut-off listing to be remembered", func() bool { return h.ListFallback().Stats().Stored == 2 })
+	second := list(t, h, tenantA, "rws")
+	assert.Equal(t, "FALLBACK", second.Header.Get("X-Cache"))
+	assert.Contains(t, readBody(t, second), "datasets/2026/outside.csv",
+		"the next listing gets the object store's answer to the one before it")
+}
+
+// A store that throttles is overloaded, not refusing the listing: the
+// remembered answer is served, and kept.
+func TestThrottlingIsAnsweredFromMemory(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusRequestTimeout} {
+		h, _, o := newFallbackProxy(t, time.Second)
+		require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
+		o.set(func(o *outage) { o.listStatus = status })
+		assert.Equal(t, "FALLBACK", list(t, h, tenantA, "rws").Header.Get("X-Cache"), "status %d", status)
+		o.set(func(o *outage) { o.listStatus = http.StatusInternalServerError })
+		assert.Equal(t, "FALLBACK", list(t, h, tenantA, "rws").Header.Get("X-Cache"), "status %d", status)
+	}
+}
+
+// A write that was sent and never answered may land after the proxy gave up.
+// A refresh, or a client's listing, in that window would remember the
+// listing from before it — so neither is remembered until the hold is over.
+func TestAWriteThatWasNeverAnsweredIsNotRefreshedOver(t *testing.T) {
+	h, upstream, o := newFallbackProxy(t, time.Second, withRefreshDelay(20*time.Millisecond), func(cfg *Config) {
+		cfg.ListFallback = listcache.New(listcache.Options{MaxBytes: 1 << 20, MaxAge: time.Hour, UnresolvedHold: 400 * time.Millisecond})
+	})
+	require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
+
+	o.set(func(o *outage) { o.putHangUp = true })
+	require.Equal(t, http.StatusBadGateway, put(t, h, "/bucket/datasets/2026/b.csv").StatusCode)
+	o.set(func(o *outage) { o.putHangUp = false })
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, 1, listings(upstream), "nothing is refreshed after a write nobody knows the outcome of")
+
+	require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
+	assert.Equal(t, uint64(1), h.ListFallback().Stats().Stored, "and a client's listing is not remembered either")
+
+	time.Sleep(400 * time.Millisecond)
+	require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
+	assert.Equal(t, uint64(2), h.ListFallback().Stats().Stored, "once the hold is over, it is")
+}
+
+// During a hang, which is when there is background listing in flight, closing
+// the handler must not wait for the object store.
+func TestClosingTheHandlerCancelsBackgroundListings(t *testing.T) {
+	h, _, o := newFallbackProxy(t, 50*time.Millisecond)
+	require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
+
+	o.set(func(o *outage) { o.listDelay = 10 * time.Second })
+	require.Equal(t, "FALLBACK", list(t, h, tenantA, "rws").Header.Get("X-Cache"))
+
+	start := time.Now()
+	h.Close()
+	assert.Less(t, time.Since(start), time.Second)
 }
