@@ -55,6 +55,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/cache"
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/listcache"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/s3"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/sigv4"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/ssec"
@@ -539,10 +540,22 @@ func (r *repairer) rewrite(ctx context.Context, target *url.URL, st *requestStat
 	if r.h.cfg.Cache != nil && st.cacheKey != "" {
 		mutation = r.h.cfg.Cache.BeginMutation(st.cacheKey)
 	}
+	// The replacement has a new ETag, so a listing remembered from before it
+	// describes an object that is gone.
+	var listing *listcache.Write
+	if r.h.cfg.ListFallback != nil {
+		listing = r.h.cfg.ListFallback.BeginWrite(cacheKeyFor(st))
+	}
 	finishing, cancel := context.WithTimeout(context.WithoutCancel(ctx), completeTimeout)
 	defer cancel()
 	err = r.completeUpload(finishing, target, uploadID, parts, state.etag)
 	mutation.End()
+	outcome := listcache.Answered
+	if err != nil {
+		// Whether the completion landed is not known, and it may still.
+		outcome = listcache.Unresolved
+	}
+	r.h.endListingWrite(listing, outcome)
 	if err != nil {
 		return err
 	}
@@ -853,10 +866,16 @@ func (r *repairer) uploadOwner(ctx context.Context, target *url.URL, uploadID st
 	return doc.Owner, nil
 }
 
-// invalidate drops whatever the cache holds for the object a request named.
+// invalidate drops whatever the caches hold for the object a request named,
+// listings that cover it included.
 func (h *Handler) invalidate(st *requestState) {
 	if h.cfg.Cache != nil && st.cacheKey != "" {
 		h.cfg.Cache.Invalidate(st.cacheKey)
+	}
+	if h.cfg.ListFallback != nil {
+		if key := cacheKeyFor(st); key != "" {
+			h.listingRefresh.schedule(h.cfg.ListFallback.Invalidate(key))
+		}
 	}
 }
 

@@ -43,7 +43,7 @@ var (
 	cacheLookups = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "s3proxy_cache_lookups_total",
-			Help: "Local cache lookups by operation and outcome (hit, miss, stale, bypass).",
+			Help: "Local cache lookups by operation and outcome (hit, miss, stale, revalidated, bypass, and fallback for a listing answered from memory).",
 		},
 		[]string{"operation", "result"},
 	)
@@ -122,6 +122,54 @@ func RegisterCacheStats(read func() CacheStats) {
 			func(s CacheStats) float64 { return float64(s.Evictions) }),
 		counter("s3proxy_cache_evicted_bytes_total", "Bytes reclaimed from the local cache.",
 			func(s CacheStats) float64 { return float64(s.EvictedBytes) }),
+	)
+}
+
+// ListFallbackStats is what the listing fallback knows about itself, reported
+// the same way CacheStats is.
+type ListFallbackStats struct {
+	Entries       int
+	Bytes         int64
+	Capacity      int64
+	Stored        uint64
+	Refreshed     uint64
+	Dropped       uint64
+	Invalidations uint64
+}
+
+// RegisterListFallbackStats publishes the listing fallback's gauges and
+// counters, once, and only when it is configured. How often it was actually
+// served is s3proxy_cache_lookups_total{operation="ListObjects",result="fallback"}.
+func RegisterListFallbackStats(read func() ListFallbackStats) {
+	prometheus.MustRegister(
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "s3proxy_list_fallback_entries",
+			Help: "Listings remembered to answer from while the object store does not.",
+		}, func() float64 { return float64(read().Entries) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "s3proxy_list_fallback_bytes",
+			Help: "Memory the remembered listings occupy.",
+		}, func() float64 { return float64(read().Bytes) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "s3proxy_list_fallback_capacity_bytes",
+			Help: "Configured memory limit of the listing fallback.",
+		}, func() float64 { return float64(read().Capacity) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "s3proxy_list_fallback_stores_total",
+			Help: "Listings remembered after the object store answered them.",
+		}, func() float64 { return float64(read().Stored) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "s3proxy_list_fallback_refreshes_total",
+			Help: "Listings remembered after being listed again in the background, because a write had dropped them.",
+		}, func() float64 { return float64(read().Refreshed) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "s3proxy_list_fallback_store_failures_total",
+			Help: "Listings not remembered: a write overlapped them, or they were too large.",
+		}, func() float64 { return float64(read().Dropped) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "s3proxy_list_fallback_invalidations_total",
+			Help: "Remembered listings dropped because a write may have changed them.",
+		}, func() float64 { return float64(read().Invalidations) }),
 	)
 }
 

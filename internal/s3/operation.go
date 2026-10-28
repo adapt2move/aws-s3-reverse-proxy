@@ -39,6 +39,8 @@ const (
 	CompleteMultipartUpload Kind = "CompleteMultipartUpload"
 	AbortMultipartUpload    Kind = "AbortMultipartUpload"
 	ListParts               Kind = "ListParts"
+	HeadBucket              Kind = "HeadBucket"
+	GetBucketLocation       Kind = "GetBucketLocation"
 )
 
 // Operation is a classified request: which S3 call it is, and the
@@ -66,7 +68,19 @@ type Operation struct {
 // IsBucketLevel reports whether the operation addresses the bucket rather
 // than one object in it.
 func (o *Operation) IsBucketLevel() bool {
-	return o.Kind == ListObjects || o.Kind == DeleteObjects
+	switch o.Kind {
+	case ListObjects, DeleteObjects, HeadBucket, GetBucketLocation:
+		return true
+	}
+	return false
+}
+
+// NamesNoKey reports whether an operation is about the bucket alone, with no
+// object key or listing prefix for a policy rule to match. Such an operation
+// says nothing about any tenant's objects, so authenticating its caller is
+// all the authorization it gets.
+func (o *Operation) NamesNoKey() bool {
+	return o.Kind == HeadBucket || o.Kind == GetBucketLocation
 }
 
 var (
@@ -97,6 +111,7 @@ var (
 		"start-after", "encoding-type", "fetch-owner", "marker",
 	)
 	deleteObjectsParams = newParamSet("delete")
+	locationParams      = newParamSet("location")
 	listPartsParams     = newParamSet("uploadId", "max-parts", "part-number-marker", "encoding-type")
 	uploadPartParams    = newParamSet("partNumber", "uploadId")
 	createMPUParams     = newParamSet("uploads")
@@ -182,7 +197,16 @@ func Classify(req *http.Request) (*Operation, error) {
 
 	if bucketLevel {
 		switch req.Method {
+		case http.MethodHead:
+			// Tools like rclone, mc and s3fs check that the bucket exists
+			// before they do anything else.
+			if len(query) == 0 {
+				return &Operation{Kind: HeadBucket, Bucket: bucket}, nil
+			}
 		case http.MethodGet:
+			if _, ok := query["location"]; ok && locationParams.covers(query) {
+				return &Operation{Kind: GetBucketLocation, Bucket: bucket}, nil
+			}
 			if listObjectsParams.covers(query) {
 				return &Operation{
 					Kind:        ListObjects,
@@ -196,8 +220,8 @@ func Classify(req *http.Request) (*Operation, error) {
 				return &Operation{Kind: DeleteObjects, Bucket: bucket, RewritesXML: true}, nil
 			}
 		}
-		// Bucket creation (PUT /bucket), deletion (DELETE /bucket),
-		// HeadBucket and every `?…` bucket sub-resource land here.
+		// Bucket creation (PUT /bucket), deletion (DELETE /bucket) and
+		// every other `?…` bucket sub-resource land here.
 		return nil, fmt.Errorf("%w: %s bucket-level request", ErrUnsupportedOperation, req.Method)
 	}
 

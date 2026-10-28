@@ -15,7 +15,7 @@ func TestPurgeHandlerEmptiesTheCache(t *testing.T) {
 	require.True(t, c.Has("k"))
 
 	rec := httptest.NewRecorder()
-	PurgeHandler(c, "").ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/cache/purge", nil))
+	PurgeHandler("", c.PurgeTarget()).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/cache/purge", nil))
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Contains(t, rec.Body.String(), "purged 1 objects")
 	assert.False(t, c.Has("k"))
@@ -26,7 +26,7 @@ func TestPurgeHandlerRefusesAnythingButPost(t *testing.T) {
 	store(t, c, "k", objectHeader(), []byte("contents"))
 
 	rec := httptest.NewRecorder()
-	PurgeHandler(c, "").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/cache/purge", nil))
+	PurgeHandler("", c.PurgeTarget()).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/cache/purge", nil))
 	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
 	assert.Equal(t, http.MethodPost, rec.Header().Get("Allow"))
 	assert.True(t, c.Has("k"), "a GET must not have emptied anything")
@@ -56,7 +56,7 @@ func TestPurgeHandlerChecksItsToken(t *testing.T) {
 				req.Header.Set("Authorization", tc.authHeader)
 			}
 			rec := httptest.NewRecorder()
-			PurgeHandler(c, "s3cret").ServeHTTP(rec, req)
+			PurgeHandler("s3cret", c.PurgeTarget()).ServeHTTP(rec, req)
 
 			assert.Equal(t, tc.want, rec.Code)
 			assert.Equal(t, tc.want != http.StatusOK, c.Has("k"),

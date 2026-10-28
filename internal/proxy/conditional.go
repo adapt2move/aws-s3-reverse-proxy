@@ -38,6 +38,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/listcache"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/s3"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/sigv4"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/ssec"
@@ -113,6 +114,9 @@ func (h *Handler) serveConditionalPutOverPlaintext(w http.ResponseWriter, proxyR
 	r := h.repairs
 	logger := h.objectLog(st)
 
+	// Until the completion is sent, nothing this does can change the object:
+	// an upload that is never completed is abandoned below.
+	st.settleWrite(listcache.Refused)
 	uploadID, err := r.createUpload(ctx, &target, objectHeaders(proxyReq.Header))
 	if err != nil {
 		logger.WithError(err).Warn("a conditional write onto a plaintext object could not start its upload")
@@ -170,6 +174,9 @@ func (h *Handler) serveConditionalPutOverPlaintext(w http.ResponseWriter, proxyR
 	}
 	finish, cancelFinish := context.WithTimeout(context.WithoutCancel(ctx), completeTimeout)
 	defer cancelFinish()
+	// From here the object may change, and until the answer is read whether
+	// it did is not known.
+	st.writeSettled = false
 	resp, err := r.send(finish, http.MethodPost, &target, url.Values{"uploadId": {uploadID}}.Encode(),
 		bytes.NewReader(list.Bytes()), int64(list.Len()), payloadSHA256(list.Bytes()), conditions)
 	if err != nil {
@@ -189,10 +196,14 @@ func (h *Handler) serveConditionalPutOverPlaintext(w http.ResponseWriter, proxyR
 				status = http.StatusPreconditionFailed
 			}
 		}
+		if readErr == nil {
+			st.settleWrite(writeOutcome(status))
+		}
 		h.writeRelayedError(w, status, resp.Header.Get("Content-Type"), result, st)
 		return true
 	}
 	completed = true
+	st.settleWrite(listcache.Answered)
 
 	// Answer like a PUT: the ETag, and nothing about the upload behind it.
 	header := http.Header{}
