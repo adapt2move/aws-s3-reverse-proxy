@@ -259,7 +259,7 @@ practice.
 
 | Flag (env) | Default | Meaning |
 | --- | --- | --- |
-| `--cache-dir` (`CACHE_DIR`) | *off* | directory to cache object reads in, emptied at every start; empty disables caching entirely |
+| `--cache-dir` (`CACHE_DIR`) | *off* | directory to cache object reads in, **unencrypted**, emptied at every start; empty disables caching entirely |
 | `--cache-max-bytes` (`CACHE_MAX_BYTES`) | 1 GiB | the most disk the cache ever uses, writes in progress included |
 | `--cache-max-object-size` (`CACHE_MAX_OBJECT_SIZE`) | 64 MiB | largest object accepted; bigger ones are proxied without being stored |
 | `--cache-max-age` (`CACHE_MAX_AGE`) | `10m` | how long an object is served before it is checked against the object store; `0s` disables expiry entirely |
@@ -597,9 +597,13 @@ things about it matter to an operator:
     an object that does not fit is not cached.
   * **The directory is emptied at every start.** A restart costs a cold
     cache; nothing an earlier process cached is ever served.
-  * **It holds tenant object data at rest**, decrypted even with SSE-C, which
-    the proxy otherwise never does. It is created `0700`, and encryption at
-    rest is the operator's to arrange.
+  * **Cached objects are stored unencrypted, always.** A file holds the
+    plaintext the object store returned, whatever encryption the object store
+    applies to its own copy: SSE-S3, SSE-KMS, or this proxy's
+    [SSE-C](#encryption-and-the-cache). Anybody who can read the volume can
+    read every tenant's cached objects. The directory is created `0700`;
+    encrypting the disk underneath it is the operator's to arrange. Without
+    `--cache-dir`, the proxy keeps no object data at rest at all.
 
 How to size the volume and the pod for it, and what node disk pressure does:
 [Running on Kubernetes](docs/kubernetes.md#the-object-cache). How the store
@@ -831,13 +835,15 @@ standard `"abcef123"` form, in headers and in XML.
 
 ### Encryption and the cache
 
-The cache stores **decrypted** object bytes. SSE-C protects the object store;
-the cache volume needs protecting on its own terms. The cache directory
-records which key it was written under (as a keyed hash, never the key
-itself), and a start with a different key — or with none — empties it, so a
-changed key cannot look healthy only because the cache still answers for
-objects the store would now refuse to decrypt. Writes made directly to the bucket, even
-with the same key, are still external writes to the cache: keep
+With a cache, SSE-C covers the object store and nothing else. The cache
+stores the **decrypted** bytes, unencrypted on local disk, so the cache volume
+needs protecting on its own terms: see [On disk](#on-disk). The key itself
+never reaches the cache directory.
+
+The cache is emptied at every start, so a restart with a different key, or
+with none, can never look healthy only because the cache still answers for
+objects the store would now refuse to decrypt. Writes made directly to the
+bucket, even with the same key, are still external writes to the cache: keep
 `--cache-max-age` finite when anything else writes.
 
 ## Observability

@@ -9,9 +9,7 @@
 package ssec
 
 import (
-	"crypto/hmac"
 	"crypto/md5"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -85,7 +83,6 @@ func StripCustomerHeaders(header http.Header) {
 type Key struct {
 	encoded    string
 	encodedMD5 string
-	label      string
 
 	// spellings matches every form the key or its digest could take in a
 	// document an object store sends back: Base64, percent-encoded Base64
@@ -112,12 +109,9 @@ func Parse(encoded string) (*Key, error) {
 		return nil, fmt.Errorf("the key decodes to %d bytes, it must be exactly %d", len(raw), KeySize)
 	}
 	sum := md5.Sum(raw)
-	mac := hmac.New(sha256.New, raw)
-	mac.Write([]byte("aws-s3-reverse-proxy/upstream-sse-c/label/v1"))
 	k := &Key{
 		encoded:    base64.StdEncoding.EncodeToString(raw),
 		encodedMD5: base64.StdEncoding.EncodeToString(sum[:]),
-		label:      hex.EncodeToString(mac.Sum(nil)[:16]),
 	}
 	var alternatives []string
 	for _, secret := range []string{k.encoded, k.encodedMD5} {
@@ -169,14 +163,6 @@ func Remove(header http.Header) {
 	header.Del(HeaderKey)
 	header.Del(HeaderKeyMD5)
 }
-
-// Label identifies this key without revealing it: a keyed hash of a fixed
-// string, truncated. It is what the local cache records as the configuration
-// its entries were written under, so a restart with a different key can tell.
-//
-// It is deliberately not the key's MD5, which S3 sends around freely but which
-// is a plain digest of the key rather than something derived for this use.
-func (k *Key) Label() string { return k.label }
 
 // Confirmation is what a response says about the encryption it was asked for.
 type Confirmation int

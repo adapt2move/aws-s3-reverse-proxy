@@ -117,7 +117,7 @@ func Parse() Options {
 	kingpin.Flag("metrics-tenant-label", "add the tenant id as a Prometheus label; tenant count is unbounded, so consider the cardinality first (env - METRICS_TENANT_LABEL)").Envar("METRICS_TENANT_LABEL").Default("false").BoolVar(&opts.TenantMetricLabel)
 	// Caching. One flag turns it on and the rest tune it, so a deployment
 	// that does not want a cache carries none of this.
-	kingpin.Flag("cache-dir", "directory to cache object reads in, emptied at every start; empty disables caching entirely (env - CACHE_DIR)").Envar("CACHE_DIR").PlaceHolder("/var/cache/s3proxy").StringVar(&opts.CacheDir)
+	kingpin.Flag("cache-dir", "directory to cache object reads in, unencrypted, emptied at every start; empty disables caching entirely (env - CACHE_DIR)").Envar("CACHE_DIR").PlaceHolder("/var/cache/s3proxy").StringVar(&opts.CacheDir)
 	kingpin.Flag("cache-max-bytes", "the most disk the cache will ever use, writes in progress included (env - CACHE_MAX_BYTES)").Envar("CACHE_MAX_BYTES").Default("1073741824").Int64Var(&opts.CacheMaxBytes)
 	kingpin.Flag("cache-max-entries", "how many objects the cache may hold, 0 for no limit; each one costs about 150 bytes of memory plus its key (env - CACHE_MAX_ENTRIES)").Envar("CACHE_MAX_ENTRIES").Default("0").IntVar(&opts.CacheMaxEntries)
 	kingpin.Flag("cache-max-object-size", "largest object the cache will accept; bigger ones are proxied without being stored (env - CACHE_MAX_OBJECT_SIZE)").Envar("CACHE_MAX_OBJECT_SIZE").Default("67108864").Int64Var(&opts.CacheMaxObjectSize)

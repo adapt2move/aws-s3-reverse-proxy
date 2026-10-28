@@ -18,6 +18,10 @@ asked, or whether anyone was allowed to.
     spread over 256 subdirectories. The payload starts at offset 0; the
     stored headers and the key follow it, because an upload's ETag is only
     known once the upload has landed.
+  * **The payload is plaintext.** It is the object as the object store
+    returned it, decrypted when SSE-C is on, and the store adds no
+    encryption of its own. Protecting the volume is the operator's job; see
+    [Running on Kubernetes](kubernetes.md#the-object-cache).
   * **A write is published by the index, not by the filesystem.** Nothing
     points at a file until its commit, and a file name is never reused, so no
     reader sees a half-written object and a new version of a key is a new

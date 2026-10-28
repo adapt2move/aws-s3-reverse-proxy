@@ -154,7 +154,9 @@ for example with `kubectl rollout restart deployment/s3proxy`.
     outside the cluster: without it, every object written with it is
     unreadable, for this proxy and for anybody else. There is no rotation:
     starting with another key makes the objects written under the old one
-    unreadable. See [Upstream encryption](../README.md#upstream-encryption-sse-c).
+    unreadable. It protects the bucket only: with a cache, the cached copies
+    sit unencrypted on the node, see [The object cache](#the-object-cache).
+    See also [Upstream encryption](../README.md#upstream-encryption-sse-c).
   * **`CACHE_PURGE_TOKEN`** protects `POST /cache/purge`. Without it, anything
     that reaches the admin port can empty the cache.
 
@@ -250,10 +252,14 @@ off unless the tenant count is known to be small.
 ## The object cache
 
 The cache wants an `emptyDir` on the node's local NVMe. Every file in the
-directory belongs to the cache, and it is emptied at every start. It holds
-tenant object data at rest, decrypted even with SSE-C, which the proxy
-otherwise never does: encryption at rest of the node's disk is yours to
-arrange.
+directory belongs to the cache, and it is emptied at every start.
+
+**Cached objects are stored unencrypted, always**, whatever the object store
+does to its own copy: SSE-S3, SSE-KMS or the proxy's SSE-C protect the bucket,
+not the cache. An `emptyDir` lives on the node's disk, so anybody with access
+to the node's filesystem can read every tenant's cached objects. Encrypt the
+node's disk, or leave `CACHE_DIR` unset: without it the proxy keeps no object
+data at rest.
 
 ### Sizing
 

@@ -88,16 +88,6 @@ func TestTheKeyDoesNotFormat(t *testing.T) {
 	}
 }
 
-func TestLabelIdentifiesTheKeyWithoutRevealingIt(t *testing.T) {
-	a, _ := Parse(encodedKey(1))
-	again, _ := Parse(encodedKey(1))
-	b, _ := Parse(encodedKey(2))
-	assert.Equal(t, a.Label(), again.Label())
-	assert.NotEqual(t, a.Label(), b.Label())
-	assert.NotContains(t, a.Label(), a.encoded)
-	assert.NotEqual(t, a.Label(), a.encodedMD5)
-}
-
 func TestCustomerHeaderFamily(t *testing.T) {
 	for _, name := range []string{
 		"x-amz-server-side-encryption-customer-algorithm",

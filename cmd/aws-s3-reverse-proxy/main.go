@@ -356,10 +356,6 @@ func logEncryptionStartup(opts config.Options) {
 			"writer replacing an object with identical bytes and new metadata just before a rewrite " +
 			"lands would lose that metadata.")
 	}
-	if opts.CacheEnabled() {
-		log.Warnf("The object cache holds decrypted object bytes: SSE-C protects the object store, "+
-			"not %s. Protect that volume accordingly.", opts.CacheDir)
-	}
 }
 
 // logCacheStartup states what the cache will and will not do, in the terms an
@@ -381,6 +377,15 @@ func logCacheStartup(opts config.Options) {
 	for _, flag := range opts.RetiredCacheFlags {
 		log.Warnf("%s has no effect any more: the cache keeps one file per object. Remove it.", flag)
 	}
+	// Said on every start, not only with a customer key: the cache stores
+	// plaintext whatever the object store does to its own copy, and a
+	// deployment relying on SSE-S3 or SSE-KMS gets no other hint of it.
+	encryption := "whatever encryption the object store applies to its own copy"
+	if opts.UpstreamSSECKey != nil {
+		encryption = "SSE-C protects the object store, not this volume"
+	}
+	log.Warnf("Cached objects are stored unencrypted in %s (%s). Anyone who can read that volume "+
+		"can read every tenant's cached objects; protect it accordingly.", opts.CacheDir, encryption)
 	if opts.CacheMaxAge > 0 {
 		log.Infof("After %s a cached object is checked against the object store, and only re-fetched if it changed.",
 			opts.CacheMaxAge)
