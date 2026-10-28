@@ -303,6 +303,12 @@ never touch the file except when told to.
     upstream call at all.
   * Multipart initiate / upload-part / complete / abort require the `full`
     permission, like any other write.
+  * Two bucket calls name no key, and are allowed for any authenticated
+    caller: `HEAD /bucket` (HeadBucket — what rclone, `mc` and s3fs check
+    before anything else) is forwarded, and `GET /bucket?location`
+    (GetBucketLocation) is answered by the proxy with the region it signs for
+    upstream. That a bucket exists is not any one tenant's to hide; nothing in
+    either answer is about a tenant's objects.
   * Key normalization happens **before** injection: `..` segments, a leading
     `/`, percent-encoded (and doubly percent-encoded) traversal and empty keys
     are **rejected**, not silently normalized.

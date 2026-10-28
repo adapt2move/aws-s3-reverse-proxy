@@ -289,6 +289,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if st.operation.Kind == s3.GetBucketLocation {
+		h.serveBucketLocation(rec)
+		h.access.Finish(entry, rec.Status(), time.Since(start))
+		return
+	}
+
 	if h.serveConditionalPutOverPlaintext(rec, proxyReq, st) {
 		h.access.Finish(entry, rec.Status(), time.Since(start))
 		return
@@ -361,7 +367,14 @@ func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, entry *observa
 	// A batch delete is authorized key by key inside prepareBody, because
 	// its keys live in the request body. Everything else has exactly one
 	// subject: the object key, or the prefix of a listing.
-	if op.Kind != s3.DeleteObjects {
+	switch {
+	case op.Kind == s3.DeleteObjects:
+	case op.NamesNoKey():
+		// About the bucket, not about anything in it: authenticating the
+		// caller is the whole check. The bucket is shared by every tenant,
+		// so that it exists is not any one tenant's to hide.
+		entry.Allowed = true
+	default:
 		subject := op.Key
 		if op.Kind == s3.ListObjects {
 			subject = op.ListPrefix
