@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -222,4 +223,43 @@ func TestTheCacheIsEmptiedWhenTheKeyChanges(t *testing.T) {
 	c, stop = start(nil)
 	assert.False(t, c.Has("bucket/tenant/object"), "and so does removing the key")
 	stop()
+}
+
+func TestBuildProxyWiresTheListingFallbackWhenAskedTo(t *testing.T) {
+	handler, _, _, err := buildProxy(baseOptions(t))
+	require.NoError(t, err)
+	assert.Nil(t, handler.ListFallback(), "off unless somebody asked for it")
+
+	opts := baseOptions(t)
+	opts.ListFallback = true
+	opts.ListFallbackTimeout = time.Second
+	opts.ListFallbackMaxAge = time.Hour
+	opts.ListFallbackMaxBytes = 1 << 20
+	handler, _, objectCache, err := buildProxy(opts)
+	require.NoError(t, err)
+	require.NotNil(t, handler.ListFallback())
+	assert.Nil(t, objectCache, "and it does not need the object cache")
+	assert.Equal(t, int64(1<<20), handler.ListFallback().Stats().Capacity)
+}
+
+// A zero timeout would answer every listing from memory and a zero age would
+// never answer one; neither is what turning the fallback on means.
+func TestStartupRejectsAListingFallbackWithoutBounds(t *testing.T) {
+	for name, unset := range map[string]func(*config.Options){
+		"timeout":   func(o *config.Options) { o.ListFallbackTimeout = 0 },
+		"max age":   func(o *config.Options) { o.ListFallbackMaxAge = 0 },
+		"max bytes": func(o *config.Options) { o.ListFallbackMaxBytes = 0 },
+		"refresh":   func(o *config.Options) { o.ListFallbackRefreshDelay = -time.Second },
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := baseOptions(t)
+			opts.ListFallback = true
+			opts.ListFallbackTimeout = time.Second
+			opts.ListFallbackMaxAge = time.Hour
+			opts.ListFallbackMaxBytes = 1 << 20
+			unset(&opts)
+			_, _, _, err := buildProxy(opts)
+			assert.ErrorContains(t, err, "--list-fallback-")
+		})
+	}
 }

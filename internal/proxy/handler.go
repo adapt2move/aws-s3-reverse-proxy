@@ -17,11 +17,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/cache"
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/listcache"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/observability"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/policy"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/s3"
@@ -136,6 +138,26 @@ type Config struct {
 	// the cache at all.
 	CacheRangeFills bool
 
+	// ListFallback remembers the last answer the object store gave to each
+	// listing, and serves it when the object store does not answer the same
+	// listing within ListFallbackTimeout or fails it with a server error.
+	// Nil — the default — leaves every listing to the object store alone.
+	//
+	// It is never consulted while the object store answers, and every write
+	// through this proxy drops the listings it may have changed before the
+	// write is acknowledged. See internal/proxy/listing.go.
+	ListFallback *listcache.Cache
+
+	// ListFallbackTimeout is how long a listing with a remembered answer
+	// waits for the object store before it is given that answer instead.
+	ListFallbackTimeout time.Duration
+
+	// ListFallbackRefreshDelay is how long writes under a prefix have to
+	// settle before the listings they dropped are asked for again in the
+	// background. Zero leaves a dropped listing dropped until a client lists
+	// it again. See listing_refresh.go.
+	ListFallbackRefreshDelay time.Duration
+
 	// UpstreamSSECKey, when set, is the customer key every object is stored
 	// under upstream (SSE-C). The proxy adds it to the object operations
 	// that take one — client requests and its own background requests alike
@@ -189,6 +211,15 @@ type Handler struct {
 	// repairs encrypts legacy plaintext objects in the background when a
 	// customer key is configured; nil otherwise.
 	repairs *repairer
+
+	// listingRefresh re-lists what writes dropped from the listing
+	// fallback; nil when there is no fallback or refreshing is off.
+	listingRefresh *listingRefresher
+
+	// listingWork is the background listing the fallback does — refreshes,
+	// and listings finished after their client was answered from memory;
+	// nil when there is no fallback.
+	listingWork *listingWork
 }
 
 // New validates the configuration and wires up the shared reverse proxy.
@@ -213,6 +244,9 @@ func New(cfg Config) (*Handler, error) {
 		// upload — or worse, against a store that does not refuse it.
 		return nil, errors.New("proxy: an upstream SSE-C key requires an https upstream endpoint")
 	}
+	if cfg.ListFallback != nil && cfg.ListFallbackTimeout <= 0 {
+		return nil, errors.New("proxy: a listing fallback needs a positive timeout")
+	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 512
@@ -235,17 +269,29 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.UpstreamSSECKey != nil {
 		h.repairs = newRepairer(h)
 	}
+	if cfg.ListFallback != nil {
+		h.listingWork = newListingWork()
+		if cfg.ListFallbackRefreshDelay > 0 {
+			h.listingRefresh = newListingRefresher(h, cfg.ListFallbackRefreshDelay)
+		}
+	}
 	h.proxy = &httputil.ReverseProxy{
 		// The request handed to ServeHTTP already carries the absolute
 		// upstream URL, so there is nothing left to direct.
 		Director: func(*http.Request) {},
 		// Every upstream response to an object read goes through
 		// inspectRead, which is where a legacy plaintext object is told
-		// apart from an encrypted one. See encryption.go.
-		Transport:      roundTripperFunc(h.roundTrip),
+		// apart from an encrypted one. See encryption.go. Listings take a
+		// detour first when there is a fallback for them, see listing.go.
+		Transport:      roundTripperFunc(h.forward),
 		FlushInterval:  -1, // flush every write: object downloads stream
 		ModifyResponse: h.modifyResponse,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if st := requestStateFrom(r.Context()); st != nil && neverSent(err) {
+				// The object store never saw this request, so a write in it
+				// changed nothing — see Write.End in internal/listcache.
+				st.settleWrite(listcache.Refused)
+			}
 			log.WithError(err).Warn("upstream request failed")
 			s3.WriteError(w, http.StatusBadGateway, "InternalError", "The proxy could not reach the object store.")
 		},
@@ -254,11 +300,20 @@ func New(cfg Config) (*Handler, error) {
 }
 
 // Close stops the background work the handler started on its own — the
-// encryption repairs — and waits for it to let go of what it holds upstream.
-// Call it after the listeners have shut down and before the cache is closed.
+// encryption repairs and the listing refreshes — and waits for it to let go
+// of what it holds upstream. Call it after the listeners have shut down and
+// before the cache is closed.
 func (h *Handler) Close() {
+	// Repairs first: finishing one drops listings, which schedules refreshes.
+	// Then nothing new is scheduled, and what is running is cancelled.
 	h.repairs.close()
+	h.listingRefresh.close()
+	h.listingWork.close()
 }
+
+// ListFallback is the listing fallback this handler was configured with, or
+// nil, for a caller that has to offer a way to purge it.
+func (h *Handler) ListFallback() *listcache.Cache { return h.cfg.ListFallback }
 
 // UpstreamAddr is the endpoint this handler forwards to, for a caller that
 // has to report it at startup. Empty means "auto-detect from the region".
@@ -282,6 +337,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if st.mutation != nil {
 		defer st.mutation.End()
 	}
+	defer func() { h.endListingWrite(st.listingWrite, st.listingWriteOutcome(), st.droppedListings...) }()
 
 	if h.serveCachedRead(rec, r, proxyReq, st) {
 		entry.Cache = st.cacheResult
@@ -397,6 +453,9 @@ func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, entry *observa
 		// has been built rather than before.
 		st.mutation = h.cfg.Cache.BeginMutation(st.deletedKeys...)
 	}
+	if op.Kind == s3.DeleteObjects && err == nil {
+		h.beginListingWrite(st, st.deletedKeys...)
+	}
 	if op.Kind == s3.DeleteObjects {
 		// A batch delete is authorized inside the body preparation, so its
 		// outcome only becomes known here.
@@ -411,6 +470,8 @@ func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, entry *observa
 			st.mutation.End()
 			st.mutation = nil
 		}
+		// Nothing is going upstream, so nothing can have changed.
+		st.listingWrite.End(listcache.Refused)
 		if errors.Is(err, errAllKeysDenied) {
 			// Nothing survived authorization, so there is no upstream call
 			// to make — answer with the per-key AccessDenied entries S3
@@ -528,6 +589,27 @@ type requestState struct {
 	// confirming the customer key, so what the cache keeps of it is marked
 	// for its encryption to be checked.
 	unconfirmed bool
+
+	// listingWrite is this request's claim on the listings its write may
+	// change. Like mutation, it is released in ServeHTTP at the latest.
+	listingWrite *listcache.Write
+
+	// droppedListings are listings this request's write dropped before its
+	// claim was released, to be refreshed when it is.
+	droppedListings []listcache.Stale
+
+	// writeOutcome is what became of this request's write, once
+	// writeSettled says it is known: refused, never received, or answered.
+	// A write still unsettled when the request is over was sent and never
+	// answered. See settleWrite.
+	writeOutcome listcache.Outcome
+	writeSettled bool
+
+	// bodyTracked and bodySent say whether the upstream request had a body,
+	// and whether it was read to its end. The transport reads it on a
+	// goroutine of its own, hence the atomic.
+	bodyTracked bool
+	bodySent    atomic.Bool
 }
 
 type requestStateKey struct{}

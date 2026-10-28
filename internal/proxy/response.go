@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/listcache"
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/s3"
 )
 
@@ -58,6 +59,15 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 	// End, which also covers every request that never gets a response.
 	if st.operation.Kind != s3.CompleteMultipartUpload {
 		st.mutation.End()
+		h.endListingWrite(st.listingWrite, writeOutcome(resp.StatusCode))
+	} else if h.cfg.ListFallback != nil && writeOutcome(resp.StatusCode) == listcache.Answered {
+		// The completion's body tells the client the object exists before
+		// ServeHTTP gets to end the claim, so the listings that would not
+		// show it go now. The claim itself stays: a listing answered while
+		// the object is still being assembled must not be remembered.
+		// What is dropped is refreshed once the claim is released, not now:
+		// an answer while the claim stands could not be remembered.
+		st.droppedListings = h.cfg.ListFallback.Invalidate(cacheKeyFor(st))
 	}
 	h.captureRead(resp, st)
 	// After the capture, which keeps the plaintext marker in the cache, and
@@ -71,6 +81,9 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 	if err := rewriteUpstreamResponse(resp); err != nil {
 		return err
 	}
+	// The whole answer is in: for a multipart completion that is where the
+	// result is, and the object store has finished with the write.
+	st.settleWrite(writeOutcome(resp.StatusCode))
 	if st.cacheResult != "" {
 		// The client asked for something the cache could have answered and
 		// did not. Saying so is what makes a hit rate debuggable from one

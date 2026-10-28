@@ -33,6 +33,8 @@ the security boundary — not a convenience layer in front of one.
    with the operator's SSE-C key added to object reads and writes when one is
    configured (see [Upstream encryption](#upstream-encryption-sse-c)).
 7. Strip the prefix back out of `ListObjectsV2` and `DeleteObjects` responses.
+   With `--list-fallback`, a listing the object store does not answer is
+   answered from the last one it gave (see [Listing fallback](#listing-fallback)).
 
 ## Module layout
 
@@ -54,6 +56,8 @@ cmd/aws-s3-reverse-proxy   the process: flags, secrets, listeners, shutdown
 
     internal/cache         cached upstream responses: freshness, invalidation
       internal/blobcache   the disk underneath it
+    internal/listcache     remembered listings, in memory, for when the
+                           object store does not answer
 ```
 
 Three seams keep the arrows pointing one way:
@@ -268,6 +272,11 @@ practice.
 The last three are expert knobs. The first six are the ones a deployment
 actually turns.
 
+### Listing fallback flags
+
+`--list-fallback` and its `--list-fallback-*` tuning flags are described in
+[docs/listing-fallback.md](docs/listing-fallback.md#configuration).
+
 ### Hot reload
 
 The policy file is re-read on `SIGHUP` and, by default, on a timer. A reload
@@ -395,7 +404,7 @@ to the bucket.
 | Ranged reads | answered from a cached object, Range arithmetic and all — including after a revalidation. A ranged **miss** is proxied straight through and the whole object is fetched in the background, see below. |
 | `PutObject` | invalidates the object, and with `--cache-writes` the uploaded body is kept, so writing an object leaves it cached. |
 | `DeleteObject`, `DeleteObjects`, `CompleteMultipartUpload` | invalidate every key they touch. |
-| `ListObjectsV2` | **never cached.** A listing's body is filtered per access level on the way out, so a cached one would be an answer to one caller rather than a copy of anything. |
+| `ListObjectsV2` | **never answered from the cache.** A listing always goes to the object store; see [Listing fallback](#listing-fallback) for the outage case. |
 | Multipart parts | not cached. The object does not exist until the upload is completed, and completing it invalidates the key. |
 
 An object marked `Cache-Control: no-store` or `private` is not stored: those
@@ -636,6 +645,18 @@ that is not byte-for-byte what was written under that key. The recovery tests
 exist to hold the second half of that sentence — each one damages a store the
 way a particular failure would and checks that what comes back is a subset of
 what went in.
+
+## Listing fallback
+
+With `--list-fallback`, a listing the object store does not answer within one
+second, or fails with a server error, is answered with the last answer the
+object store gave to it. Listings still always go to the object store first;
+every write through the proxy drops the remembered listings it affects, and
+refreshes them in the background once writes have settled. It is off by
+default, because writes that bypass this process can be missing from such an
+answer for up to `--list-fallback-max-age`.
+
+Flags, consistency rules and metrics: [docs/listing-fallback.md](docs/listing-fallback.md).
 
 ## Upstream encryption (SSE-C)
 
@@ -892,6 +913,7 @@ an unbounded label is an unbounded number of time series.
 | `s3proxy_cache_stores_total`, `s3proxy_cache_store_failures_total` | responses written, and the ones that could not be |
 | `s3proxy_cache_invalidations_total` | keys dropped because the object behind them was written |
 | `s3proxy_cache_evictions_total`, `s3proxy_cache_evicted_bytes_total` | reclaim, to stay within the size limit |
+| `s3proxy_list_fallback_*` | the listing fallback, see [docs/listing-fallback.md](docs/listing-fallback.md#observability) |
 
 The cache series appear only when a cache is configured: a deployment without
 one exports nothing rather than a set of zeros that read like an idle cache.
@@ -911,9 +933,8 @@ second cost a transfer.
   * `CopyObject`, client-provided SSE-C keys, key rotation, per-tenant keys,
     and a bulk migration of plaintext objects to the SSE-C key.
   * Bucket-level administration through the proxy.
-  * Caching listings. It would have to be an index the proxy answers
-    `ListObjectsV2` from, not a stored response, because a listing is filtered
-    per access level on the way out.
+  * Answering listings from a cache while the object store is up. The
+    [listing fallback](#listing-fallback) only answers when it does not.
 
 ## Releases
 

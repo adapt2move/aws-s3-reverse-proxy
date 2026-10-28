@@ -3,13 +3,38 @@ package cache
 import (
 	"crypto/subtle"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 )
 
-// PurgeHandler empties the cache on request.
+// PurgeTarget is one store the purge endpoint empties.
+type PurgeTarget struct {
+	// What names what the store holds, for the answer: "objects",
+	// "listings".
+	What string
+	// Size reports how much it holds right now.
+	Size func() (entries int, bytes int64)
+	// Purge empties it.
+	Purge func() error
+}
+
+// PurgeTarget is the object cache, for PurgeHandler.
+func (c *Cache) PurgeTarget() PurgeTarget {
+	return PurgeTarget{
+		What: "objects",
+		Size: func() (int, int64) {
+			s := c.Stats()
+			return s.Entries, s.Bytes
+		},
+		Purge: c.Purge,
+	}
+}
+
+// PurgeHandler empties the caches on request — the object cache, the
+// listing fallback, whichever of them are configured.
 //
-// It exists for the one inconsistency the cache cannot detect on its own:
+// It exists for the one inconsistency the caches cannot detect on their own:
 // something outside this process changed the data, and there is no list of
 // which objects. Everything else — an upload, a delete, a completed multipart
 // — invalidates what it touched as it goes.
@@ -25,7 +50,7 @@ import (
 // force full re-fetches and spend exactly the egress this feature exists to
 // save. An empty token leaves the endpoint open, which is why the process
 // says so at startup rather than leaving it to be discovered.
-func PurgeHandler(c *Cache, token string) http.Handler {
+func PurgeHandler(token string, targets ...PurgeTarget) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -37,13 +62,17 @@ func PurgeHandler(c *Cache, token string) http.Handler {
 			http.Error(w, "a bearer token is required to purge the cache\n", http.StatusUnauthorized)
 			return
 		}
-		before := c.Stats()
-		if err := c.Purge(); err != nil {
-			http.Error(w, "the cache could not be purged: "+err.Error()+"\n", http.StatusInternalServerError)
-			return
+		var answer strings.Builder
+		for _, target := range targets {
+			entries, bytes := target.Size()
+			if err := target.Purge(); err != nil {
+				http.Error(w, "the cache of "+target.What+" could not be purged: "+err.Error()+"\n", http.StatusInternalServerError)
+				return
+			}
+			fmt.Fprintf(&answer, "purged %d %s, %d bytes\n", entries, target.What, bytes)
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintf(w, "purged %d objects, %d bytes\n", before.Entries, before.Bytes)
+		_, _ = io.WriteString(w, answer.String())
 	})
 }
 

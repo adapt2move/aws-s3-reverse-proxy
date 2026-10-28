@@ -42,6 +42,7 @@ func (h *Handler) buildUpstreamRequest(req *http.Request, st *requestState) (*ht
 		return nil, err
 	}
 	proxyReq.ContentLength = body.contentLength
+	trackBodySent(proxyReq, st)
 
 	// Client headers are copied BEFORE signing, so everything forwarded is
 	// also covered by the upstream signature. Copying them afterwards would

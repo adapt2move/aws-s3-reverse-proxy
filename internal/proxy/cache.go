@@ -13,8 +13,10 @@ package proxy
 //     something `data/a.parquet` are two different keys by construction, and
 //     nothing about that depends on remembering to check.
 //  3. What is stored is what the upstream sent, before any tenant rewriting.
-//     Listings are not cached at all, precisely because their bodies are
-//     filtered per access level and a cached one would be a filtered one.
+//     Listings are not cached here at all, precisely because their bodies
+//     are filtered per access level and a cached one would be a filtered one.
+//     The listing fallback in listing.go keeps the unfiltered answer, and
+//     filters it again each time it serves it.
 //  4. Nothing is committed until the upstream confirmed it and the whole
 //     announced length arrived.
 //  5. The cache never delays or fails a request. Every error path here ends
@@ -111,13 +113,22 @@ func asksTheStoreToDecide(r *http.Request) bool {
 // flight sees the object the upload is about to replace, and can finish —
 // and be cached — after the upload landed. Claiming the key up front closes
 // it, at the cost of that key not being cached for the length of the write.
+//
+// The listing fallback is claimed at the same moment, for the same reason: a
+// listing that is answered while the write is in flight must not become the
+// answer remembered for after it.
 func (h *Handler) beginCaching(st *requestState) {
+	key := cacheKeyFor(st)
+	writes := key != "" && mutatesObject(st.operation.Kind)
+	if writes {
+		h.beginListingWrite(st, key)
+	}
 	if h.cfg.Cache == nil {
 		return
 	}
-	st.cacheKey = cacheKeyFor(st)
-	if st.cacheKey != "" && mutatesObject(st.operation.Kind) {
-		st.mutation = h.cfg.Cache.BeginMutation(st.cacheKey)
+	st.cacheKey = key
+	if writes {
+		st.mutation = h.cfg.Cache.BeginMutation(key)
 	}
 }
 
