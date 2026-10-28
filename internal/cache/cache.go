@@ -95,6 +95,10 @@ type Cache struct {
 
 	// mu guards pending, which only ever holds the keys with a write or a
 	// fill in flight — never the cache's contents.
+	//
+	// It is taken inside the store's lock when a Writer commits (see
+	// filestore.Writer.CommitUnless), so it must never be held while
+	// calling into the store.
 	mu      sync.Mutex
 	pending map[string]*pending
 

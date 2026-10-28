@@ -25,7 +25,11 @@ asked, or whether anyone was allowed to.
   * **A write is published by the index, not by the filesystem.** Nothing
     points at a file until its commit, and a file name is never reused, so no
     reader sees a half-written object and a new version of a key is a new
-    file. A reader that already opened the old one reads it to the end.
+    file. A reader that already opened the old one reads it to the end. The
+    cache's last check that the object was not invalidated in the meantime
+    runs under the store's lock, at the moment of publishing, so an
+    invalidation or a purge can never slip in between the check and the
+    publish.
   * **Nothing is fsynced.** The files only have to be readable by the
     process that wrote them, and the page cache already guarantees that.
   * **An invalidation cannot be lost.** Deleting a key takes it out of the
@@ -49,8 +53,10 @@ byte is counted from before it is written until after it is gone:
     a reader still has it open, that is when the reader closes it, so a slow
     download of an evicted object keeps its file, and its share of the
     ceiling, until it ends.
-  * A write that counts on a removal somebody else is still doing waits for
-    it before it writes anything. That takes no longer than an unlink.
+  * A write that counts on removals somebody else is still doing waits until
+    enough of them are done before it writes anything. Space comes back file
+    by file, so a write behind a purge of a full cache waits for the few
+    unlinks it needs, not for the whole purge.
   * What a previous process left in the directory is removed before the store
     opens, so it never sits on disk uncounted.
 

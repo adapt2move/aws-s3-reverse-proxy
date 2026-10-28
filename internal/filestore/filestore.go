@@ -84,6 +84,11 @@ var (
 
 	// ErrClosed is returned once Close has been called.
 	ErrClosed = errors.New("filestore: store is closed")
+
+	// ErrSuperseded is returned by Writer.CommitUnless when the caller's
+	// check, made at the moment of publishing, says the payload is out of
+	// date. The file is discarded and the store is unchanged.
+	ErrSuperseded = errors.New("filestore: superseded before it was published")
 )
 
 // Options configures a Store. The zero value of every field is replaced by the
@@ -439,10 +444,12 @@ func (s *Store) claim(n int64) error {
 
 	s.unlink(gone)
 
-	// The claim may be counting on a removal another goroutine is still in
-	// the middle of. Starting to write before it finishes is the difference
-	// between a budget and a ceiling, and it never takes longer than an
-	// unlink.
+	// The claim may be counting on removals another goroutine is still in
+	// the middle of. Starting to write before they are done is the
+	// difference between a budget and a ceiling. Space comes back file by
+	// file, so this waits only for as many unlinks as the claim needs, not
+	// for the whole batch they are part of: a purge of a full cache does not
+	// hold up every miss behind it.
 	s.mu.Lock()
 	for s.live+s.held+s.removing+s.reserved > s.opts.MaxBytes {
 		s.freed.Wait()
@@ -465,7 +472,12 @@ func (s *Store) unclaim(n int64) {
 // commit makes a finished file the entry for its key, replacing whatever was
 // there. The file is already counted in full by what its writer claimed, so
 // the store's total does not grow.
-func (s *Store) commit(e *entry, claimed int64) error {
+//
+// superseded, when given, is asked with the store's lock held, immediately
+// before the entry becomes visible: anything that changes its answer and
+// then deletes from the store is therefore either seen here or runs after
+// the entry is in, and removes it.
+func (s *Store) commit(e *entry, claimed int64, superseded func() bool) error {
 	s.mu.Lock()
 	s.reserved -= claimed
 	if s.closed {
@@ -473,6 +485,12 @@ func (s *Store) commit(e *entry, claimed int64) error {
 		s.mu.Unlock()
 		s.unlink([]*entry{e})
 		return ErrClosed
+	}
+	if superseded != nil && superseded() {
+		s.removing += e.disk
+		s.mu.Unlock()
+		s.unlink([]*entry{e})
+		return ErrSuperseded
 	}
 	var gone []*entry
 	if old := s.index[e.key]; old != nil {
@@ -612,22 +630,18 @@ func (s *Store) unref(e *entry) {
 
 // unlink removes files that have left the index and gives their disk back.
 // The bytes stay counted until the file is actually gone, which is what keeps
-// MaxBytes a ceiling.
+// MaxBytes a ceiling, and come back one file at a time, so a claim waiting on
+// a long batch resumes as soon as there is enough.
 func (s *Store) unlink(gone []*entry) {
-	if len(gone) == 0 {
-		return
-	}
-	var freed int64
 	for _, e := range gone {
 		if err := os.Remove(s.path(e.id)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			s.opts.logf("filestore: removing %s: %v", s.path(e.id), err)
 		}
-		freed += e.disk
+		s.mu.Lock()
+		s.removing -= e.disk
+		s.freed.Broadcast()
+		s.mu.Unlock()
 	}
-	s.mu.Lock()
-	s.removing -= freed
-	s.freed.Broadcast()
-	s.mu.Unlock()
 }
 
 func (s *Store) unlinkFromLRU(e *entry) {

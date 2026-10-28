@@ -77,7 +77,11 @@ func (w *Writer) grow(n int64) error {
 func (w *Writer) Size() int64 { return w.written }
 
 // Commit publishes the payload under its key, described by meta. Once it
-// returns nil, Get finds the entry.
+// returns nil, Get finds the entry. It is CommitUnless with nothing to check.
+func (w *Writer) Commit(meta []byte) error { return w.CommitUnless(meta, nil) }
+
+// CommitUnless publishes the payload under its key, described by meta, unless
+// superseded reports true. Once it returns nil, Get finds the entry.
 //
 // The metadata is supplied here rather than at Put because it is often not
 // known any earlier: what an object store says about an upload — its ETag —
@@ -85,9 +89,16 @@ func (w *Writer) Size() int64 { return w.written }
 // payload, followed by the key, which leaves the payload at offset 0. Both
 // are claimed before they are written, like the payload was.
 //
+// superseded is asked with the store's lock held, at the moment the entry
+// would become visible, which is the only moment its answer is final: a
+// check made any earlier leaves a gap in which the object can be invalidated
+// and the out-of-date payload published anyway. It must not call back into
+// the store. When it reports true, the file is discarded and CommitUnless
+// returns ErrSuperseded.
+//
 // Nothing is synced. The file only has to be readable by this process, and
 // the page cache already makes it so.
-func (w *Writer) Commit(meta []byte) error {
+func (w *Writer) CommitUnless(meta []byte, superseded func() bool) error {
 	if w.done {
 		return errors.New("filestore: commit called twice")
 	}
@@ -115,7 +126,7 @@ func (w *Writer) Commit(meta []byte) error {
 	// From here the file belongs to the store, which removes it when the
 	// entry goes or, if it is closed already, right away.
 	w.id, w.claimed = 0, 0
-	return w.s.commit(e, claimed)
+	return w.s.commit(e, claimed, superseded)
 }
 
 // Abort discards the write. It is safe to call after Commit and safe to call

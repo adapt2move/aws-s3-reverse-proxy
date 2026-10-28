@@ -570,3 +570,79 @@ func TestConcurrentUseNeverCrossesKeys(t *testing.T) {
 	assert.Len(t, objectFiles(t, s), stats.Entries, "every file on disk is an entry, and the reverse")
 	assert.Zero(t, s.reserved)
 }
+
+// A caller's last word on whether a payload is still current is asked at the
+// moment of publishing, under the store's lock: a check made any earlier
+// leaves a gap in which the object can be invalidated first and the stale
+// payload published after.
+func TestASupersededCommitPublishesNothing(t *testing.T) {
+	s := open(t, Options{})
+	put(t, s, "k", []byte("old"), nil)
+
+	w, err := s.Put("k", 3)
+	require.NoError(t, err)
+	_, err = w.Write([]byte("new"))
+	require.NoError(t, err)
+	var lockHeld bool
+	err = w.CommitUnless(nil, func() bool {
+		if s.mu.TryLock() {
+			s.mu.Unlock()
+		} else {
+			lockHeld = true
+		}
+		return true
+	})
+	assert.ErrorIs(t, err, ErrSuperseded)
+	assert.True(t, lockHeld, "asked with the store's lock held")
+
+	payload, _, ok := get(t, s, "k")
+	require.True(t, ok)
+	assert.Equal(t, "old", string(payload), "the store is unchanged")
+	assert.Len(t, objectFiles(t, s), 1, "and the refused file is gone")
+	assert.Zero(t, s.reserved)
+
+	w, err = s.Put("k", 3)
+	require.NoError(t, err)
+	_, err = w.Write([]byte("new"))
+	require.NoError(t, err)
+	require.NoError(t, w.CommitUnless(nil, func() bool { return false }))
+	payload, _, ok = get(t, s, "k")
+	require.True(t, ok)
+	assert.Equal(t, "new", string(payload))
+}
+
+// Space a purge frees comes back file by file. A write waiting for room goes
+// ahead as soon as there is enough, not once the whole purge is through: on
+// a full cache of small objects that would hold every miss for seconds.
+func TestAPurgeDoesNotHoldUpWrites(t *testing.T) {
+	const entries = 5000
+	s := open(t, Options{MaxBytes: entries * blockSize, MaxObjectSize: blockSize})
+	for i := 0; i < entries; i++ {
+		put(t, s, fmt.Sprintf("k%d", i), []byte("x"), nil)
+	}
+
+	purged := make(chan error, 1)
+	go func() { purged <- s.Purge() }()
+	for started := false; !started; {
+		select {
+		case <-purged:
+			t.Fatal("the purge finished before the test could see it running")
+		default:
+		}
+		s.mu.Lock()
+		started = s.removing > 0
+		s.mu.Unlock()
+	}
+
+	// The cache was full, so this claim waits for the purge to free a block.
+	w, err := s.Put("new", 100)
+	require.NoError(t, err)
+	s.mu.Lock()
+	stillRemoving := s.removing
+	s.mu.Unlock()
+	w.Abort()
+	require.NoError(t, <-purged)
+
+	assert.Greater(t, stillRemoving, int64(0), "the write went ahead while the purge was still removing files")
+	assert.Zero(t, s.removing)
+}
