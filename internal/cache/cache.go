@@ -356,6 +356,11 @@ func (c *Cache) Put(key string, size int64) (*Writer, error) {
 	}
 	w, err := c.store.Put(key, size)
 	if err != nil {
+		// The store refused it: no room under the size limit, or a disk
+		// that would not take the file. Counted, because a cache that has
+		// quietly stopped storing anything looks exactly like one with
+		// nothing new to store.
+		c.dropped.Add(1)
 		c.unclaim(key)
 		return nil, err
 	}

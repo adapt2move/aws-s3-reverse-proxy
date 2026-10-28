@@ -63,6 +63,9 @@ func (w *Writer) Commit(header http.Header) error {
 	defer w.finish()
 
 	if w.failed {
+		// The store gave up partway: out of room, or a write to disk that
+		// failed. Already aborted; only counted here.
+		w.c.dropped.Add(1)
 		return nil
 	}
 	if w.expect >= 0 && w.written != w.expect {

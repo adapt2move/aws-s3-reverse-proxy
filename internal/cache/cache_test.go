@@ -639,3 +639,29 @@ func TestAnUploadThatGetsARivalMidwayIsNotCached(t *testing.T) {
 	assert.Equal(t, Miss, result,
 		"a body whose upload overlapped another must not be what the cache holds")
 }
+
+// A store that refuses an object is counted, wherever the refusal happens: a
+// cache that has quietly stopped storing anything must not look like one
+// with nothing new to store.
+func TestARefusedStoreIsCounted(t *testing.T) {
+	c, _ := newCache(t, func(o *Options) { o.MaxBytes = 64 << 10; o.MaxObjectSize = 32 << 10 })
+
+	// Writes in flight may hold half the size limit, here 32 KiB. The first
+	// write takes all of it, so the second is refused before it starts.
+	first, err := c.Put("first", 30<<10)
+	require.NoError(t, err)
+	defer first.Abort()
+	_, err = c.Put("second", 30<<10)
+	require.Error(t, err)
+	assert.Equal(t, uint64(1), c.Stats().Dropped)
+
+	// One of unknown length that outgrows the largest object is refused
+	// partway, and counted when it would have been committed.
+	w, err := c.Put("growing", -1)
+	require.NoError(t, err)
+	_, _ = w.Write(make([]byte, 40<<10))
+	require.NoError(t, w.Commit(http.Header{}))
+	assert.Equal(t, uint64(2), c.Stats().Dropped)
+	_, result := c.Get("growing")
+	assert.Equal(t, Miss, result)
+}

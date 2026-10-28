@@ -400,8 +400,7 @@ to the bucket.
 
 The directory is meant to be a local volume that lives as long as the pod,
 an `emptyDir` on local NVMe, and it is **emptied at every start**: nothing
-cached survives a restart. See [Running it on Kubernetes](#running-it-on-kubernetes)
-and [The disk underneath](#the-disk-underneath).
+cached survives a restart. See [On disk](#on-disk).
 
 ### What it does and does not cache
 
@@ -584,141 +583,27 @@ them:
     back may get the previous version until it expires.
 
 This is not something the proxy can detect or warn about — a replica cannot
-see its siblings — so it is stated here rather than at startup.
+see its siblings — so it is stated here rather than at startup. How to route
+by key on Kubernetes, and how to purge every replica's cache, is in
+[Running on Kubernetes](docs/kubernetes.md#more-than-one-replica).
 
-### Running it on Kubernetes
+### On disk
 
-The cache wants a volume of its own: an `emptyDir` on the node's local NVMe.
-Every file in the directory belongs to the cache, and it is emptied at every
-start. It holds tenant object data at rest, which the proxy otherwise never
-does; the directory is created `0700`, and encryption at rest is the
-operator's to arrange.
+Every cached object is a file in `--cache-dir`, indexed in memory. Three
+things about it matter to an operator:
 
-**`--cache-max-bytes` is a ceiling.** The cache never has more than that on
-disk, counting everything it writes: the entries, files that were evicted but
-are still being streamed to a client, and writes in progress, which claim
-their full length before their first byte is written. Room is made by
-evicting before a write, never after it, and a write that cannot be fitted is
-simply not cached. Sizes are counted in 4 KiB blocks, which is what ext4 and
-XFS allocate on a volume formatted with their defaults. Not counted are the
-256 shard directories, about 1 MiB, and on XFS the speculative preallocation
-it can briefly give a file that is still growing.
+  * **`--cache-max-bytes` is a ceiling** on everything the cache has on disk,
+    writes in progress included. Room is made by evicting before a write, and
+    an object that does not fit is not cached.
+  * **The directory is emptied at every start.** A restart costs a cold
+    cache; nothing an earlier process cached is ever served.
+  * **It holds tenant object data at rest**, decrypted even with SSE-C, which
+    the proxy otherwise never does. It is created `0700`, and encryption at
+    rest is the operator's to arrange.
 
-**When the disk runs short, the kubelet decides what happens, so size the pod
-for it.** These numbers belong together:
-
-| | set it to | because |
-| --- | --- | --- |
-| `--cache-max-bytes` | the cache size you want | it is the ceiling the proxy enforces itself |
-| `emptyDir.sizeLimit` | `--cache-max-bytes` plus a few percent | past it, the kubelet evicts the pod |
-| `requests.ephemeral-storage` | at least `sizeLimit`, plus room for logs and the container's writable layer | under disk pressure, pods using more than they requested are evicted first |
-| `limits.ephemeral-storage` | above the request | past it, the kubelet evicts the pod |
-
-Node disk pressure starts, by default, when the node filesystem has less than
-10 % of its space or 5 % of its inodes left. The kubelet then evicts pods in
-order: first those using more ephemeral storage than they requested, then by
-priority, then by how far over their request they are. A cache pod whose
-request does not cover its cache is the obvious first choice, and losing it
-loses the proxy, not just the cache. With the request set as above, it is
-among the last.
-
-The proxy cannot see any of this from the inside. Asked for free space, the
-filesystem reports the node's whole disk, shared with every other pod, while
-`sizeLimit` and the ephemeral-storage limits are enforced by the kubelet
-measuring usage. That is why the ceiling is configured rather than detected.
-
-**Inodes count too.** Every cached object is a file, so a cache of many small
-objects uses an inode for each, and the node's inode threshold can trip before
-its space does. `--cache-max-entries` bounds the number of files.
-
-For a 30 GiB cache:
-
-```yaml
-containers:
-  - name: s3proxy
-    env:
-      - name: CACHE_DIR
-        value: /var/cache/s3proxy
-      - name: CACHE_MAX_BYTES
-        value: "32212254720"        # 30 GiB, the ceiling
-    resources:
-      requests:
-        ephemeral-storage: 32Gi     # the cache, logs and the writable layer
-      limits:
-        ephemeral-storage: 34Gi
-    volumeMounts:
-      - name: cache
-        mountPath: /var/cache/s3proxy
-volumes:
-  - name: cache
-    emptyDir:
-      sizeLimit: 31Gi               # the ceiling plus a few percent
-```
-
-**The directory has to belong to the user the proxy runs as.** An `emptyDir`
-is created world-writable and needs nothing. The container image runs as
-`proxyuser`, though, and both a Kubernetes PVC and a Docker volume are handed
-over owned by root — so the proxy cannot create anything in one and refuses to
-start rather than serve without the cache it was told to use. On Kubernetes
-set `fsGroup` in the pod's security context; elsewhere `chown` the directory
-before the process starts. `e2e/docker-compose.yml` does the latter, in the
-`cache-dir` service.
-
-### The disk underneath
-
-`internal/filestore` is what holds the bytes: one file per cached object, an
-index of them in memory, and nothing else. It is built for a local NVMe volume
-that belongs to the process for as long as the process runs, where creating a
-file costs microseconds and nothing about the disk has to be worked around.
-
-  * **Every object is a file of its own**, named by a sequence number and
-    spread over 256 subdirectories. The payload starts at offset 0; the
-    stored headers and the key follow it, because an upload's ETag is only
-    known once the upload has landed.
-  * **A write is published by the index, not by the filesystem.** Nothing
-    points at a file until its commit, and a file name is never reused, so no
-    reader sees a half-written object and a new version of a key is a new
-    file. A reader that already opened the old one reads it to the end.
-  * **Nothing is fsynced.** The files only have to be readable by the
-    process that wrote them, and the page cache already guarantees that.
-  * **An invalidation cannot be lost.** Deleting a key takes it out of the
-    index under a lock, which cannot fail; the file is unlinked right after,
-    or by the last reader still streaming it. There is no queue that could be
-    full and no disk state that could refuse it, so after a write through
-    this proxy, no read through it finds the version the write replaced.
-  * **Eviction is least recently used, per object, and happens before a
-    write rather than after it.** Disk is counted in whole 4 KiB blocks,
-    because that is what a file occupies: a cache of 200-byte objects counted
-    at 200 bytes each would overrun its ceiling many times over. See
-    [Running it on Kubernetes](#running-it-on-kubernetes) for what the
-    ceiling covers.
-
-#### Every start is a cold start
-
-Opening the cache empties its directory. Nothing a previous process wrote is
-read back: there is **no startup scan**, no on-disk index and no recovery, and
-that is deliberate. A new pod gets an empty `emptyDir` anyway. The one case in
-which old files are still there is a container restarted inside the same pod,
-after a crash or an OOM kill, and those files are discarded rather than
-trusted. They are removed before the proxy starts serving, so they never sit
-on disk uncounted next to a cache that fills up again. With a few thousand
-files that is instant; with hundreds of thousands it takes a few seconds.
-
-A restart therefore costs a cold cache, and every object is fetched from the
-object store once more. Keeping the cache across restarts is not needed today.
-If it ever is, it takes two things this store does not have: a marker written
-after a `syncfs` at a clean shutdown, so that a start can tell complete files
-from ones the page cache never wrote out, and a scan of the directory at
-startup to rebuild the index.
-
-#### Keys
-
-The index maps the **whole key** to its file: bucket, injected tenant prefix
-and object key, exactly as `internal/proxy` built it. Nothing is hashed: two
-tenants' `data/a.parquet` are two entries because their keys differ, and no
-collision can ever merge them. Each file also records the key it was
-written for, and every read compares it: an index entry that pointed at
-another key's file would be a miss, never that key's bytes.
+How to size the volume and the pod for it, and what node disk pressure does:
+[Running on Kubernetes](docs/kubernetes.md#the-object-cache). How the store
+underneath works: [How the cache stores objects](docs/cache-storage.md).
 
 ## Listing fallback
 
@@ -1047,6 +932,9 @@ docker run --rm -ti \
   -e CREDENTIAL_PEPPER=… \
   aws-s3-reverse-proxy
 ```
+
+For Kubernetes, with a complete manifest and what each part of it is for,
+see [Running on Kubernetes](docs/kubernetes.md).
 
 The available options and help information can be displayed with:
 

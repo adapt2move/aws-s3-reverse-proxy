@@ -82,6 +82,7 @@ func (m *Mutation) Capture(size int64) *Writer {
 	}
 	w, err := m.c.store.Put(m.keys[0], size)
 	if err != nil {
+		m.c.dropped.Add(1)
 		return nil
 	}
 	m.c.mu.Lock()
