@@ -641,3 +641,26 @@ func TestHealthAndMetrics(t *testing.T) {
 		t.Fatal("/metrics leaked the derivation pepper")
 	}
 }
+
+// The two bucket calls tools make before anything else, through a real SDK:
+// HeadBucket reaches the object store and says the bucket is there, and
+// GetBucketLocation is answered with the region the proxy signs for. Every
+// level may ask either.
+func TestBucketCalls(t *testing.T) {
+	env := setup(t)
+	client := env.Client(t, env.TenantA, env.ReadLevel)
+
+	_, err := client.HeadBucket(&s3.HeadBucketInput{Bucket: aws.String(env.Bucket)})
+	requireNoError(t, err, "head bucket")
+
+	_, err = client.HeadBucket(&s3.HeadBucketInput{Bucket: aws.String(env.Bucket + "-does-not-exist")})
+	if status := statusOf(err); status != http.StatusNotFound {
+		t.Fatalf("head of a missing bucket answered %d (%v), want 404", status, err)
+	}
+
+	location, err := client.GetBucketLocation(&s3.GetBucketLocationInput{Bucket: aws.String(env.Bucket)})
+	requireNoError(t, err, "get bucket location")
+	if aws.StringValue(location.LocationConstraint) == "" {
+		t.Fatalf("the location is empty, want the region the proxy signs upstream for")
+	}
+}
