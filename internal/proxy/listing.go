@@ -99,6 +99,12 @@ func (h *Handler) forwardListing(req *http.Request, st *requestState) (*http.Res
 		// A listing too large to rewrite is not an outage: the object store
 		// did answer that one.
 		if !answer.failed() || errors.Is(answer.err, errListingTooLarge) {
+			// The answer was fetched on the background context, which does
+			// not carry the request state; the rewrite reads it from the
+			// response's request, so hand back the one the client sent.
+			if answer.resp != nil {
+				answer.resp.Request = req
+			}
 			return answer.resp, answer.err
 		}
 		logger := h.objectLog(st)

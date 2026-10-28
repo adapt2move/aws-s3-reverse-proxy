@@ -252,6 +252,30 @@ func TestARememberedListingIsFilteredForWhoeverItIsServedTo(t *testing.T) {
 	assert.NotContains(t, body, "private", "ro may not, whoever's listing it was remembered from")
 }
 
+// A listing that has a remembered answer is still answered live while the
+// object store is healthy, and that live answer is owed the same rewrite as
+// the first one: the background request it is sent as must not lose who
+// asked.
+func TestALiveListingWithARememberedOneIsRewrittenToo(t *testing.T) {
+	h, _, _ := newFallbackProxy(t, time.Second)
+	first := list(t, h, tenantA, "rws")
+	require.Equal(t, http.StatusOK, first.StatusCode)
+	firstBody := readBody(t, first)
+
+	again := list(t, h, tenantA, "rws")
+	require.Equal(t, http.StatusOK, again.StatusCode)
+	assert.Empty(t, again.Header.Get("X-Cache"), "the object store answered this one")
+	body := readBody(t, again)
+	assert.Equal(t, firstBody, body)
+	assert.NotContains(t, body, tenantA, "no injected prefix reaches the client")
+
+	filtered := list(t, h, tenantA, "ro")
+	require.Equal(t, http.StatusOK, filtered.StatusCode)
+	body = readBody(t, filtered)
+	assert.Contains(t, body, "<Key>datasets/2026/a.csv</Key>")
+	assert.NotContains(t, body, "private", "and it is filtered for whoever asked")
+}
+
 func TestTenantsDoNotShareRememberedListings(t *testing.T) {
 	h, _, o := newFallbackProxy(t, time.Second)
 	require.Equal(t, http.StatusOK, list(t, h, tenantA, "rws").StatusCode)
