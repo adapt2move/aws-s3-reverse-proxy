@@ -118,7 +118,7 @@ func Parse() Options {
 	// Caching. One flag turns it on and the rest tune it, so a deployment
 	// that does not want a cache carries none of this.
 	kingpin.Flag("cache-dir", "directory to cache object reads in, emptied at every start; empty disables caching entirely (env - CACHE_DIR)").Envar("CACHE_DIR").PlaceHolder("/var/cache/s3proxy").StringVar(&opts.CacheDir)
-	kingpin.Flag("cache-max-bytes", "how much disk the cache may use (env - CACHE_MAX_BYTES)").Envar("CACHE_MAX_BYTES").Default("1073741824").Int64Var(&opts.CacheMaxBytes)
+	kingpin.Flag("cache-max-bytes", "the most disk the cache will ever use, writes in progress included (env - CACHE_MAX_BYTES)").Envar("CACHE_MAX_BYTES").Default("1073741824").Int64Var(&opts.CacheMaxBytes)
 	kingpin.Flag("cache-max-entries", "how many objects the cache may hold, 0 for no limit; each one costs about 150 bytes of memory plus its key (env - CACHE_MAX_ENTRIES)").Envar("CACHE_MAX_ENTRIES").Default("0").IntVar(&opts.CacheMaxEntries)
 	kingpin.Flag("cache-max-object-size", "largest object the cache will accept; bigger ones are proxied without being stored (env - CACHE_MAX_OBJECT_SIZE)").Envar("CACHE_MAX_OBJECT_SIZE").Default("67108864").Int64Var(&opts.CacheMaxObjectSize)
 	kingpin.Flag("cache-max-age", "how long a cached object may be served before it is checked against the object store; 0 disables expiry entirely, which assumes this proxy is the only writer (env - CACHE_MAX_AGE)").Envar("CACHE_MAX_AGE").Default("10m").DurationVar(&opts.CacheMaxAge)

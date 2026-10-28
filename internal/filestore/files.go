@@ -4,7 +4,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"sync"
 )
 
 // Writer accumulates one payload in its own file and, on Commit, makes it the
@@ -25,10 +24,10 @@ type Writer struct {
 	err     error
 	done    bool
 
-	// reserved is how much disk this write has claimed against the store's
-	// allowance for writes in flight. It is given back when the write ends,
-	// whichever way it ends.
-	reserved int64
+	// claimed is the disk this write holds against MaxBytes. Nothing is
+	// written that has not been claimed first, and the claim is given back
+	// when the write ends, whichever way it ends.
+	claimed int64
 }
 
 func (w *Writer) Write(p []byte) (int, error) {
@@ -46,15 +45,9 @@ func (w *Writer) Write(p []byte) (int, error) {
 		w.fail(ErrTooLarge)
 		return 0, w.err
 	}
-	if next > w.reserved {
-		// A write whose length was announced claimed its disk up front. One
-		// whose length is not known claims it as it arrives, because that is
-		// the only point at which anybody knows how much there is.
-		if !w.s.reserve(next - w.reserved) {
-			w.fail(ErrNoRoom)
-			return 0, w.err
-		}
-		w.reserved = next
+	if err := w.grow(next); err != nil {
+		w.fail(err)
+		return 0, w.err
 	}
 	n, err := w.f.Write(p)
 	w.written += int64(n)
@@ -62,6 +55,22 @@ func (w *Writer) Write(p []byte) (int, error) {
 		w.fail(err)
 	}
 	return n, err
+}
+
+// grow claims what a file of length n occupies, beyond what this write has
+// claimed already. A write whose length was announced claimed it all in Put;
+// one whose length is not known claims it as it arrives, because that is the
+// only point at which anybody knows how much there is.
+func (w *Writer) grow(n int64) error {
+	need := blocks(n) - w.claimed
+	if need <= 0 {
+		return nil
+	}
+	if err := w.s.claim(need); err != nil {
+		return err
+	}
+	w.claimed += need
+	return nil
 }
 
 // Size is how many payload bytes have been written so far.
@@ -73,7 +82,8 @@ func (w *Writer) Size() int64 { return w.written }
 // The metadata is supplied here rather than at Put because it is often not
 // known any earlier: what an object store says about an upload — its ETag —
 // arrives once the upload has landed. So it goes into the file after the
-// payload, followed by the key, which leaves the payload at offset 0.
+// payload, followed by the key, which leaves the payload at offset 0. Both
+// are claimed before they are written, like the payload was.
 //
 // Nothing is synced. The file only has to be readable by this process, and
 // the page cache already makes it so.
@@ -85,6 +95,10 @@ func (w *Writer) Commit(meta []byte) error {
 		return w.err
 	}
 	w.done = true
+	length := w.written + int64(len(meta)) + int64(len(w.key))
+	if err := w.grow(length); err != nil {
+		return w.discard(err)
+	}
 	if _, err := w.f.Write(meta); err != nil {
 		return w.discard(err)
 	}
@@ -96,13 +110,12 @@ func (w *Writer) Commit(meta []byte) error {
 	if err != nil {
 		return w.discard(err)
 	}
-	length := w.written + int64(len(meta)) + int64(len(w.key))
 	e := &entry{key: w.key, id: w.id, size: w.written, meta: int64(len(meta)), disk: blocks(length)}
-	reserved := w.reserved
+	claimed := w.claimed
 	// From here the file belongs to the store, which removes it when the
 	// entry goes or, if it is closed already, right away.
-	w.id, w.reserved = 0, 0
-	return w.s.commit(e, reserved)
+	w.id, w.claimed = 0, 0
+	return w.s.commit(e, claimed)
 }
 
 // Abort discards the write. It is safe to call after Commit and safe to call
@@ -128,8 +141,9 @@ func (w *Writer) discard(err error) error {
 	return err
 }
 
-// release closes and removes the file and gives back the reservation. The
-// file was never an entry, so nothing else can be reading it.
+// release closes and removes the file, and only then gives back the claim:
+// the other way round, the space would be counted free while the file still
+// held it. The file was never an entry, so nothing else can be reading it.
 func (w *Writer) release() {
 	if w.f != nil {
 		_ = w.f.Close()
@@ -139,21 +153,22 @@ func (w *Writer) release() {
 		_ = os.Remove(w.s.path(w.id))
 		w.id = 0
 	}
-	w.s.release(w.reserved)
-	w.reserved = 0
+	w.s.unclaim(w.claimed)
+	w.claimed = 0
 }
 
 // Reader streams one cached payload.
 //
-// It holds the file open, so neither eviction nor a newer version of the key
-// can pull the ground out from under a download in progress: the entry leaves
-// the index immediately, and the bytes stay readable until the reader closes.
-// Closing it is therefore not optional.
+// It holds the file, so neither eviction nor a newer version of the key can
+// pull the ground out from under a download in progress: the entry leaves the
+// index immediately, and the file stays on disk, still counted against
+// MaxBytes, until the reader closes. Closing it is therefore not optional.
 type Reader struct {
+	s      *Store
+	e      *entry
 	f      *os.File
 	body   *io.SectionReader
 	meta   []byte
-	size   int64
 	closed bool
 }
 
@@ -162,7 +177,7 @@ type Reader struct {
 func (r *Reader) Meta() []byte { return r.meta }
 
 // Size is the payload length in bytes.
-func (r *Reader) Size() int64 { return r.size }
+func (r *Reader) Size() int64 { return r.e.size }
 
 func (r *Reader) Read(p []byte) (int, error) {
 	if r.closed {
@@ -185,103 +200,14 @@ func (r *Reader) Seek(offset int64, whence int) (int64, error) {
 	return r.body.Seek(offset, whence)
 }
 
-// Close releases the file. Calling it twice is harmless.
+// Close releases the file, and removes it if it has left the index and this
+// was the last reader. Calling it twice is harmless.
 func (r *Reader) Close() error {
 	if r.closed {
 		return nil
 	}
 	r.closed = true
-	return r.f.Close()
-}
-
-// reaper removes files in the background.
-//
-// The moments a file stops being needed — a commit that evicted something, a
-// delete on an upload's path — are moments somebody is waiting, and unlinking
-// a large file is not free. The index is updated synchronously, which is what
-// correctness rests on; the disk catches up here.
-type reaper struct {
-	mu      sync.Mutex
-	idle    *sync.Cond // broadcast whenever pending drops to zero
-	queue   []string
-	pending int
-	stopped bool
-
-	wake chan struct{}
-	quit chan struct{}
-	done chan struct{}
-}
-
-func (r *reaper) start() {
-	r.idle = sync.NewCond(&r.mu)
-	r.wake = make(chan struct{}, 1)
-	r.quit = make(chan struct{})
-	r.done = make(chan struct{})
-	go r.run()
-}
-
-// remove queues paths for removal. Once the reaper has stopped it removes them
-// itself, so nothing queued late is left behind.
-func (r *reaper) remove(paths ...string) {
-	if len(paths) == 0 {
-		return
-	}
-	r.mu.Lock()
-	if r.stopped {
-		r.mu.Unlock()
-		for _, p := range paths {
-			_ = os.RemoveAll(p)
-		}
-		return
-	}
-	r.queue = append(r.queue, paths...)
-	r.pending += len(paths)
-	r.mu.Unlock()
-	select {
-	case r.wake <- struct{}{}:
-	default:
-	}
-}
-
-func (r *reaper) run() {
-	defer close(r.done)
-	for {
-		select {
-		case <-r.wake:
-			r.drain()
-		case <-r.quit:
-			r.drain()
-			return
-		}
-	}
-}
-
-func (r *reaper) drain() {
-	for {
-		r.mu.Lock()
-		batch := r.queue
-		r.queue = nil
-		r.mu.Unlock()
-		if len(batch) == 0 {
-			return
-		}
-		for _, p := range batch {
-			_ = os.RemoveAll(p)
-		}
-		r.mu.Lock()
-		r.pending -= len(batch)
-		if r.pending == 0 {
-			r.idle.Broadcast()
-		}
-		r.mu.Unlock()
-	}
-}
-
-// stop removes what is still queued and ends the goroutine.
-func (r *reaper) stop() {
-	r.mu.Lock()
-	r.stopped = true
-	r.mu.Unlock()
-	close(r.quit)
-	<-r.done
+	err := r.f.Close()
+	r.s.unref(r.e)
+	return err
 }

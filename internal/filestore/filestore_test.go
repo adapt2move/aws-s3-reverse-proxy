@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,20 +50,9 @@ func get(t *testing.T, s *Store, key string) (payload, meta []byte, ok bool) {
 	return payload, r.Meta(), true
 }
 
-// settle waits until every file the store has let go of is gone, so a test can
-// look at the directory without racing the background removal.
-func (s *Store) settle() {
-	s.reaper.mu.Lock()
-	for s.reaper.pending > 0 {
-		s.reaper.idle.Wait()
-	}
-	s.reaper.mu.Unlock()
-}
-
 // objectFiles lists the files under the shard directories.
 func objectFiles(t *testing.T, s *Store) []string {
 	t.Helper()
-	s.settle()
 	var files []string
 	shards, err := filepath.Glob(filepath.Join(s.opts.Dir, "??", "*"))
 	require.NoError(t, err)
@@ -172,11 +162,17 @@ func TestANewVersionReplacesTheOld(t *testing.T) {
 	assert.Equal(t, "version two", string(payload))
 	assert.Equal(t, "2", string(meta))
 
-	assert.Len(t, objectFiles(t, s), 1, "the old file is gone from the directory")
+	// The old file is out of the index but still on disk, and still counted,
+	// for as long as the download that has it open runs.
+	assert.Equal(t, 1, s.Stats().Entries)
+	assert.Len(t, objectFiles(t, s), 2)
+	assert.Equal(t, int64(2*blockSize), s.Stats().Bytes)
 	body, err := io.ReadAll(old)
 	require.NoError(t, err)
-	assert.Equal(t, "version one", string(body), "but still readable through a reader that had it open")
-	assert.Equal(t, 1, s.Stats().Entries)
+	assert.Equal(t, "version one", string(body))
+
+	require.NoError(t, old.Close())
+	assert.Len(t, objectFiles(t, s), 1, "the last reader out removes it")
 	assert.Equal(t, int64(blockSize), s.Stats().Bytes)
 }
 
@@ -190,12 +186,16 @@ func TestDeleteTakesEffectImmediately(t *testing.T) {
 	require.NoError(t, s.Delete("k"))
 	_, err = s.Get("k")
 	assert.ErrorIs(t, err, ErrNotFound)
-	assert.Equal(t, Stats{Capacity: s.opts.MaxBytes, Hits: 1, Misses: 1, Puts: 1, Deletes: 1}, s.Stats())
-	assert.Empty(t, objectFiles(t, s))
+	stats := s.Stats()
+	assert.Zero(t, stats.Entries)
+	assert.Equal(t, int64(blockSize), stats.Bytes, "a file still being read stays counted")
 
 	body, err := io.ReadAll(reading)
 	require.NoError(t, err)
 	assert.Equal(t, "payload", string(body))
+	require.NoError(t, reading.Close())
+	assert.Empty(t, objectFiles(t, s))
+	assert.Equal(t, Stats{Capacity: s.opts.MaxBytes, Hits: 1, Misses: 1, Puts: 1, Deletes: 1}, s.Stats())
 
 	require.NoError(t, s.Delete("never-stored"), "deleting an absent key is not an error")
 }
@@ -266,30 +266,170 @@ func TestAnOversizedObjectIsRefused(t *testing.T) {
 	assert.Empty(t, objectFiles(t, s), "nothing is left behind")
 }
 
-// Writes in flight have claimed disk nothing counts yet. They are bounded on
-// their own, at half the budget or one largest object.
-func TestWritesInFlightAreBounded(t *testing.T) {
+// A write claims its whole length before its first byte, and room is made by
+// evicting first: a full cache never holds more than MaxBytes, not even while
+// it is taking a new object in.
+func TestAWriteMakesRoomBeforeItWrites(t *testing.T) {
 	s := open(t, Options{MaxBytes: 64 * blockSize, MaxObjectSize: 16 * blockSize})
+	const size = 16*blockSize - 2*metaAllowance // leaves room in the last block for key and metadata
+	for i := 0; i < 4; i++ {
+		put(t, s, fmt.Sprintf("k%d", i), make([]byte, size), nil)
+	}
+	require.Equal(t, int64(64*blockSize), s.Stats().Bytes, "full")
 
-	first, err := s.Put("first", 16*blockSize)
+	first, err := s.Put("new-1", size)
 	require.NoError(t, err)
-	second, err := s.Put("second", 16*blockSize)
+	_, _, ok := get(t, s, "k0")
+	assert.False(t, ok, "the least recently used entry made room before anything was written")
+	assert.Equal(t, int64(64*blockSize), s.Stats().Bytes, "and the claim fills exactly what it freed")
+
+	second, err := s.Put("new-2", size)
 	require.NoError(t, err)
-	_, err = s.Put("third", 16*blockSize)
+
+	// Writes in flight hold at most half the budget between them, so a burst
+	// of misses cannot evict the whole cache to make room for itself.
+	_, err = s.Put("new-3", size)
 	assert.ErrorIs(t, err, ErrNoRoom)
+	for _, key := range []string{"k2", "k3"} {
+		_, _, ok := get(t, s, key)
+		assert.True(t, ok, "%s was not evicted for a write that was refused anyway", key)
+	}
+	assert.Equal(t, uint64(2), s.Stats().Evictions)
 
-	first.Abort()
-	third, err := s.Put("third", 16*blockSize)
-	require.NoError(t, err, "an ended write gives its claim back")
-
-	_, err = second.Write(make([]byte, 16*blockSize))
+	_, err = first.Write(make([]byte, size))
 	require.NoError(t, err)
-	require.NoError(t, second.Commit(nil))
-	fourth, err := s.Put("fourth", 16*blockSize)
-	require.NoError(t, err, "and so does a committed one")
-	third.Abort()
-	fourth.Abort()
+	require.NoError(t, first.Commit(nil))
+	second.Abort()
+	assert.Zero(t, s.reserved, "a committed write and an aborted one both give their claim back")
+	assert.LessOrEqual(t, s.Stats().Bytes, int64(64*blockSize))
+}
+
+// An evicted file that a download still has open stays on disk until the
+// download ends. It counts against the ceiling for as long, so making room
+// past it takes the next entry instead.
+func TestAFileStillBeingReadStaysCounted(t *testing.T) {
+	s := open(t, Options{MaxBytes: 4 * blockSize, MaxObjectSize: blockSize})
+	for _, key := range []string{"a", "b", "c", "d"} {
+		put(t, s, key, []byte(key), nil)
+	}
+	reading, err := s.Get("a")
+	require.NoError(t, err)
+	require.NoError(t, s.Delete("a"))
+
+	put(t, s, "e", []byte("e"), nil)
+	_, _, ok := get(t, s, "b")
+	assert.False(t, ok, "b went, because a's file is still there")
+	assert.Len(t, objectFiles(t, s), 4, "c, d, e and the one being read")
+	assert.Equal(t, int64(4*blockSize), s.Stats().Bytes)
+
+	require.NoError(t, reading.Close())
+	assert.Len(t, objectFiles(t, s), 3)
+	assert.Equal(t, int64(3*blockSize), s.Stats().Bytes)
+}
+
+// What the directory holds, counted the way the store counts it, while nothing
+// can change the accounting underneath. Files being written grow without the
+// lock, but only into space their writer has already claimed.
+func (s *Store) diskInUse(t *testing.T) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var total int64
+	shards, err := filepath.Glob(filepath.Join(s.opts.Dir, "??"))
+	require.NoError(t, err)
+	for _, shard := range shards {
+		files, err := os.ReadDir(shard)
+		require.NoError(t, err)
+		for _, f := range files {
+			info, err := f.Info()
+			if err != nil {
+				continue // removed between the listing and the stat
+			}
+			total += blocks(info.Size())
+		}
+	}
+	return total
+}
+
+// The ceiling under concurrent writers of known and unknown length, readers
+// that hold files open across evictions, and deletes. The directory is
+// measured throughout, and never holds more than MaxBytes.
+func TestTheCeilingHoldsUnderLoad(t *testing.T) {
+	const ceiling = 64 * blockSize
+	s := open(t, Options{MaxBytes: ceiling, MaxObjectSize: 8 * blockSize})
+
+	stop := make(chan struct{})
+	var peak int64
+	sampled := make(chan struct{})
+	go func() {
+		defer close(sampled)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if used := s.diskInUse(t); used > peak {
+				peak = used
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(g)))
+			var holding []*Reader
+			for i := 0; i < 300; i++ {
+				key := fmt.Sprintf("k%d", rng.Intn(40))
+				switch op := rng.Intn(10); {
+				case op < 5:
+					payload := make([]byte, 1+rng.Intn(8*blockSize-64))
+					hint := int64(len(payload))
+					if op == 0 {
+						hint = -1 // length unknown, claimed as it arrives
+					}
+					w, err := s.Put(key, hint)
+					if err != nil {
+						continue
+					}
+					for off := 0; off < len(payload); off += 3000 {
+						end := min(off+3000, len(payload))
+						if _, err := w.Write(payload[off:end]); err != nil {
+							break
+						}
+					}
+					_ = w.Commit([]byte("{}"))
+					w.Abort()
+				case op < 8:
+					if r, err := s.Get(key); err == nil {
+						holding = append(holding, r)
+					}
+					if len(holding) > 3 {
+						_ = holding[0].Close()
+						holding = holding[1:]
+					}
+				default:
+					_ = s.Delete(key)
+				}
+			}
+			for _, r := range holding {
+				_ = r.Close()
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(stop)
+	<-sampled
+
+	t.Logf("peak %d of %d blocks", peak/blockSize, ceiling/blockSize)
+	assert.LessOrEqual(t, peak, int64(ceiling))
+	assert.LessOrEqual(t, s.diskInUse(t), int64(ceiling))
+	assert.Equal(t, s.Stats().Bytes, s.diskInUse(t), "what is counted is what is on disk")
 	assert.Zero(t, s.reserved)
+	assert.Zero(t, s.held)
+	assert.Zero(t, s.removing)
 }
 
 func TestAbortLeavesNothing(t *testing.T) {
@@ -345,7 +485,6 @@ func TestOpenStartsEmpty(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "from the second process", string(payload))
 
-	second.settle()
 	names, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	assert.Len(t, names, numShards, "only the shard directories remain")

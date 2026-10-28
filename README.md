@@ -260,7 +260,7 @@ practice.
 | Flag (env) | Default | Meaning |
 | --- | --- | --- |
 | `--cache-dir` (`CACHE_DIR`) | *off* | directory to cache object reads in, emptied at every start; empty disables caching entirely |
-| `--cache-max-bytes` (`CACHE_MAX_BYTES`) | 1 GiB | how much disk the cache may use |
+| `--cache-max-bytes` (`CACHE_MAX_BYTES`) | 1 GiB | the most disk the cache ever uses, writes in progress included |
 | `--cache-max-object-size` (`CACHE_MAX_OBJECT_SIZE`) | 64 MiB | largest object accepted; bigger ones are proxied without being stored |
 | `--cache-max-age` (`CACHE_MAX_AGE`) | `10m` | how long an object is served before it is checked against the object store; `0s` disables expiry entirely |
 | `--cache-writes` (`CACHE_WRITES`) | `true` | also cache the body of an accepted upload |
@@ -400,7 +400,8 @@ to the bucket.
 
 The directory is meant to be a local volume that lives as long as the pod,
 an `emptyDir` on local NVMe, and it is **emptied at every start**: nothing
-cached survives a restart. See [The disk underneath](#the-disk-underneath).
+cached survives a restart. See [Running it on Kubernetes](#running-it-on-kubernetes)
+and [The disk underneath](#the-disk-underneath).
 
 ### What it does and does not cache
 
@@ -585,22 +586,77 @@ them:
 This is not something the proxy can detect or warn about — a replica cannot
 see its siblings — so it is stated here rather than at startup.
 
-The cache directory holds tenant object data at rest, which the proxy
-otherwise never does. It is created `0700`; encryption at rest is the
-operator's to arrange, and it wants a volume of its own.
+### Running it on Kubernetes
 
-**Size the volume above `--cache-max-bytes`, not at it.** Two things sit
-outside that budget: writes in flight claim disk they have not committed, up
-to half the budget or one `--cache-max-object-size`, whichever is larger; and
-eviction runs after a write rather than before one, with the evicted files
-removed in the background a moment later. Budgeting the volume at roughly
-`--cache-max-bytes` plus that allowance leaves "the volume filled up" as an
-eviction that happens slightly late rather than a write that fails. On an
-`emptyDir`, that figure is the `sizeLimit`: past it, the kubelet evicts the
-pod.
+The cache wants a volume of its own: an `emptyDir` on the node's local NVMe.
+Every file in the directory belongs to the cache, and it is emptied at every
+start. It holds tenant object data at rest, which the proxy otherwise never
+does; the directory is created `0700`, and encryption at rest is the
+operator's to arrange.
 
-**It also has to belong to the user the proxy runs as.** An `emptyDir` is
-created world-writable and needs nothing. The container image runs as
+**`--cache-max-bytes` is a ceiling.** The cache never has more than that on
+disk, counting everything it writes: the entries, files that were evicted but
+are still being streamed to a client, and writes in progress, which claim
+their full length before their first byte is written. Room is made by
+evicting before a write, never after it, and a write that cannot be fitted is
+simply not cached. Sizes are counted in 4 KiB blocks, which is what ext4 and
+XFS allocate on a volume formatted with their defaults. Not counted are the
+256 shard directories, about 1 MiB, and on XFS the speculative preallocation
+it can briefly give a file that is still growing.
+
+**When the disk runs short, the kubelet decides what happens, so size the pod
+for it.** These numbers belong together:
+
+| | set it to | because |
+| --- | --- | --- |
+| `--cache-max-bytes` | the cache size you want | it is the ceiling the proxy enforces itself |
+| `emptyDir.sizeLimit` | `--cache-max-bytes` plus a few percent | past it, the kubelet evicts the pod |
+| `requests.ephemeral-storage` | at least `sizeLimit`, plus room for logs and the container's writable layer | under disk pressure, pods using more than they requested are evicted first |
+| `limits.ephemeral-storage` | above the request | past it, the kubelet evicts the pod |
+
+Node disk pressure starts, by default, when the node filesystem has less than
+10 % of its space or 5 % of its inodes left. The kubelet then evicts pods in
+order: first those using more ephemeral storage than they requested, then by
+priority, then by how far over their request they are. A cache pod whose
+request does not cover its cache is the obvious first choice, and losing it
+loses the proxy, not just the cache. With the request set as above, it is
+among the last.
+
+The proxy cannot see any of this from the inside. Asked for free space, the
+filesystem reports the node's whole disk, shared with every other pod, while
+`sizeLimit` and the ephemeral-storage limits are enforced by the kubelet
+measuring usage. That is why the ceiling is configured rather than detected.
+
+**Inodes count too.** Every cached object is a file, so a cache of many small
+objects uses an inode for each, and the node's inode threshold can trip before
+its space does. `--cache-max-entries` bounds the number of files.
+
+For a 30 GiB cache:
+
+```yaml
+containers:
+  - name: s3proxy
+    env:
+      - name: CACHE_DIR
+        value: /var/cache/s3proxy
+      - name: CACHE_MAX_BYTES
+        value: "32212254720"        # 30 GiB, the ceiling
+    resources:
+      requests:
+        ephemeral-storage: 32Gi     # the cache, logs and the writable layer
+      limits:
+        ephemeral-storage: 34Gi
+    volumeMounts:
+      - name: cache
+        mountPath: /var/cache/s3proxy
+volumes:
+  - name: cache
+    emptyDir:
+      sizeLimit: 31Gi               # the ceiling plus a few percent
+```
+
+**The directory has to belong to the user the proxy runs as.** An `emptyDir`
+is created world-writable and needs nothing. The container image runs as
 `proxyuser`, though, and both a Kubernetes PVC and a Docker volume are handed
 over owned by root — so the proxy cannot create anything in one and refuses to
 start rather than serve without the cache it was told to use. On Kubernetes
@@ -626,14 +682,16 @@ file costs microseconds and nothing about the disk has to be worked around.
   * **Nothing is fsynced.** The files only have to be readable by the
     process that wrote them, and the page cache already guarantees that.
   * **An invalidation cannot be lost.** Deleting a key takes it out of the
-    index under a lock, which cannot fail; the file is unlinked afterwards, in
-    the background. There is no queue that could be full and no disk state
-    that could refuse it, so after a write through this proxy, no read through
-    it finds the version the write replaced.
-  * **Eviction is least recently used, per object.** Disk is counted in whole
-    4 KiB blocks, because that is what a file occupies: a cache of 200-byte
-    objects counted at 200 bytes each would overrun its budget many times
-    over.
+    index under a lock, which cannot fail; the file is unlinked right after,
+    or by the last reader still streaming it. There is no queue that could be
+    full and no disk state that could refuse it, so after a write through
+    this proxy, no read through it finds the version the write replaced.
+  * **Eviction is least recently used, per object, and happens before a
+    write rather than after it.** Disk is counted in whole 4 KiB blocks,
+    because that is what a file occupies: a cache of 200-byte objects counted
+    at 200 bytes each would overrun its ceiling many times over. See
+    [Running it on Kubernetes](#running-it-on-kubernetes) for what the
+    ceiling covers.
 
 #### Every start is a cold start
 
@@ -642,8 +700,9 @@ read back: there is **no startup scan**, no on-disk index and no recovery, and
 that is deliberate. A new pod gets an empty `emptyDir` anyway. The one case in
 which old files are still there is a container restarted inside the same pod,
 after a crash or an OOM kill, and those files are discarded rather than
-trusted: moved aside at start and removed in the background, so a large
-leftover directory does not hold up readiness.
+trusted. They are removed before the proxy starts serving, so they never sit
+on disk uncounted next to a cache that fills up again. With a few thousand
+files that is instant; with hundreds of thousands it takes a few seconds.
 
 A restart therefore costs a cold cache, and every object is fetched from the
 object store once more. Keeping the cache across restarts is not needed today.
