@@ -86,7 +86,6 @@ type CacheStats struct {
 	Invalidations uint64
 	Evictions     uint64
 	EvictedBytes  uint64
-	WritesDropped uint64
 }
 
 // RegisterCacheStats publishes the cache's gauges and counters. It is called
@@ -116,7 +115,7 @@ func RegisterCacheStats(read func() CacheStats) {
 		counter("s3proxy_cache_stores_total", "Upstream responses written into the local cache.",
 			func(s CacheStats) float64 { return float64(s.Stored) }),
 		counter("s3proxy_cache_store_failures_total", "Responses that could not be cached: truncated, superseded, or refused by the store.",
-			func(s CacheStats) float64 { return float64(s.Dropped + s.WritesDropped) }),
+			func(s CacheStats) float64 { return float64(s.Dropped) }),
 		counter("s3proxy_cache_invalidations_total", "Cache keys dropped because the object behind them was written.",
 			func(s CacheStats) float64 { return float64(s.Invalidations) }),
 		counter("s3proxy_cache_evictions_total", "Cache files reclaimed to stay within the size limit.",

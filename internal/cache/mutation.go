@@ -60,7 +60,7 @@ func (c *Cache) BeginMutation(keys ...string) *Mutation {
 
 // Capture asks for a writer to tee the uploaded body into, so a successful
 // upload leaves the object cached instead of merely un-cached. It returns nil
-// when the store will not take it — too large, too busy, no room — and a nil
+// when the store will not take it — too large, no room, closed — and a nil
 // writer is not an error the caller has to handle.
 //
 // It also returns nil when another write to the same key is already in
@@ -82,6 +82,7 @@ func (m *Mutation) Capture(size int64) *Writer {
 	}
 	w, err := m.c.store.Put(m.keys[0], size)
 	if err != nil {
+		m.c.dropped.Add(1)
 		return nil
 	}
 	m.c.mu.Lock()

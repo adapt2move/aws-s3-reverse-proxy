@@ -200,9 +200,10 @@ services:
       cache-dir: {condition: service_completed_successfully}
     volumes:
       - "./policies/policy-a.yaml:/etc/s3proxy/policy.yaml:ro"
-      # A named volume rather than a container path, so the cache is still
-      # there after `docker compose restart` — which is how the suite checks
-      # that a restart recovers rather than starts cold.
+      # A named volume rather than a container path, so the old files are
+      # still there after `docker compose restart`, the way an emptyDir keeps
+      # them across a container restart — which is how the suite checks that
+      # the new process discards them rather than serving them.
       - "cache:/var/cache/s3proxy"
     environment:
       POLICY_FILE: /etc/s3proxy/policy.yaml

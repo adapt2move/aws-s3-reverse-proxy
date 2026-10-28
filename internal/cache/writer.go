@@ -2,10 +2,11 @@ package cache
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
-	"github.com/Kriechi/aws-s3-reverse-proxy/internal/blobcache"
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/filestore"
 )
 
 // Writer captures one upstream response on its way to a client.
@@ -18,7 +19,7 @@ import (
 type Writer struct {
 	c   *Cache
 	key string
-	w   *blobcache.Writer
+	w   *filestore.Writer
 
 	// expect is the payload length the response announced, or negative if
 	// it announced none. It is what makes a truncated download detectable:
@@ -53,8 +54,8 @@ func (w *Writer) Write(p []byte) (int, error) {
 //
 // It refuses in three cases, and all three are ordinary: the body was shorter
 // than it announced, the object was invalidated while this response was in
-// flight, or the store was too busy to take it. None of them is a reason for
-// the caller to do anything.
+// flight, or the store refused it (closed, or the disk failed). None of them is
+// a reason for the caller to do anything.
 func (w *Writer) Commit(header http.Header) error {
 	if w.done {
 		return nil
@@ -63,6 +64,9 @@ func (w *Writer) Commit(header http.Header) error {
 	defer w.finish()
 
 	if w.failed {
+		// The store gave up partway: out of room, or a write to disk that
+		// failed. Already aborted; only counted here.
+		w.c.dropped.Add(1)
 		return nil
 	}
 	if w.expect >= 0 && w.written != w.expect {
@@ -89,8 +93,16 @@ func (w *Writer) Commit(header http.Header) error {
 		w.c.dropped.Add(1)
 		return err
 	}
-	if err := w.w.Commit(meta); err != nil {
+	// Checked once more as the entry is published, under the store's lock.
+	// The check above saves writing out a response already known to be out
+	// of date; this one closes the gap between it and the publish, in which
+	// an Invalidate or a Purge would otherwise delete first and then see
+	// this response land after it.
+	if err := w.w.CommitUnless(meta, w.superseded); err != nil {
 		w.c.dropped.Add(1)
+		if errors.Is(err, filestore.ErrSuperseded) {
+			return nil
+		}
 		return err
 	}
 	w.c.stored.Add(1)

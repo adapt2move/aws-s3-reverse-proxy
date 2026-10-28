@@ -52,11 +52,8 @@ func withTestCacheIn(t *testing.T, dir string, cached **cache.Cache, maxAge time
 		c, err := cache.New(cache.Options{
 			Dir:           dir,
 			MaxBytes:      8 << 20,
-			SegmentSize:   256 << 10,
-			InlineMaxSize: 32 << 10,
 			MaxObjectSize: 1 << 20,
 			MaxAge:        maxAge,
-			Label:         "upstream-sse-c:" + mustKey(t, testKeyEncoded).Label(),
 		})
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = c.Close() })

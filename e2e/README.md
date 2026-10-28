@@ -56,7 +56,7 @@ that no tenant, level name or key layout is baked into the proxy:
 | secrets from | environment | mounted files | environment | environment | environment | mounted files |
 | upstream SSE-C | off | off | off | off | on, key from the environment | on, key from a mounted file |
 | local cache | off | off | off | on, 3s maximum age, 8 MiB per object | off | on, 3s maximum age, 8 MiB per object |
-| extras | hot reload, 192 MiB memory cap | — | `--read-only` | 192 MiB memory cap, restartable with its cache | 192 MiB memory cap | 192 MiB memory cap, restartable with its cache, 2s policy reload |
+| extras | hot reload, 192 MiB memory cap | — | `--read-only` | 192 MiB memory cap, restartable on its cache volume | 192 MiB memory cap | 192 MiB memory cap, restartable on its cache volume, 2s policy reload |
 
 The rule *paths* are deliberately identical across variants, so the same
 authorization assertions apply to each.
@@ -98,7 +98,7 @@ declines still streams rather than being buffered on its way past.
 | `TestAnObjectTooLargeForTheCacheIsStillServed` | the cache declining an object changes nothing else |
 | `TestACachedObjectIsStillSubjectToPolicy` | a warm cache is not a way around a level that may not read it |
 | `TestOneTenantsWarmCacheIsAnothersMiss` | isolation holds for a warm cache, not just a cold one |
-| `TestTheCacheSurvivesARestart` | a real process really stopped, and recovered its disk |
+| `TestTheCacheStartsEmptyAfterARestart` | a real process really stopped, and its successor discarded what it left on disk |
 | `TestCacheMetricsAreExposed` | the cache series, with no key or credential in them |
 | `TestClientSuppliedSSECHeadersAreRefused` | a client's own SSE-C key is refused with a reason, on every variant |
 | `TestSSECObjectsAreEncryptedAtRest` | a proxy write is unreadable without the key, `403` with the wrong one, and the original bytes with the right one |
@@ -154,7 +154,7 @@ Every variable the suite reads:
 | `E2E_CACHE_MAX_AGE` | marks a caching deployment and enables every cache test; must match its `--cache-max-age` |
 | `E2E_CACHE_MAX_OBJECT_SIZE` | its `--cache-max-object-size`, so a test can pick a size on either side of it |
 | `E2E_CACHE_PURGE_TOKEN` | the deployment's `CACHE_PURGE_TOKEN`; empty means it accepts an unauthenticated purge |
-| `E2E_CACHE_RESTART_CMD` | restarts the proxy with its cache intact; without it the restart test skips |
+| `E2E_CACHE_RESTART_CMD` | restarts the proxy on the same cache directory; without it the restart test skips |
 | `E2E_SSEC_KEY` | the deployment's `UPSTREAM_SSE_C_KEY`; marks an SSE-C deployment and enables the `TestSSEC…` tests |
 | `E2E_SSEC_KEY_FILE` | host path of the key file the deployment read; enables the no-reload test, which rewrites it |
 

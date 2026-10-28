@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -182,9 +183,12 @@ func TestLoadSSECKey(t *testing.T) {
 
 		// Loaded once: changing the file afterwards changes nothing about
 		// the key this process already holds.
-		label := opts.UpstreamSSECKey.Label()
+		before := http.Header{}
+		opts.UpstreamSSECKey.Apply(before)
 		require.NoError(t, os.WriteFile(path, []byte("AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="), 0o600))
-		assert.Equal(t, label, opts.UpstreamSSECKey.Label())
+		after := http.Header{}
+		opts.UpstreamSSECKey.Apply(after)
+		assert.Equal(t, before, after)
 	})
 
 	for name, setup := range map[string]func(t *testing.T){

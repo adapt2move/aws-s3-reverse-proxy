@@ -9,7 +9,7 @@
 // the one the client asked for — are made by the caller, because they are
 // the caller's to make.
 //
-// Underneath is internal/blobcache, which owns the disk. What this package
+// Underneath is internal/filestore, which owns the disk. What this package
 // adds is the three things a response cache needs and a blob store should not
 // know about:
 //
@@ -34,23 +34,19 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Kriechi/aws-s3-reverse-proxy/internal/blobcache"
+	"github.com/Kriechi/aws-s3-reverse-proxy/internal/filestore"
 )
 
 // Options configures a Cache. Anything left at zero takes the default named
-// in blobcache.Options, which is where the disk-shaped knobs are documented.
+// in filestore.Options, which is where the disk-shaped knobs are documented.
+//
+// The directory is emptied when the cache opens: every start is a cold start.
+// See filestore.Open.
 type Options struct {
 	Dir           string
 	MaxBytes      int64
 	MaxEntries    int
 	MaxObjectSize int64
-	SegmentSize   int64
-	InlineMaxSize int64
-
-	// Label names the configuration the cached responses depend on beyond
-	// their key. A cache opened with a different label than the one its
-	// directory was written under starts empty. See blobcache.Options.Label.
-	Label string
 
 	// MaxAge is how long an entry may be served without being fetched
 	// again. Zero means never: the cache is then only ever wrong if
@@ -91,7 +87,7 @@ const (
 // Cache is a set of cached upstream responses on local disk. It is safe for
 // concurrent use.
 type Cache struct {
-	store  *blobcache.Store
+	store  *filestore.Store
 	maxAge time.Duration
 	maxObj int64
 	now    func() time.Time
@@ -99,6 +95,10 @@ type Cache struct {
 
 	// mu guards pending, which only ever holds the keys with a write or a
 	// fill in flight — never the cache's contents.
+	//
+	// It is taken inside the store's lock when a Writer commits (see
+	// filestore.Writer.CommitUnless), so it must never be held while
+	// calling into the store.
 	mu      sync.Mutex
 	pending map[string]*pending
 
@@ -141,15 +141,11 @@ func New(opts Options) (*Cache, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	store, err := blobcache.Open(blobcache.Options{
+	store, err := filestore.Open(filestore.Options{
 		Dir:           opts.Dir,
 		MaxBytes:      opts.MaxBytes,
 		MaxEntries:    opts.MaxEntries,
 		MaxObjectSize: opts.MaxObjectSize,
-		SegmentSize:   opts.SegmentSize,
-		InlineMaxSize: opts.InlineMaxSize,
-		SyncDeletes:   true,
-		Label:         opts.Label,
 		Logf:          opts.Logf,
 	})
 	if err != nil {
@@ -199,7 +195,7 @@ type Entry struct {
 	StoredAt time.Time
 	Age      time.Duration
 
-	body *blobcache.Reader
+	body *filestore.Reader
 }
 
 // revalidation is one entry having been confirmed current: when that was, and
@@ -281,9 +277,9 @@ func (c *Cache) Get(key string) (*Entry, Result) {
 // there is no ordering between the two that the caller could arrange instead.
 //
 // It is kept in memory rather than written back into the entry, because the
-// payload and its metadata are one record on disk and restamping it would
-// mean rewriting the object. Losing these timestamps on restart costs one
-// revalidation per object, which is what a restart costs anyway.
+// payload and its metadata are one file on disk and restamping it would mean
+// rewriting the object. The cache starts empty on every start anyway, so
+// nothing here has to outlive the process.
 func (c *Cache) Refresh(entry *Entry) {
 	if c.maxAge <= 0 || entry == nil || entry.key == "" {
 		return
@@ -364,6 +360,11 @@ func (c *Cache) Put(key string, size int64) (*Writer, error) {
 	}
 	w, err := c.store.Put(key, size)
 	if err != nil {
+		// The store refused it: no room under the size limit, or a disk
+		// that would not take the file. Counted, because a cache that has
+		// quietly stopped storing anything looks exactly like one with
+		// nothing new to store.
+		c.dropped.Add(1)
 		c.unclaim(key)
 		return nil, err
 	}
@@ -375,10 +376,10 @@ func (c *Cache) Put(key string, size int64) (*Writer, error) {
 // One capture per key at a time. Concurrent readers of the same cold object
 // each get their own response and each stream it to their own client — none
 // of them is made to wait, which is the rule — but only the first of them
-// writes it down. The others would append a second copy that the index would
-// immediately supersede, so the store would carry the cost of writing bytes
-// it was always going to reclaim, and each of them would hold its own
-// preallocated file while doing it.
+// writes it down. The others would each write a full copy that the index
+// would immediately supersede, so the store would carry the cost of writing
+// bytes it was always going to throw away, and each of them would hold disk
+// against the allowance for writes in flight while doing it.
 func (c *Cache) claim(key string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -518,7 +519,6 @@ type Stats struct {
 	Invalidations uint64
 	Evictions     uint64
 	EvictedBytes  uint64
-	WritesDropped uint64
 }
 
 func (c *Cache) Stats() Stats {
@@ -533,7 +533,6 @@ func (c *Cache) Stats() Stats {
 		Invalidations: c.invalidations.Load(),
 		Evictions:     s.Evictions,
 		EvictedBytes:  s.EvictedBytes,
-		WritesDropped: s.DroppedWrites,
 	}
 }
 

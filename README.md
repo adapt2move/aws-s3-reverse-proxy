@@ -55,7 +55,7 @@ cmd/aws-s3-reverse-proxy   the process: flags, secrets, listeners, shutdown
     internal/observability access log, metrics, health probes
 
     internal/cache         cached upstream responses: freshness, invalidation
-      internal/blobcache   the disk underneath it
+      internal/filestore   the disk underneath it
     internal/listcache     remembered listings, in memory, for when the
                            object store does not answer
 ```
@@ -73,7 +73,7 @@ Three seams keep the arrows pointing one way:
   lets the authorization model be tested without either.
 
 The two cache packages keep the same discipline. `internal/cache` knows what
-an HTTP response is and when one goes stale; `internal/blobcache` knows only
+an HTTP response is and when one goes stale; `internal/filestore` knows only
 opaque keys and opaque payloads. Neither knows what S3 is, which tenant asked,
 or whether anyone was allowed to — see [Caching](#caching).
 
@@ -259,18 +259,20 @@ practice.
 
 | Flag (env) | Default | Meaning |
 | --- | --- | --- |
-| `--cache-dir` (`CACHE_DIR`) | *off* | directory to cache object reads in; empty disables caching entirely |
-| `--cache-max-bytes` (`CACHE_MAX_BYTES`) | 1 GiB | how much disk the cache may use |
+| `--cache-dir` (`CACHE_DIR`) | *off* | directory to cache object reads in, **unencrypted**, emptied at every start; empty disables caching entirely |
+| `--cache-max-bytes` (`CACHE_MAX_BYTES`) | 1 GiB | the most disk the cache ever uses, writes in progress included |
 | `--cache-max-object-size` (`CACHE_MAX_OBJECT_SIZE`) | 64 MiB | largest object accepted; bigger ones are proxied without being stored |
 | `--cache-max-age` (`CACHE_MAX_AGE`) | `10m` | how long an object is served before it is checked against the object store; `0s` disables expiry entirely |
 | `--cache-writes` (`CACHE_WRITES`) | `true` | also cache the body of an accepted upload |
 | `--cache-range-fills` (`CACHE_RANGE_FILLS`) | `true` | fetch the whole object in the background when a ranged read misses |
-| `--cache-max-entries` (`CACHE_MAX_ENTRIES`) | `0` | object count limit; `0` for none. Budget ~100 bytes of memory each |
-| `--cache-segment-size` (`CACHE_SEGMENT_SIZE`) | 256 MiB | size of the append-only segment files, and the granularity disk is reclaimed at |
-| `--cache-inline-max-size` (`CACHE_INLINE_MAX_SIZE`) | 1 MiB | objects up to this size share a segment; larger ones get a file of their own |
+| `--cache-max-entries` (`CACHE_MAX_ENTRIES`) | `0` | object count limit; `0` for none. Budget ~150 bytes of memory each, plus the length of its key |
 
-The last three are expert knobs. The first six are the ones a deployment
+The last one is an expert knob. The first six are the ones a deployment
 actually turns.
+
+`--cache-segment-size` and `--cache-inline-max-size` are retired along with
+the segment files they sized. They are still accepted so that a deployment
+setting them keeps starting, have no effect, and log a warning at startup.
 
 ### Listing fallback flags
 
@@ -395,6 +397,10 @@ none of this code runs.
 It is aimed at a workload of many small files read over and over — Parquet and
 DuckDB files behind a query engine — on a proxy that is the only thing writing
 to the bucket.
+
+The directory is meant to be a local volume that lives as long as the pod,
+an `emptyDir` on local NVMe, and it is **emptied at every start**: nothing
+cached survives a restart. See [On disk](#on-disk).
 
 ### What it does and does not cache
 
@@ -577,74 +583,31 @@ them:
     back may get the previous version until it expires.
 
 This is not something the proxy can detect or warn about — a replica cannot
-see its siblings — so it is stated here rather than at startup.
+see its siblings — so it is stated here rather than at startup. How to route
+by key on Kubernetes, and how to purge every replica's cache, is in
+[Running on Kubernetes](docs/kubernetes.md#more-than-one-replica).
 
-The cache directory holds tenant object data at rest, which the proxy
-otherwise never does. It is created `0700`; encryption at rest is the
-operator's to arrange, and it wants a volume of its own.
+### On disk
 
-**Size the volume above `--cache-max-bytes`, not at it.** Three things sit
-outside that budget: the segment being appended to is preallocated at its full
-`--cache-segment-size` (256 MiB by default) the moment the process starts, so
-the volume is that much occupied before anything is cached; writes in flight
-claim disk they have not committed, up to half the budget or one
-`--cache-max-object-size`, whichever is larger; and eviction runs after a
-write rather than before one. Budgeting the volume at roughly
-`--cache-max-bytes` plus a segment plus that allowance leaves "the volume
-filled up" as an eviction that happens slightly late rather than a write that
-fails.
+Every cached object is a file in `--cache-dir`, indexed in memory. Three
+things about it matter to an operator:
 
-**It also has to belong to the user the proxy runs as.** The container image
-runs as `proxyuser`, and both a Kubernetes PVC and a Docker volume are handed
-over owned by root — so the proxy cannot create anything in one and refuses to
-start rather than serve without the cache it was told to use. On Kubernetes
-set `fsGroup` in the pod's security context; elsewhere `chown` the directory
-before the process starts. `e2e/docker-compose.yml` does the latter, in the
-`cache-dir` service.
+  * **`--cache-max-bytes` is a ceiling** on everything the cache has on disk,
+    writes in progress included. Room is made by evicting before a write, and
+    an object that does not fit is not cached.
+  * **The directory is emptied at every start.** A restart costs a cold
+    cache; nothing an earlier process cached is ever served.
+  * **Cached objects are stored unencrypted, always.** A file holds the
+    plaintext the object store returned, whatever encryption the object store
+    applies to its own copy: SSE-S3, SSE-KMS, or this proxy's
+    [SSE-C](#encryption-and-the-cache). Anybody who can read the volume can
+    read every tenant's cached objects. The directory is created `0700`;
+    encrypting the disk underneath it is the operator's to arrange. Without
+    `--cache-dir`, the proxy keeps no object data at rest at all.
 
-### The disk underneath
-
-`internal/blobcache` is what holds the bytes: a size-bounded blob store built
-for a network-attached volume, where an fsync is a round trip and so is a file
-create.
-
-  * Objects up to `--cache-inline-max-size` are **appended to shared segment
-    files** rather than stored one file per key. A write is one buffered
-    append, not create + write + rename with an inode update behind each, and
-    concurrent writes fold into a single `write()`.
-  * Larger objects get **a file of their own**, streamed rather than buffered:
-    one big object would otherwise monopolise the append point and make its
-    segment unreclaimable.
-  * **Nothing on the hot path is fsynced.** A cache does not need durability,
-    it needs to never be wrong, and only the second one is free. Correctness
-    after a crash comes from per-record checksums: a record that was torn, or
-    that the filesystem zero-filled — the shape ext4's delayed allocation
-    leaves behind — is a miss, and a miss is always safe because the truth
-    lives upstream.
-  * The two fsyncs that remain are amortised past noticing: sealing a full
-    segment, and committing one large object alongside its own megabytes.
-    Deletions are synced too, because a resurrected key is the one kind of
-    staleness the store can prevent on its own.
-  * Reclaim is **segment-granular** — records are never rewritten, so write
-    amplification is exactly 1.0 and one `unlink` returns a whole segment.
-    Victims come from a bounded sample, so eviction costs the same whether the
-    store holds a thousand files or a million.
-
-Measured against the obvious alternative on the same volume
-(`go test ./internal/blobcache -bench Put`):
-
-| payload | blobcache | file per entry | file per entry + fsync |
-| --- | --- | --- | --- |
-| 512 B | 6.5 µs | 367 µs | 746 µs |
-| 4 KiB | 18 µs | 276 µs | 790 µs |
-| 64 KiB | 125 µs | 459 µs | 1069 µs |
-
-The durability contract is written down where it cannot be missed: a crash may
-lose any subset of recent entries, and the store must never return a payload
-that is not byte-for-byte what was written under that key. The recovery tests
-exist to hold the second half of that sentence — each one damages a store the
-way a particular failure would and checks that what comes back is a subset of
-what went in.
+How to size the volume and the pod for it, and what node disk pressure does:
+[Running on Kubernetes](docs/kubernetes.md#the-object-cache). How the store
+underneath works: [How the cache stores objects](docs/cache-storage.md).
 
 ## Listing fallback
 
@@ -872,13 +835,15 @@ standard `"abcef123"` form, in headers and in XML.
 
 ### Encryption and the cache
 
-The cache stores **decrypted** object bytes. SSE-C protects the object store;
-the cache volume needs protecting on its own terms. The cache directory
-records which key it was written under (as a keyed hash, never the key
-itself), and a start with a different key — or with none — empties it, so a
-changed key cannot look healthy only because the cache still answers for
-objects the store would now refuse to decrypt. Writes made directly to the bucket, even
-with the same key, are still external writes to the cache: keep
+With a cache, SSE-C covers the object store and nothing else. The cache
+stores the **decrypted** bytes, unencrypted on local disk, so the cache volume
+needs protecting on its own terms: see [On disk](#on-disk). The key itself
+never reaches the cache directory.
+
+The cache is emptied at every start, so a restart with a different key, or
+with none, can never look healthy only because the cache still answers for
+objects the store would now refuse to decrypt. Writes made directly to the
+bucket, even with the same key, are still external writes to the cache: keep
 `--cache-max-age` finite when anything else writes.
 
 ## Observability
@@ -973,6 +938,9 @@ docker run --rm -ti \
   -e CREDENTIAL_PEPPER=… \
   aws-s3-reverse-proxy
 ```
+
+For Kubernetes, with a complete manifest and what each part of it is for,
+see [Running on Kubernetes](docs/kubernetes.md).
 
 The available options and help information can be displayed with:
 

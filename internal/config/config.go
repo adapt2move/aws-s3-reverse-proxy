@@ -56,9 +56,11 @@ type Options struct {
 	CacheMaxAge        time.Duration
 	CacheWrites        bool
 	CacheRangeFills    bool
-	CacheSegmentSize   int64
-	CacheInlineMaxSize int64
 	CachePurgeToken    string
+
+	// RetiredCacheFlags names the cache flags that were set although they no
+	// longer do anything, so startup can say so instead of failing on them.
+	RetiredCacheFlags []string
 
 	// Listing fallback. Off unless ListFallback is set, and independent of
 	// the object cache: it holds listings in memory, not objects on disk.
@@ -115,15 +117,19 @@ func Parse() Options {
 	kingpin.Flag("metrics-tenant-label", "add the tenant id as a Prometheus label; tenant count is unbounded, so consider the cardinality first (env - METRICS_TENANT_LABEL)").Envar("METRICS_TENANT_LABEL").Default("false").BoolVar(&opts.TenantMetricLabel)
 	// Caching. One flag turns it on and the rest tune it, so a deployment
 	// that does not want a cache carries none of this.
-	kingpin.Flag("cache-dir", "directory to cache object reads in; empty disables caching entirely (env - CACHE_DIR)").Envar("CACHE_DIR").PlaceHolder("/var/cache/s3proxy").StringVar(&opts.CacheDir)
-	kingpin.Flag("cache-max-bytes", "how much disk the cache may use (env - CACHE_MAX_BYTES)").Envar("CACHE_MAX_BYTES").Default("1073741824").Int64Var(&opts.CacheMaxBytes)
-	kingpin.Flag("cache-max-entries", "how many objects the cache may hold, 0 for no limit; each one costs about 100 bytes of memory (env - CACHE_MAX_ENTRIES)").Envar("CACHE_MAX_ENTRIES").Default("0").IntVar(&opts.CacheMaxEntries)
+	kingpin.Flag("cache-dir", "directory to cache object reads in, unencrypted, emptied at every start; empty disables caching entirely (env - CACHE_DIR)").Envar("CACHE_DIR").PlaceHolder("/var/cache/s3proxy").StringVar(&opts.CacheDir)
+	kingpin.Flag("cache-max-bytes", "the most disk the cache will ever use, writes in progress included (env - CACHE_MAX_BYTES)").Envar("CACHE_MAX_BYTES").Default("1073741824").Int64Var(&opts.CacheMaxBytes)
+	kingpin.Flag("cache-max-entries", "how many objects the cache may hold, 0 for no limit; each one costs about 150 bytes of memory plus its key (env - CACHE_MAX_ENTRIES)").Envar("CACHE_MAX_ENTRIES").Default("0").IntVar(&opts.CacheMaxEntries)
 	kingpin.Flag("cache-max-object-size", "largest object the cache will accept; bigger ones are proxied without being stored (env - CACHE_MAX_OBJECT_SIZE)").Envar("CACHE_MAX_OBJECT_SIZE").Default("67108864").Int64Var(&opts.CacheMaxObjectSize)
 	kingpin.Flag("cache-max-age", "how long a cached object may be served before it is checked against the object store; 0 disables expiry entirely, which assumes this proxy is the only writer (env - CACHE_MAX_AGE)").Envar("CACHE_MAX_AGE").Default("10m").DurationVar(&opts.CacheMaxAge)
 	kingpin.Flag("cache-writes", "also cache the body of an accepted upload, so writing an object leaves it cached (env - CACHE_WRITES)").Envar("CACHE_WRITES").Default("true").BoolVar(&opts.CacheWrites)
 	kingpin.Flag("cache-range-fills", "fetch the whole object in the background when a ranged read misses; without it a client that only reads ranges never fills the cache (env - CACHE_RANGE_FILLS)").Envar("CACHE_RANGE_FILLS").Default("true").BoolVar(&opts.CacheRangeFills)
-	kingpin.Flag("cache-segment-size", "size of the cache's append-only segment files, which is also the granularity it reclaims disk at (env - CACHE_SEGMENT_SIZE)").Envar("CACHE_SEGMENT_SIZE").Default("268435456").Int64Var(&opts.CacheSegmentSize)
-	kingpin.Flag("cache-inline-max-size", "objects up to this size are appended to a shared segment; larger ones get a file of their own (env - CACHE_INLINE_MAX_SIZE)").Envar("CACHE_INLINE_MAX_SIZE").Default("1048576").Int64Var(&opts.CacheInlineMaxSize)
+	// Retired with the segment files they sized: the cache keeps one file
+	// per object now. Still accepted, so a deployment that sets them keeps
+	// starting, and reported at startup so it can drop them.
+	var segmentSize, inlineMaxSize string
+	kingpin.Flag("cache-segment-size", "no effect; the cache keeps one file per object (env - CACHE_SEGMENT_SIZE)").Envar("CACHE_SEGMENT_SIZE").Hidden().StringVar(&segmentSize)
+	kingpin.Flag("cache-inline-max-size", "no effect; the cache keeps one file per object (env - CACHE_INLINE_MAX_SIZE)").Envar("CACHE_INLINE_MAX_SIZE").Hidden().StringVar(&inlineMaxSize)
 
 	// The listing fallback trades consistency for availability during an
 	// outage, so it is never on unless somebody asked for it.
@@ -140,6 +146,12 @@ func Parse() Options {
 	kingpin.Flag("shutdown-timeout", "how long to wait for in-flight requests to finish on shutdown (env - SHUTDOWN_TIMEOUT)").Envar("SHUTDOWN_TIMEOUT").Default("30s").DurationVar(&opts.ShutdownTimeout)
 	kingpin.Flag("shutdown-delay", "how long to keep serving after /readyz starts failing, so a load balancer can stop routing first (env - SHUTDOWN_DELAY)").Envar("SHUTDOWN_DELAY").Default("0s").DurationVar(&opts.ShutdownDelay)
 	kingpin.Parse()
+	if segmentSize != "" {
+		opts.RetiredCacheFlags = append(opts.RetiredCacheFlags, "--cache-segment-size")
+	}
+	if inlineMaxSize != "" {
+		opts.RetiredCacheFlags = append(opts.RetiredCacheFlags, "--cache-inline-max-size")
+	}
 	return opts
 }
 

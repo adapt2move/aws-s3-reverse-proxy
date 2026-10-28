@@ -127,10 +127,11 @@ start_proxy() {
   return 1
 }
 
-# The caching variant needs to be restartable with its cache intact, which is
-# how the suite checks that a restart recovers rather than starts cold. The
-# script this writes is what the test runs; keeping the launch in one place
-# means the restarted proxy cannot drift from the original.
+# The caching variant needs to be restartable on the same cache directory,
+# which is how the suite checks that a restart discards what the previous
+# process left there. The script this writes is what the test runs; keeping
+# the launch in one place means the restarted proxy cannot drift from the
+# original.
 start_cache_proxy() {
   local name=$1 policy=$2 api=$3 admin=$4 dir=$5
   mkdir -p "$dir"
