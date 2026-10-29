@@ -18,7 +18,7 @@ import (
 	"github.com/Kriechi/aws-s3-reverse-proxy/internal/ssec"
 )
 
-// copyRequest is the CopyObject the fleet-insights WebUI sends: a PUT of the
+// copyRequest is the CopyObject a typical SDK client sends: a PUT of the
 // destination naming the source, with no body and nothing else.
 func copyRequest(tenant, level, source, destination string) clientRequest {
 	req := clientRequest{method: http.MethodPut, target: "/bucket/" + destination, tenant: tenant, level: level}
