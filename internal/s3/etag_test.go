@@ -75,6 +75,20 @@ func TestNormalizeConditionHeaders(t *testing.T) {
 	assert.Equal(t, date, NormalizeIfRange(date), "an If-Range date is not an entity tag")
 }
 
+func TestWriteIfMatchPreservesBareValues(t *testing.T) {
+	cases := []struct{ raw, want string }{
+		{` abc `, `abc`},
+		{`"abc"`, `"abc"`},
+		{`"'abc'"`, `"abc"`},
+		{`W/"'abc'"`, `W/"abc"`},
+		{` * `, `*`},
+		{`ABC-12, "'def'", W/"ghi", "j,k"`, `ABC-12, "def", W/"ghi", "j,k"`},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, NormalizeWriteIfMatch(tc.raw), tc.raw)
+	}
+}
+
 func TestXMLETags(t *testing.T) {
 	response := []byte(`<ListPartsResult><Part><PartNumber>1</PartNumber><ETag>&#34;&#39;abc&#39;&#34;</ETag></Part>` +
 		`<Part><PartNumber>2</PartNumber><ETag>&quot;def&quot;</ETag></Part></ListPartsResult>`)

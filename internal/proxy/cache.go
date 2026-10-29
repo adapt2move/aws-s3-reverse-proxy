@@ -188,8 +188,9 @@ func (h *Handler) replayCachedResponse(w http.ResponseWriter, r *http.Request, e
 	// because net/http already knows not to write one.
 	//
 	// It compares the client's validators against the stored ETag, so they
-	// get the same normalization a forwarded request does. The client's
-	// signature was verified already; this copy is only ever compared.
+	// use standard HTTP syntax even when the client sent a bare value for
+	// its upstream. The signature was verified already; this copy is only
+	// ever compared.
 	http.ServeContent(w, withCanonicalConditions(r), "", cachedModTime(entry), entry.Body())
 }
 
@@ -200,19 +201,18 @@ func withCanonicalConditions(r *http.Request) *http.Request {
 		return r
 	}
 	clone := r.Clone(r.Context())
-	canonicalizeConditions(clone.Header)
+	normalizeConditions(clone.Header, s3.NormalizeETagList)
 	return clone
 }
 
-// canonicalizeConditions rewrites the entity tags in a request's conditional
-// headers into standard syntax, so a validator a client copied out of a
-// malformed upstream header — `"'abc'"` — is sent as the `"abc"` the store
-// accepts.
-func canonicalizeConditions(header http.Header) {
-	for _, name := range []string{"If-Match", "If-None-Match"} {
-		if v := header.Get(name); v != "" {
-			header.Set(name, s3.NormalizeETagList(v))
-		}
+// normalizeConditions uses standard HTTP validators except for write
+// If-Match, whose normalization preserves deliberately bare values.
+func normalizeConditions(header http.Header, normalizeMatch func(string) string) {
+	if v := header.Get("If-Match"); v != "" {
+		header.Set("If-Match", normalizeMatch(v))
+	}
+	if v := header.Get("If-None-Match"); v != "" {
+		header.Set("If-None-Match", s3.NormalizeETagList(v))
 	}
 	if v := header.Get("If-Range"); v != "" {
 		header.Set("If-Range", s3.NormalizeIfRange(v))

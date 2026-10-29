@@ -819,7 +819,7 @@ the value with any matching surrounding quotes removed, however nested. At
 least one object store answers `ETag: "'abcef123'"` and then refuses that same
 value, single quotes included, as a precondition or in a part list.
 
-| Received | Canonical | Sent as an HTTP validator | Sent in a part list |
+| Received | Canonical | Sent in an ETag response header | Sent in a part list |
 | --- | --- | --- | --- |
 | `abcef123` | `abcef123` | `"abcef123"` | `abcef123` |
 | `"abcef123"` | `abcef123` | `"abcef123"` | `abcef123` |
@@ -831,7 +831,12 @@ multipart `-N` suffix are left alone, and an ETag is never taken for the MD5
 of the bytes (under SSE-C it is not). Cache freshness checks, replayed
 validators, client conditions forwarded upstream, multipart completions and
 the repair's preconditions all use the canonical value; clients receive the
-standard `"abcef123"` form, in headers and in XML.
+standard `"abcef123"` form, in headers and in XML. For `PutObject` and
+`CompleteMultipartUpload`, forwarded `If-Match` conditions preserve values a
+client sent without quotes. Ceph RGW requires a bare `If-Match` on writes;
+quoting it would cause `412` even when the stored ETag matches. Quoted
+conditions still have malformed wrappers removed. Reads, including local
+cache comparisons, continue to use standard HTTP validators.
 
 ### Encryption and the cache
 

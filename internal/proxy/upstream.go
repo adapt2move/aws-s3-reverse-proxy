@@ -58,10 +58,13 @@ func (h *Handler) buildUpstreamRequest(req *http.Request, st *requestState) (*ht
 			proxyReq.Header[http.CanonicalHeaderKey(name)] = values
 		}
 	}
-	// Past authentication, the forwarded copy is ours to spell: entity tags
-	// in the client's conditions go upstream in standard syntax, never with
-	// the single-quote wrappers some stores put around them.
-	canonicalizeConditions(proxyReq.Header)
+	// Remove malformed quote wrappers, but preserve deliberately bare
+	// conditions: Ceph RGW requires a bare If-Match on writes.
+	normalizeMatch := s3.NormalizeETagList
+	if st.operation.Kind == s3.PutObject || st.operation.Kind == s3.CompleteMultipartUpload {
+		normalizeMatch = s3.NormalizeWriteIfMatch
+	}
+	normalizeConditions(proxyReq.Header, normalizeMatch)
 	if st.mutation != nil {
 		// What the client says about the object it is uploading is what a
 		// later read of it should report back, so it is kept from the
