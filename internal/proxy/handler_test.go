@@ -162,8 +162,10 @@ func TestUnsupportedOperationsAreRefused(t *testing.T) {
 		target  string
 		headers http.Header
 	}{
-		{"copy source", http.MethodPut, "/bucket/workspaces/a/copy.txt",
-			http.Header{"X-Amz-Copy-Source": {"/bucket/workspaces/a/orig.txt"}}},
+		{"copy replacing metadata", http.MethodPut, "/bucket/workspaces/a/copy.txt",
+			http.Header{"X-Amz-Copy-Source": {"/bucket/workspaces/a/orig.txt"}, "X-Amz-Metadata-Directive": {"REPLACE"}}},
+		{"upload part copy", http.MethodPut, "/bucket/workspaces/a/copy.txt?partNumber=1&uploadId=u",
+			http.Header{"X-Amz-Copy-Source": {"/bucket/workspaces/a/orig.txt"}, "X-Amz-Copy-Source-Range": {"bytes=0-9"}}},
 		{"bucket acl", http.MethodGet, "/bucket?acl", nil},
 		{"bucket policy", http.MethodPut, "/bucket?policy", nil},
 		{"bucket versioning", http.MethodGet, "/bucket?versioning", nil},

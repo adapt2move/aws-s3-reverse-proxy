@@ -147,7 +147,7 @@ func (h *Handler) serveConditionalPutOverPlaintext(w http.ResponseWriter, proxyR
 	if proxyReq.ContentLength > 0 {
 		body = proxyReq.Body
 	}
-	part, err := r.send(ctx, http.MethodPut, &target, url.Values{"partNumber": {"1"}, "uploadId": {uploadID}}.Encode(),
+	part, err := r.h.send(ctx, http.MethodPut, &target, url.Values{"partNumber": {"1"}, "uploadId": {uploadID}}.Encode(),
 		body, proxyReq.ContentLength, payloadHash, partHeader)
 	if err != nil {
 		logger.WithError(err).Warn("a conditional write onto a plaintext object could not upload its body")
@@ -177,7 +177,7 @@ func (h *Handler) serveConditionalPutOverPlaintext(w http.ResponseWriter, proxyR
 	// From here the object may change, and until the answer is read whether
 	// it did is not known.
 	st.writeSettled = false
-	resp, err := r.send(finish, http.MethodPost, &target, url.Values{"uploadId": {uploadID}}.Encode(),
+	resp, err := r.h.send(finish, http.MethodPost, &target, url.Values{"uploadId": {uploadID}}.Encode(),
 		bytes.NewReader(list.Bytes()), int64(list.Len()), payloadSHA256(list.Bytes()), conditions)
 	if err != nil {
 		logger.WithError(err).Warn("a conditional write onto a plaintext object could not complete its upload")

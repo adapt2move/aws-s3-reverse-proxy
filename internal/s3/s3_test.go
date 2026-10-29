@@ -105,8 +105,8 @@ func TestClassify(t *testing.T) {
 		// request into an operation it is not.
 		{name: "the marker never decides the operation", method: http.MethodPatch, target: "/b/a/x.csv?x-id=PutObject", wantErr: ErrUnsupportedOperation},
 
-		{name: "copy source", method: http.MethodPut, target: "/b/a/x.csv",
-			headers: http.Header{"X-Amz-Copy-Source": {"/b/a/y.csv"}}, wantErr: ErrUnsupportedOperation},
+		{name: "copy object", method: http.MethodPut, target: "/b/a/x.csv",
+			headers: http.Header{"X-Amz-Copy-Source": {"/b/a/y.csv"}}, want: CopyObject},
 		{name: "presigned", method: http.MethodGet, target: "/b/a/x.csv?X-Amz-Signature=deadbeef", wantErr: ErrUnsupportedOperation},
 		{name: "bucket acl", method: http.MethodGet, target: "/b?acl", wantErr: ErrUnsupportedOperation},
 		{name: "head bucket", method: http.MethodHead, target: "/b", want: HeadBucket},
@@ -358,4 +358,107 @@ func TestSanitizeErrorDocument(t *testing.T) {
 	for _, other := range []string{"not xml at all", `<ListBucketResult><Key>k</Key></ListBucketResult>`} {
 		assert.Equal(t, other, string(SanitizeErrorDocument([]byte(other))), "only an <Error> document is rebuilt")
 	}
+}
+
+// A copy names a second key, so its source is held to everything the request
+// key is — and to the one shape the proxy carries out: a whole object, within
+// the bucket, keeping its metadata.
+func TestClassifyCopy(t *testing.T) {
+	accepted := []struct {
+		name, source, wantKey string
+		headers               http.Header
+	}{
+		{name: "leading slash", source: "/b/a/y.csv", wantKey: "a/y.csv"},
+		{name: "no leading slash", source: "b/a/y.csv", wantKey: "a/y.csv"},
+		{name: "encoded slashes", source: "/b/a%2Fy.csv", wantKey: "a/y.csv"},
+		{name: "encoded space and unicode", source: "b/a/my%20f%C3%BCle.csv", wantKey: "a/my füle.csv"},
+		{name: "plus is literal", source: "b/a/x+y.csv", wantKey: "a/x+y.csv"},
+		{name: "explicit COPY directive", source: "b/a/y.csv", wantKey: "a/y.csv",
+			headers: http.Header{"X-Amz-Metadata-Directive": {"COPY"}}},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/b/a/x.csv?x-id=CopyObject", nil)
+			req.Header.Set("X-Amz-Copy-Source", tc.source)
+			for name, values := range tc.headers {
+				req.Header[name] = values
+			}
+			op, err := Classify(req)
+			require.NoError(t, err)
+			assert.Equal(t, CopyObject, op.Kind)
+			assert.Equal(t, "a/x.csv", op.Key)
+			assert.Equal(t, tc.wantKey, op.SourceKey)
+		})
+	}
+
+	refused := []struct {
+		name, method, target, source string
+		headers                      http.Header
+		body                         string
+		wantErr                      error
+	}{
+		{name: "another bucket", source: "/other/a/y.csv", wantErr: ErrUnsupportedOperation},
+		{name: "encoded bucket separator", source: "/b%2Fa/y.csv", wantErr: ErrUnsupportedOperation},
+		{name: "no key", source: "/b", wantErr: ErrInvalidKey},
+		{name: "empty", source: "", wantErr: ErrUnsupportedOperation},
+		{name: "version", source: "/b/a/y.csv?versionId=3", wantErr: ErrUnsupportedOperation},
+		{name: "access point", source: "arn:aws:s3:eu-central-1:1:accesspoint/ap/object/a/y.csv", wantErr: ErrUnsupportedOperation},
+		{name: "traversal", source: "/b/a/../../x.csv", wantErr: ErrInvalidKey},
+		{name: "encoded traversal", source: "/b/a/%2E%2E/%2E%2E/x.csv", wantErr: ErrInvalidKey},
+		{name: "encoded slash traversal", source: "/b/a%2F..%2F..%2Fx.csv", wantErr: ErrInvalidKey},
+		{name: "double-encoded traversal", source: "/b/a/%252e%252e/x.csv", wantErr: ErrInvalidKey},
+		{name: "double-encoded slash", source: "/b/a%252F..%252Fx.csv", wantErr: ErrInvalidKey},
+		{name: "absolute key", source: "/b//etc/passwd", wantErr: ErrInvalidKey},
+		{name: "empty segment", source: "/b/a//y.csv", wantErr: ErrInvalidKey},
+		{name: "control character", source: "/b/a/y%0A.csv", wantErr: ErrInvalidKey},
+		{name: "malformed encoding", source: "/b/a/y%zz.csv", wantErr: ErrInvalidKey},
+		{name: "onto itself", source: "/b/a/x.csv", wantErr: ErrUnsupportedOperation},
+		{name: "replace metadata", source: "/b/a/y.csv",
+			headers: http.Header{"X-Amz-Metadata-Directive": {"REPLACE"}}, wantErr: ErrUnsupportedOperation},
+		{name: "tagging directive", source: "/b/a/y.csv",
+			headers: http.Header{"X-Amz-Tagging-Directive": {"COPY"}}, wantErr: ErrUnsupportedOperation},
+		{name: "source condition", source: "/b/a/y.csv",
+			headers: http.Header{"X-Amz-Copy-Source-If-Match": {`"abc"`}}, wantErr: ErrUnsupportedOperation},
+		{name: "destination condition", source: "/b/a/y.csv",
+			headers: http.Header{"If-None-Match": {"*"}}, wantErr: ErrUnsupportedOperation},
+		{name: "source range", source: "/b/a/y.csv",
+			headers: http.Header{"X-Amz-Copy-Source-Range": {"bytes=0-9"}}, wantErr: ErrUnsupportedOperation},
+		{name: "two sources", source: "/b/a/y.csv",
+			headers: http.Header{"X-Amz-Copy-Source": {"/b/a/y.csv", "/b/a/z.csv"}}, wantErr: ErrUnsupportedOperation},
+		{name: "a body", source: "/b/a/y.csv", body: "x", wantErr: ErrUnsupportedOperation},
+		{name: "upload part copy", target: "/b/a/x.csv?partNumber=1&uploadId=u", source: "/b/a/y.csv", wantErr: ErrUnsupportedOperation},
+		{name: "on a POST", method: http.MethodPost, target: "/b/a/x.csv?uploads", source: "/b/a/y.csv", wantErr: ErrUnsupportedOperation},
+		{name: "on the bucket", target: "/b", source: "/b/a/y.csv", wantErr: ErrUnsupportedOperation},
+		{name: "a client key for the source", source: "/b/a/y.csv",
+			headers: http.Header{"X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key": {"k"}}, wantErr: ErrCustomerKey},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			method, target := tc.method, tc.target
+			if method == "" {
+				method = http.MethodPut
+			}
+			if target == "" {
+				target = "/b/a/x.csv"
+			}
+			var body io.Reader
+			if tc.body != "" {
+				body = strings.NewReader(tc.body)
+			}
+			req := httptest.NewRequest(method, target, body)
+			req.Header.Set("X-Amz-Copy-Source", tc.source)
+			for name, values := range tc.headers {
+				req.Header[name] = values
+			}
+			_, err := Classify(req)
+			require.ErrorIs(t, err, tc.wantErr)
+		})
+	}
+
+	t.Run("a directive without a copy", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, "/b/a/x.csv", nil)
+		req.Header.Set("X-Amz-Metadata-Directive", "COPY")
+		_, err := Classify(req)
+		require.ErrorIs(t, err, ErrUnsupportedOperation)
+	})
 }

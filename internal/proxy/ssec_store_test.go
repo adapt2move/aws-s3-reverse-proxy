@@ -595,7 +595,7 @@ func storedHeaders(header http.Header) http.Header {
 	for name, values := range header {
 		switch {
 		case name == "Content-Type", name == "Content-Encoding", name == "Content-Disposition",
-			name == "Content-Language", name == "Cache-Control", strings.HasPrefix(name, "X-Amz-Meta-"):
+			name == "Content-Language", name == "Cache-Control", name == "Expires", strings.HasPrefix(name, "X-Amz-Meta-"):
 			out[name] = values
 		}
 	}

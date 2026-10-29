@@ -362,6 +362,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if st.operation.Kind == s3.CopyObject {
+		h.serveCopy(rec, proxyReq.WithContext(r.Context()), st)
+		h.access.Finish(entry, rec.Status(), time.Since(start))
+		return
+	}
+
 	if h.serveConditionalPutOverPlaintext(rec, proxyReq, st) {
 		h.access.Finish(entry, rec.Status(), time.Since(start))
 		return
@@ -405,7 +411,7 @@ func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, entry *observa
 		return nil, nil, err
 	}
 	entry.Operation = string(op.Kind)
-	entry.Key = op.Key
+	entry.Key, entry.SourceKey = op.Key, op.SourceKey
 	if op.Kind == s3.ListObjects {
 		entry.Key = op.ListPrefix
 	}
@@ -441,16 +447,22 @@ func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, entry *observa
 		// caller is the whole check. The bucket is shared by every tenant,
 		// so that it exists is not any one tenant's to hide.
 		entry.Allowed = true
+	case op.Kind == s3.CopyObject:
+		// Two keys, two decisions: reading the source and writing the
+		// destination, each under its own rule. The access log names the
+		// rule that refused, or the destination's when both allow.
+		if err := h.authorize(w, entry, current, identity, op.SourceKey, http.MethodGet); err != nil {
+			return nil, nil, err
+		}
+		if err := h.authorize(w, entry, current, identity, op.Key, http.MethodPut); err != nil {
+			return nil, nil, err
+		}
 	default:
 		subject := op.Key
 		if op.Kind == s3.ListObjects {
 			subject = op.ListPrefix
 		}
-		decision := current.AuthorizeIdentity(identity, subject, r.Method)
-		entry.Rule, entry.Allowed = decision.Rule, decision.Allowed
-		if !decision.Allowed {
-			err := fmt.Errorf("policy denies %s on %q for level %q", r.Method, subject, identity.Level)
-			h.reject(w, entry, http.StatusForbidden, "AccessDenied", err)
+		if err := h.authorize(w, entry, current, identity, subject, r.Method); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -500,6 +512,19 @@ func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, entry *observa
 		return nil, nil, err
 	}
 	return proxyReq, st, nil
+}
+
+// authorize decides one key for one method, records the decision on the
+// access log, and answers the request when it is refused.
+func (h *Handler) authorize(w http.ResponseWriter, entry *observability.AccessLog, current *policy.Policy, identity *policy.Identity, subject, method string) error {
+	decision := current.AuthorizeIdentity(identity, subject, method)
+	entry.Rule, entry.Allowed = decision.Rule, decision.Allowed
+	if !decision.Allowed {
+		err := fmt.Errorf("policy denies %s on %q for level %q", method, subject, identity.Level)
+		h.reject(w, entry, http.StatusForbidden, "AccessDenied", err)
+		return err
+	}
+	return nil
 }
 
 // reject answers a refused request. The body is an S3-shaped error so SDK

@@ -363,10 +363,10 @@ never touch the file except when told to.
     `/`, percent-encoded (and doubly percent-encoded) traversal and empty keys
     are **rejected**, not silently normalized.
   * Anything not explicitly handled is `403`. The set of understood operations
-    is a whitelist, which is how `x-amz-copy-source` (it names a second key
-    that would otherwise bypass authorization) and every bucket-level
-    administrative call (`?acl`, `?policy`, `?versioning`, `?lifecycle`,
-    `?tagging`, bucket create/delete, …) are refused without enumerating them.
+    is a whitelist, which is how every bucket-level administrative call
+    (`?acl`, `?policy`, `?versioning`, `?lifecycle`, `?tagging`, bucket
+    create/delete, …) is refused without enumerating them.
+  * `CopyObject` is authorized on **both** keys — see [CopyObject](#copyobject).
   * The AWS SDKs' `?x-id=<Operation>` marker is dropped before a request is
     classified. It is the query-string twin of the telemetry headers below —
     it describes what the SDK believes it is sending, instructs nothing, and
@@ -396,6 +396,41 @@ never touch the file except when told to.
     query-string (presigned) requests are `403`.
   * `X-Amz-Date` skew tolerance is bounded and configurable, which is what
     stops a captured signature from being replayed indefinitely.
+
+## CopyObject
+
+`PUT /bucket/<destination>` with `x-amz-copy-source: [/]bucket/<url-encoded
+source>` copies an object within the bucket. It is never forwarded as a
+native copy: the proxy reads the source and writes the destination itself,
+streaming, so the same path works with and without an
+[SSE-C key](#upstream-encryption-sse-c) — and with a key on stores that do not
+support SSE-C copy sources (Hetzner).
+
+  * **Authorization.** The source is decoded once and held to the same key
+    rules as any other key (no `..`, no empty or leading-slash segments, no
+    doubly-encoded traversal). Both keys get the tenant prefix injected. The
+    caller needs `read` on the source and `full` on the destination, each
+    under its own rule; the global credential needs `full`. Read-only mode
+    refuses it.
+  * **Execution.** `GET` of the source, exactly as a client's read: decrypted
+    under the key, a legacy plaintext object served (and, with repair on,
+    scheduled for repair) like any read. Then `PUT` of the destination with
+    the key, carrying the source's `Content-Type`, `Content-Encoding`,
+    `Content-Disposition`, `Content-Language`, `Cache-Control`, `Expires` and
+    `x-amz-meta-*`. The source's local cache entry is not used.
+  * **Answer.** `200` with a `CopyObjectResult` (the new ETag, and the store's
+    acceptance time as `LastModified`). A missing source is `404 NoSuchKey`;
+    other upstream errors are passed on like any other operation's. Sources
+    over 5 GiB are refused, as S3 refuses them for a single-request copy.
+  * **Caches.** The destination is invalidated, and filled with
+    `--cache-writes`, exactly as for a `PutObject`; listings that cover it
+    are dropped.
+  * **Refused** (`403`): another bucket, `?versionId=`, an
+    `x-amz-metadata-directive` other than `COPY`, `x-amz-tagging-directive`,
+    `x-amz-copy-source-if-*` and `x-amz-copy-source-range` (UploadPartCopy),
+    `Range` or `If-*` conditions, a request body, and a copy onto its own
+    source. Content headers and `x-amz-meta-*` sent with the copy are ignored,
+    as S3 ignores them under `COPY`.
 
 ## Runtime behaviour
 
@@ -447,7 +482,7 @@ cached survives a restart. See [On disk](#on-disk).
 | --- | --- |
 | `GetObject`, `HeadObject` | served from the cache, and stored on the way past. A `HEAD` is answered out of a cached `GET`. |
 | Ranged reads | answered from a cached object, Range arithmetic and all — including after a revalidation. A ranged **miss** is proxied straight through and the whole object is fetched in the background, see below. |
-| `PutObject` | invalidates the object, and with `--cache-writes` the uploaded body is kept, so writing an object leaves it cached. |
+| `PutObject`, `CopyObject` | invalidates the object, and with `--cache-writes` the written body is kept, so writing an object leaves it cached. |
 | `DeleteObject`, `DeleteObjects`, `CompleteMultipartUpload` | invalidate every key they touch. |
 | `ListObjectsV2` | **never answered from the cache.** A listing always goes to the object store; see [Listing fallback](#listing-fallback) for the outage case. |
 | Multipart parts | not cached. The object does not exist until the upload is completed, and completing it invalidates the key. |
@@ -708,6 +743,7 @@ objects written with it are unreadable — by this proxy and by anybody else.
 | `GetObject`, `HeadObject`, `PutObject` | key |
 | `CreateMultipartUpload`, `UploadPart` | key (S3 requires it on every part) |
 | `CompleteMultipartUpload`, `ListParts` | key (AWS needs it there for uploads with checksums, and accepts it otherwise) |
+| `CopyObject` | key on both halves: it is a `GetObject` of the source and a `PutObject` of the destination |
 | `AbortMultipartUpload`, `DeleteObject(s)`, `ListObjects` | no key |
 
 The cache's own requests (the freshness `HEAD` of an expired entry, the
@@ -905,6 +941,8 @@ level=warning msg="request denied" tenant=1f0c… access_level=ro operation=PutO
 uses `level` for the severity of the line itself.) With a cache configured,
 every line also carries `cache=hit|revalidated|stale|miss|bypass`, which is
 what turns "the hit rate dropped" into a list of the requests that missed.
+A `CopyObject` line also names the key it read as `source_key`; `key` is the
+one it wrote.
 
 No credentials, signatures or `Authorization` header content appear in logs or
 in metric labels, at any verbosity. The tenant id is available as a metric
@@ -939,8 +977,10 @@ second cost a transfer.
   * Any credential store or per-tenant configuration — identity stays derived.
   * Presigned-URL support; clients that need it should address the object store
     directly.
-  * `CopyObject`, client-provided SSE-C keys, key rotation, per-tenant keys,
-    and a bulk migration of plaintext objects to the SSE-C key.
+  * Client-provided SSE-C keys, key rotation, per-tenant keys, and a bulk
+    migration of plaintext objects to the SSE-C key.
+  * `UploadPartCopy`, copies across buckets or of a version, and `CopyObject`
+    with `REPLACE` metadata or conditions.
   * Bucket-level administration through the proxy.
   * Answering listings from a cache while the object store is up. The
     [listing fallback](#listing-fallback) only answers when it does not.
@@ -1011,6 +1051,8 @@ $ AWS_ACCESS_KEY_ID=$TENANT$LEVEL AWS_SECRET_ACCESS_KEY=$DERIVED \
   * client secrets derived from a deployment-wide pepper — no credential store
   * tenant key prefix injected by the proxy, stripped back out of responses
   * per-key authorization for batch deletes, with S3-shaped per-key results
+  * `CopyObject` authorized on both keys and carried out as a streamed read
+    and write, so it works under the SSE-C key on any store
   * limits access based on source IP, subnet and endpoint URL
   * streaming bodies with explicit caps on the two paths that must buffer
   * optional local disk cache for object reads, with ranged reads served from

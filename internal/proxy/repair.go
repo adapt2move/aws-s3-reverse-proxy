@@ -579,7 +579,7 @@ func (r *repairer) rewrite(ctx context.Context, target *url.URL, st *requestStat
 func (r *repairer) createUpload(ctx context.Context, target *url.URL, preserved http.Header) (string, error) {
 	header := preserved.Clone()
 	r.h.cfg.UpstreamSSECKey.Apply(header)
-	resp, err := r.send(ctx, http.MethodPost, target, "uploads", nil, 0, sigv4.EmptyPayloadSHA256, header)
+	resp, err := r.h.send(ctx, http.MethodPost, target, "uploads", nil, 0, sigv4.EmptyPayloadSHA256, header)
 	if err != nil {
 		return "", err
 	}
@@ -666,7 +666,7 @@ func (r *repairer) uploadParts(ctx context.Context, target *url.URL, uploadID st
 		// UNSIGNED-PAYLOAD rather than a digest, because a digest would mean
 		// reading the part twice — once to hash it — and so holding it in
 		// memory. The connection is TLS, which SSE-C requires anyway.
-		resp, err := r.send(ctx, http.MethodPut, target, query, body, length, sigv4.UnsignedPayload, header)
+		resp, err := r.h.send(ctx, http.MethodPut, target, query, body, length, sigv4.UnsignedPayload, header)
 		if err != nil {
 			return nil, err
 		}
@@ -707,7 +707,7 @@ func (r *repairer) completeUpload(ctx context.Context, target *url.URL, uploadID
 	body := b.Bytes()
 
 	header := http.Header{"If-Match": {s3.FormatETag(etag, false)}, "Content-Type": {"application/xml"}}
-	resp, err := r.send(ctx, http.MethodPost, target, url.Values{"uploadId": {uploadID}}.Encode(),
+	resp, err := r.h.send(ctx, http.MethodPost, target, url.Values{"uploadId": {uploadID}}.Encode(),
 		bytes.NewReader(body), int64(len(body)), payloadSHA256(body), header)
 	if err != nil {
 		return err
@@ -745,7 +745,7 @@ func (r *repairer) completeUpload(ctx context.Context, target *url.URL, uploadID
 func (r *repairer) abortUpload(target *url.URL, uploadID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), abortTimeout)
 	defer cancel()
-	resp, err := r.send(ctx, http.MethodDelete, target, url.Values{"uploadId": {uploadID}}.Encode(), nil, 0, sigv4.EmptyPayloadSHA256, nil)
+	resp, err := r.h.send(ctx, http.MethodDelete, target, url.Values{"uploadId": {uploadID}}.Encode(), nil, 0, sigv4.EmptyPayloadSHA256, nil)
 	if err != nil {
 		log.WithError(err).Warn("could not abort the multipart upload of an abandoned encryption repair")
 		return
@@ -761,7 +761,7 @@ func (r *repairer) abortUpload(target *url.URL, uploadID string) {
 func (r *repairer) verify(ctx context.Context, target *url.URL, st *requestState) {
 	header := http.Header{}
 	r.h.cfg.UpstreamSSECKey.Apply(header)
-	resp, err := r.send(ctx, http.MethodHead, target, "", nil, 0, sigv4.EmptyPayloadSHA256, header)
+	resp, err := r.h.send(ctx, http.MethodHead, target, "", nil, 0, sigv4.EmptyPayloadSHA256, header)
 	if err != nil {
 		return
 	}
@@ -771,8 +771,9 @@ func (r *repairer) verify(ctx context.Context, target *url.URL, st *requestState
 	}
 }
 
-// send builds, signs and sends one request of a repair.
-func (r *repairer) send(ctx context.Context, method string, target *url.URL, rawQuery string, body io.Reader, length int64, payloadHash string, header http.Header) (*http.Response, error) {
+// upstreamRequest builds and signs one request the proxy makes on its own
+// behalf: a repair's, or one half of a copy.
+func (h *Handler) upstreamRequest(ctx context.Context, method string, target *url.URL, rawQuery string, body io.Reader, length int64, payloadHash string, header http.Header) (*http.Request, error) {
 	u := *target
 	u.RawQuery = rawQuery
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
@@ -787,10 +788,19 @@ func (r *repairer) send(ctx context.Context, method string, target *url.URL, raw
 		req.Header[http.CanonicalHeaderKey(name)] = values
 	}
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
-	if err := r.h.cfg.UpstreamSigner.Sign(req, r.h.cfg.UpstreamRegion, time.Now()); err != nil {
+	if err := h.cfg.UpstreamSigner.Sign(req, h.cfg.UpstreamRegion, time.Now()); err != nil {
 		return nil, err
 	}
-	return r.h.transport.RoundTrip(req)
+	return req, nil
+}
+
+// send is upstreamRequest, sent straight to the object store.
+func (h *Handler) send(ctx context.Context, method string, target *url.URL, rawQuery string, body io.Reader, length int64, payloadHash string, header http.Header) (*http.Response, error) {
+	req, err := h.upstreamRequest(ctx, method, target, rawQuery, body, length, payloadHash, header)
+	if err != nil {
+		return nil, err
+	}
+	return h.transport.RoundTrip(req)
 }
 
 // objectACL is an object's access control list, reduced to what decides
@@ -822,7 +832,7 @@ func (a *objectACL) equal(b *objectACL) bool {
 // silently dropped, so such an object is left as it is. MinIO has no object
 // ACLs, and answers with exactly the default.
 func (r *repairer) readACL(ctx context.Context, target *url.URL) (*objectACL, string) {
-	resp, err := r.send(ctx, http.MethodGet, target, "acl", nil, 0, sigv4.EmptyPayloadSHA256, nil)
+	resp, err := r.h.send(ctx, http.MethodGet, target, "acl", nil, 0, sigv4.EmptyPayloadSHA256, nil)
 	if err != nil {
 		return nil, "its access control list could not be read: " + err.Error()
 	}
@@ -855,7 +865,7 @@ func (r *repairer) readACL(ctx context.Context, target *url.URL) (*objectACL, st
 func (r *repairer) uploadOwner(ctx context.Context, target *url.URL, uploadID string) (string, error) {
 	header := http.Header{}
 	r.h.cfg.UpstreamSSECKey.Apply(header)
-	resp, err := r.send(ctx, http.MethodGet, target, url.Values{"uploadId": {uploadID}}.Encode(), nil, 0, sigv4.EmptyPayloadSHA256, header)
+	resp, err := r.h.send(ctx, http.MethodGet, target, url.Values{"uploadId": {uploadID}}.Encode(), nil, 0, sigv4.EmptyPayloadSHA256, header)
 	if err != nil {
 		return "", err
 	}

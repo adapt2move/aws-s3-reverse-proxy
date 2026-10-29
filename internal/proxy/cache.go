@@ -79,7 +79,7 @@ func upstreamKeyFor(bucket, prefixedKey string) string {
 // the upload is completed — and neither does abandoning one.
 func mutatesObject(kind s3.Kind) bool {
 	switch kind {
-	case s3.PutObject, s3.DeleteObject, s3.CompleteMultipartUpload:
+	case s3.PutObject, s3.CopyObject, s3.DeleteObject, s3.CompleteMultipartUpload:
 		return true
 	}
 	return false
@@ -470,7 +470,7 @@ func (h *Handler) captureUpload(st *requestState, contentLength int64) *cache.Wr
 	if h.cfg.Cache == nil || !h.cfg.CacheWrites || st.mutation == nil {
 		return nil
 	}
-	if st.operation.Kind != s3.PutObject {
+	if st.operation.Kind != s3.PutObject && st.operation.Kind != s3.CopyObject {
 		return nil
 	}
 	if contentLength <= 0 || contentLength > h.cfg.Cache.MaxObjectSize() {
