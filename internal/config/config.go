@@ -47,6 +47,10 @@ type Options struct {
 	PolicyFile           string
 	PolicyReloadInterval time.Duration
 
+	// GlobalAccessPermission is what the global credential may do: "read" or
+	// "full". It only means something once the credential itself is set.
+	GlobalAccessPermission string
+
 	// Cache. The whole feature is off unless CacheDir is set, and every
 	// field below is ignored while it is empty.
 	CacheDir           string
@@ -85,6 +89,12 @@ type Options struct {
 	UpstreamSecretAccessKey string
 	Pepper                  []byte
 
+	// GlobalAccessKeyID and GlobalSecretAccessKey are the operator's
+	// general-access credential. Both empty — the default — means there is
+	// none, and every request is a tenant's.
+	GlobalAccessKeyID     string
+	GlobalSecretAccessKey string
+
 	// UpstreamSSECKey is the customer key every object is encrypted with
 	// upstream. Nil — no key configured — leaves upstream encryption alone.
 	UpstreamSSECKey *ssec.Key
@@ -102,6 +112,7 @@ func Parse() Options {
 	kingpin.Flag("allowed-source-subnet", "allowed source IP addresses with netmask (env - ALLOWED_SOURCE_SUBNET)").Default("127.0.0.1/32").Envar("ALLOWED_SOURCE_SUBNET").StringsVar(&opts.AllowedSourceSubnet)
 	kingpin.Flag("policy-file", "path to the policy file that defines identity, levels and the ordered rule list (env - POLICY_FILE)").Envar("POLICY_FILE").Required().PlaceHolder("/etc/s3proxy/policy.yaml").StringVar(&opts.PolicyFile)
 	kingpin.Flag("policy-reload-interval", "how often to re-read the policy file, 0 to disable (SIGHUP always reloads) (env - POLICY_RELOAD_INTERVAL)").Envar("POLICY_RELOAD_INTERVAL").Default("30s").DurationVar(&opts.PolicyReloadInterval)
+	kingpin.Flag("global-access-permission", "what the global credential (GLOBAL_ACCESS_KEY_ID / GLOBAL_SECRET_ACCESS_KEY) may do anywhere in the bucket: read or full (env - GLOBAL_ACCESS_PERMISSION)").Envar("GLOBAL_ACCESS_PERMISSION").Default("full").EnumVar(&opts.GlobalAccessPermission, "read", "full")
 	kingpin.Flag("upstream-insecure", "use insecure HTTP for upstream connections when the endpoint carries no scheme (env - UPSTREAM_INSECURE)").Envar("UPSTREAM_INSECURE").BoolVar(&opts.UpstreamInsecure)
 	kingpin.Flag("upstream-endpoint", "S3 endpoint for upstream connections; an http:// or https:// prefix selects the scheme (env - UPSTREAM_ENDPOINT)").Envar("UPSTREAM_ENDPOINT").PlaceHolder("http://minio.storage.svc:9000").StringVar(&opts.UpstreamEndpoint)
 	// One knob, not two. The region a request is signed for upstream has
@@ -179,12 +190,14 @@ const (
 	envCredentialPepper     = "CREDENTIAL_PEPPER"
 	envCachePurgeToken      = "CACHE_PURGE_TOKEN"
 	envUpstreamSSECKey      = "UPSTREAM_SSE_C_KEY"
+	envGlobalAccessKey      = "GLOBAL_ACCESS_KEY_ID"
+	envGlobalSecretKey      = "GLOBAL_SECRET_ACCESS_KEY"
 	minCredentialPepperSize = 16
 )
 
 // LoadSecrets reads the secrets this proxy holds — the upstream credentials,
-// the derivation pepper, and optionally the purge token and the upstream SSE-C
-// key — from the environment or from a mounted file. None of them is a command
+// the derivation pepper, and optionally the purge token, the upstream SSE-C
+// key and the global access credential — from the environment or from a mounted file. None of them is a command
 // line flag (they would show up in `ps`) and none may appear in the policy file
 // (it is a ConfigMap, reviewed and version-controlled like any other
 // configuration, and hot-reloaded).
@@ -231,9 +244,34 @@ func LoadSecrets(opts *Options) error {
 		return err
 	}
 
+	if err := loadGlobalAccess(opts); err != nil {
+		return err
+	}
+
 	opts.UpstreamSSECKey, err = loadSSECKey()
 	return err
 }
+
+// loadGlobalAccess reads the optional general-access credential. Half of one
+// is refused rather than ignored: an operator who set only the id would
+// otherwise get a proxy that starts cleanly and refuses the job they set it
+// for, with nothing in the log to say why.
+func loadGlobalAccess(opts *Options) error {
+	var err error
+	if opts.GlobalAccessKeyID, err = readSecretEnv(envGlobalAccessKey); err != nil {
+		return err
+	}
+	if opts.GlobalSecretAccessKey, err = readSecretEnv(envGlobalSecretKey); err != nil {
+		return err
+	}
+	if (opts.GlobalAccessKeyID == "") != (opts.GlobalSecretAccessKey == "") {
+		return fmt.Errorf("global access needs both %s and %s (or their _FILE variants), or neither", envGlobalAccessKey, envGlobalSecretKey)
+	}
+	return nil
+}
+
+// GlobalAccessEnabled reports whether a global credential was configured.
+func (o Options) GlobalAccessEnabled() bool { return o.GlobalAccessKeyID != "" }
 
 // loadSSECKey reads the upstream SSE-C key, or returns nil when none is
 // configured.

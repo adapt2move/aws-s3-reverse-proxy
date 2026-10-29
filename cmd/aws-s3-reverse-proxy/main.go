@@ -131,6 +131,15 @@ func buildProxy(opts config.Options) (*proxy.Handler, *policy.Store, *cache.Cach
 		return nil, nil, nil, err
 	}
 
+	var globalAccess *policy.GlobalAccess
+	if opts.GlobalAccessEnabled() {
+		globalAccess = &policy.GlobalAccess{
+			AccessKeyID:     opts.GlobalAccessKeyID,
+			SecretAccessKey: opts.GlobalSecretAccessKey,
+			Permission:      policy.Permission(opts.GlobalAccessPermission),
+		}
+	}
+
 	handler, err := proxy.New(proxy.Config{
 		Debug:                 opts.Debug,
 		ReadOnly:              opts.ReadOnly,
@@ -141,6 +150,7 @@ func buildProxy(opts config.Options) (*proxy.Handler, *policy.Store, *cache.Cach
 		AllowedSourceSubnet:   subnets,
 		Policy:                store,
 		Pepper:                opts.Pepper,
+		GlobalAccess:          globalAccess,
 		UpstreamSigner:        sigv4.NewSigner(opts.UpstreamAccessKeyID, opts.UpstreamSecretAccessKey),
 		MaxClockSkew:          opts.MaxClockSkew,
 		Limits: proxy.Limits{
@@ -329,9 +339,25 @@ func logStartup(opts config.Options, handler *proxy.Handler, store *policy.Store
 	if opts.ReadOnly {
 		log.Infof("Read-only mode: only GET/HEAD are proxied; mutating requests are rejected with 403.")
 	}
+	logGlobalAccessStartup(opts, current)
 	logEncryptionStartup(opts)
 	logCacheStartup(opts)
 	logListFallbackStartup(opts)
+}
+
+// logGlobalAccessStartup says whether a global credential is in force, and
+// warns when its id also reads as a tenant's: the global credential wins, so
+// that tenant would be locked out.
+func logGlobalAccessStartup(opts config.Options, current *policy.Policy) {
+	if !opts.GlobalAccessEnabled() {
+		return
+	}
+	log.Infof("Global access is on: GLOBAL_ACCESS_KEY_ID addresses the whole bucket, unprefixed, with permission %q. "+
+		"The policy rules do not apply to it; read-only mode, the operation whitelist, the cache and SSE-C do.",
+		opts.GlobalAccessPermission)
+	if _, err := current.ResolveIdentity(opts.GlobalAccessKeyID, opts.Pepper); err == nil {
+		log.Warnf("GLOBAL_ACCESS_KEY_ID also matches identity.accessKeyIdPattern; requests with it are always treated as global access.")
+	}
 }
 
 // logEncryptionStartup says what upstream encryption does and, as importantly,

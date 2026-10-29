@@ -236,3 +236,48 @@ func TestLoadSSECKey(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadGlobalAccess(t *testing.T) {
+	base := func(t *testing.T) {
+		t.Setenv(envUpstreamCredentials, "AKID,secret-value")
+		t.Setenv(envCredentialPepper, "a-sufficiently-long-pepper")
+	}
+
+	t.Run("off unless configured", func(t *testing.T) {
+		base(t)
+		var opts Options
+		require.NoError(t, LoadSecrets(&opts))
+		assert.False(t, opts.GlobalAccessEnabled())
+	})
+
+	t.Run("both variables", func(t *testing.T) {
+		base(t)
+		t.Setenv(envGlobalAccessKey, "GLOBALKEY")
+		t.Setenv(envGlobalSecretKey, "global-secret-value")
+		var opts Options
+		require.NoError(t, LoadSecrets(&opts))
+		assert.True(t, opts.GlobalAccessEnabled())
+		assert.Equal(t, "GLOBALKEY", opts.GlobalAccessKeyID)
+		assert.Equal(t, "global-secret-value", opts.GlobalSecretAccessKey)
+	})
+
+	t.Run("the secret from a mounted file", func(t *testing.T) {
+		base(t)
+		path := filepath.Join(t.TempDir(), "secret")
+		require.NoError(t, os.WriteFile(path, []byte("global-secret-value\n"), 0o600))
+		t.Setenv(envGlobalAccessKey, "GLOBALKEY")
+		t.Setenv(envGlobalSecretKey+"_FILE", path)
+		var opts Options
+		require.NoError(t, LoadSecrets(&opts))
+		assert.Equal(t, "global-secret-value", opts.GlobalSecretAccessKey)
+	})
+
+	for _, name := range []string{envGlobalAccessKey, envGlobalSecretKey} {
+		t.Run("only "+name, func(t *testing.T) {
+			base(t)
+			t.Setenv(name, "something")
+			var opts Options
+			assert.Error(t, LoadSecrets(&opts))
+		})
+	}
+}

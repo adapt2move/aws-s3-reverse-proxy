@@ -195,7 +195,7 @@ func rewriteUpstreamResponse(resp *http.Response) error {
 		// ones a rule denies this level outright. Without it, "denied" would
 		// hold for reads but not for the listing that reveals them.
 		body = s3.FilterListEntries(body, func(key string) bool {
-			return st.policy.Authorize(st.identity.Level, key, http.MethodGet).Allowed
+			return st.policy.AuthorizeIdentity(st.identity, key, http.MethodGet).Allowed
 		})
 	}
 	if st.operation.Kind == s3.DeleteObjects {
