@@ -334,9 +334,19 @@ func (r *repairer) run(job repairJob) {
 // is held to what the deployment forbids for everybody: read-only mode, and a
 // path no level of the current policy may write — a path an operator made
 // read-only for every tenant is one they did not mean to have rewritten.
+//
+// A read through the global credential names the key as it is upstream,
+// which no rule is written against. There the operator's own word stands in
+// for the policy's: the object is rewritten when that credential may write.
 func (r *repairer) prohibited(st *requestState) string {
 	if r.h.cfg.ReadOnly {
 		return "the proxy is in read-only mode"
+	}
+	if st.identity.Global() {
+		if st.policy.AuthorizeIdentity(st.identity, st.operation.Key, http.MethodPut).Allowed {
+			return ""
+		}
+		return "the global access credential may not write"
 	}
 	current := r.h.cfg.Policy.Current()
 	for _, level := range current.Levels() {

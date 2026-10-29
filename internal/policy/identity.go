@@ -26,6 +26,12 @@ type Identity struct {
 	// verified against. It is never logged, never exported and never sent
 	// upstream.
 	SecretAccessKey string
+
+	// global is the permission of the operator's general-access credential,
+	// and empty for every tenant. A global identity has no tenant and an
+	// empty KeyPrefix: it addresses the bucket as it is upstream. See
+	// GlobalAccess.
+	global Permission
 }
 
 // errUnknownAccessKeyID is returned for an access-key id that does not

@@ -101,6 +101,12 @@ type Config struct {
 	// environment or a mounted secret, never from the policy file.
 	Pepper []byte
 
+	// GlobalAccess is the operator's general-access credential, nil when none
+	// is configured. A request signed with it is not scoped to a tenant and
+	// not held to the rule list, but takes every other step a tenant's does —
+	// the cache and the SSE-C key included. See policy.GlobalAccess.
+	GlobalAccess *policy.GlobalAccess
+
 	// UpstreamSigner re-signs requests with the credentials only this
 	// process holds. Clients never see them.
 	UpstreamSigner *sigv4.Signer
@@ -236,6 +242,11 @@ func New(cfg Config) (*Handler, error) {
 	}
 	if cfg.UpstreamSigner == nil {
 		return nil, errors.New("proxy: no upstream signer configured")
+	}
+	if cfg.GlobalAccess != nil {
+		if err := cfg.GlobalAccess.Validate(); err != nil {
+			return nil, fmt.Errorf("proxy: %v", err)
+		}
 	}
 	if cfg.UpstreamSSECKey != nil && cfg.UpstreamScheme != "https" {
 		// S3 refuses SSE-C over plain http, and rightly: the key would cross
@@ -435,7 +446,7 @@ func (h *Handler) prepare(w http.ResponseWriter, r *http.Request, entry *observa
 		if op.Kind == s3.ListObjects {
 			subject = op.ListPrefix
 		}
-		decision := current.Authorize(identity.Level, subject, r.Method)
+		decision := current.AuthorizeIdentity(identity, subject, r.Method)
 		entry.Rule, entry.Allowed = decision.Rule, decision.Allowed
 		if !decision.Allowed {
 			err := fmt.Errorf("policy denies %s on %q for level %q", r.Method, subject, identity.Level)
@@ -513,14 +524,20 @@ func (h *Handler) reject(w http.ResponseWriter, entry *observability.AccessLog, 
 // request has no Authorization header and fails at the first step; an unknown
 // access-key id fails at resolution; a forged signature fails at the
 // comparison. All three are the same 403 to the client.
+//
+// The global credential, when there is one, is looked at first: its id is
+// fixed rather than derived, and it takes precedence over a tenant id the
+// pattern would also have matched.
 func (h *Handler) authenticate(current *policy.Policy, r *http.Request) (*policy.Identity, error) {
 	cred, err := h.verifier.ReadCredential(r)
 	if err != nil {
 		return nil, err
 	}
-	identity, err := current.ResolveIdentity(cred.AccessKeyID, h.cfg.Pepper)
-	if err != nil {
-		return nil, err
+	identity := h.cfg.GlobalAccess.Resolve(cred.AccessKeyID)
+	if identity == nil {
+		if identity, err = current.ResolveIdentity(cred.AccessKeyID, h.cfg.Pepper); err != nil {
+			return nil, err
+		}
 	}
 	if err := h.verifier.Verify(r, cred, identity.SecretAccessKey); err != nil {
 		return nil, err

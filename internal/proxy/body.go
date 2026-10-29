@@ -196,7 +196,7 @@ func (h *Handler) prepareDeleteBody(raw []byte, reqHeader http.Header, st *reque
 		if err := s3.ValidateObjectKey(obj.Key); err != nil {
 			return nil, "", fmt.Errorf("batch delete: %w", err)
 		}
-		decision := st.policy.Authorize(st.identity.Level, obj.Key, http.MethodDelete)
+		decision := st.policy.AuthorizeIdentity(st.identity, obj.Key, http.MethodDelete)
 		if i == 0 {
 			firstRule = decision.Rule
 		}

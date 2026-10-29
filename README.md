@@ -22,7 +22,9 @@ the security boundary — not a convenience layer in front of one.
 
 1. Verify the inbound [SigV4](https://docs.aws.amazon.com/general/latest/gr/signature-version-4.html)
    header signature against the secret derived for the request's access-key id.
-2. Resolve `{tenant, level}` from that access-key id.
+2. Resolve `{tenant, level}` from that access-key id — or, when it is the
+   optional [global access](#global-access) credential, skip the tenant
+   model for this request.
 3. Inject the tenant key prefix into the object key and into listing parameters.
 4. Authorize the HTTP method + key against the policy for that level.
 5. Answer object reads from the local cache if one is configured and holds
@@ -194,6 +196,41 @@ read — whether by an explicit `deny` or by no rule at all — are also removed
 from the response, so a denial holds for the listing that would reveal a key
 just as much as for a `GET` of it.
 
+## Global access
+
+Some workloads have no tenant: a backup job, a migration, an operator's own
+tooling. They need the bucket as it is upstream, across every tenant prefix.
+Handing them the upstream credentials works, but they would then bypass the
+proxy's cache and its SSE-C key: what they write lands unencrypted (or
+encrypted under a key they would have to hold too), and every tenant keeps
+being served the cached copy they replaced.
+
+The global credential gives them that access through the proxy instead. It
+is off unless both `GLOBAL_ACCESS_KEY_ID` and `GLOBAL_SECRET_ACCESS_KEY` are
+set (see [Secrets](#secrets)). Compared with a tenant's, a request signed
+with it is treated like this:
+
+| | tenant | global |
+| --- | --- | --- |
+| key prefix | injected, and stripped from responses | none: keys are upstream keys, `<tenant>/…` included |
+| authorization | the policy's rule list for the level | `--global-access-permission` (`read` or `full`) everywhere |
+| listing filter | entries the level may not read are removed | none |
+| cache, invalidation, listing fallback | shared, keyed by upstream object | the same entries |
+| SSE-C key | added to object operations | added to object operations |
+| read-only mode, source subnets, operation and header whitelists, signature check | apply | apply |
+
+Because the cache is keyed by the upstream object, a write through the global
+credential replaces the entry the owning tenant is served next, and the other
+way round. A read through it repairs a legacy plaintext object (see
+[Legacy plaintext objects](#legacy-plaintext-objects)) only when the global
+permission is `full`.
+
+The id and secret are fixed, not derived from the pepper, and the id is
+compared before the tenant pattern: should it also match
+`identity.accessKeyIdPattern`, the request is global and startup logs a
+warning. In the access log and the metrics a global request shows an empty
+tenant, the level `(global)` and the rule `(global access)`.
+
 ## Configuration
 
 Split by lifetime and sensitivity:
@@ -201,7 +238,7 @@ Split by lifetime and sensitivity:
 | Kind | Source | Contents |
 | --- | --- | --- |
 | **Policy** | file (e.g. a mounted ConfigMap), hot-reloadable | rule list, access-key-id pattern, key-prefix template, level names |
-| **Secrets** | env / mounted secret only | upstream credentials, derivation pepper, optional upstream SSE-C key |
+| **Secrets** | env / mounted secret only | upstream credentials, derivation pepper, optional upstream SSE-C key, optional global access credential |
 | **Deployment knobs** | flags or env | listen and metrics addresses, upstream endpoint, allowed source subnets, body caps, logging verbosity |
 
 A secret is never readable from the policy file, and the policy file never
@@ -220,6 +257,7 @@ a mounted secret, which is what a Kubernetes Secret volume gives you.
 | `CREDENTIAL_PEPPER` | keys the HMAC that derives every client secret (minimum 16 bytes) |
 | `CACHE_PURGE_TOKEN` | bearer token required by `POST /cache/purge`; unset leaves that endpoint open |
 | `UPSTREAM_SSE_C_KEY` | Base64 of a 32-byte key; when set, every object is encrypted upstream with it (SSE-C) — see [Upstream encryption](#upstream-encryption-sse-c) |
+| `GLOBAL_ACCESS_KEY_ID`, `GLOBAL_SECRET_ACCESS_KEY` | optional credential with unprefixed access to the whole bucket — see [Global access](#global-access). Both or neither; the secret needs at least 16 bytes |
 
 Secrets are read once, at startup. A policy reload does not touch them, and
 changing a variable or a mounted file takes effect at the next restart.
@@ -245,6 +283,7 @@ changing a variable or a mounted file takes effect at the next restart.
 | `--shutdown-delay` (`SHUTDOWN_DELAY`) | `0s` | how long to keep serving after `/readyz` starts failing |
 | `--read-only` (`READ_ONLY`) | `false` | reject every mutation regardless of policy — a maintenance kill switch |
 | `--metrics-tenant-label` (`METRICS_TENANT_LABEL`) | `false` | add the tenant id as a Prometheus label |
+| `--global-access-permission` (`GLOBAL_ACCESS_PERMISSION`) | `full` | what the global credential may do anywhere in the bucket: `read` or `full`; ignored without one |
 | `--upstream-sse-c-repair` (`UPSTREAM_SSE_C_REPAIR`) | `false` | with an SSE-C key, rewrite plaintext objects found by a read under it — see [Legacy plaintext objects](#legacy-plaintext-objects) |
 
 `--upstream-endpoint` decides the scheme, so one image serves an in-cluster

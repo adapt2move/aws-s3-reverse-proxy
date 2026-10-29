@@ -119,7 +119,7 @@ func buildProxy(opts config.Options) (*proxy.Handler, *policy.Store, *cache.Cach
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	store.OnReload = reportReload(store)
+	store.OnReload = reportReload(store, opts)
 
 	listings, err := buildListFallback(opts)
 	if err != nil {
@@ -129,6 +129,15 @@ func buildProxy(opts config.Options) (*proxy.Handler, *policy.Store, *cache.Cach
 	objectCache, err := buildCache(opts)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+
+	var globalAccess *policy.GlobalAccess
+	if opts.GlobalAccessEnabled() {
+		globalAccess = &policy.GlobalAccess{
+			AccessKeyID:     opts.GlobalAccessKeyID,
+			SecretAccessKey: opts.GlobalSecretAccessKey,
+			Permission:      policy.Permission(opts.GlobalAccessPermission),
+		}
 	}
 
 	handler, err := proxy.New(proxy.Config{
@@ -141,6 +150,7 @@ func buildProxy(opts config.Options) (*proxy.Handler, *policy.Store, *cache.Cach
 		AllowedSourceSubnet:   subnets,
 		Policy:                store,
 		Pepper:                opts.Pepper,
+		GlobalAccess:          globalAccess,
 		UpstreamSigner:        sigv4.NewSigner(opts.UpstreamAccessKeyID, opts.UpstreamSecretAccessKey),
 		MaxClockSkew:          opts.MaxClockSkew,
 		Limits: proxy.Limits{
@@ -329,9 +339,35 @@ func logStartup(opts config.Options, handler *proxy.Handler, store *policy.Store
 	if opts.ReadOnly {
 		log.Infof("Read-only mode: only GET/HEAD are proxied; mutating requests are rejected with 403.")
 	}
+	logGlobalAccessStartup(opts, current)
 	logEncryptionStartup(opts)
 	logCacheStartup(opts)
 	logListFallbackStartup(opts)
+}
+
+// logGlobalAccessStartup says whether a global credential is in force, and
+// warns when its id also reads as a tenant's: the global credential wins, so
+// that tenant would be locked out.
+func logGlobalAccessStartup(opts config.Options, current *policy.Policy) {
+	if !opts.GlobalAccessEnabled() {
+		return
+	}
+	log.Infof("Global access is on: GLOBAL_ACCESS_KEY_ID addresses the whole bucket, unprefixed, with permission %q. "+
+		"The policy rules do not apply to it; read-only mode, the operation whitelist, the cache and SSE-C do.",
+		opts.GlobalAccessPermission)
+	warnGlobalAccessCollision(opts, current)
+}
+
+// warnGlobalAccessCollision is checked at startup and again after every
+// reload, since either side of the collision can change: the id with the
+// environment, the pattern with the policy file.
+func warnGlobalAccessCollision(opts config.Options, current *policy.Policy) {
+	if !opts.GlobalAccessEnabled() {
+		return
+	}
+	if _, err := current.ResolveIdentity(opts.GlobalAccessKeyID, opts.Pepper); err == nil {
+		log.Warnf("GLOBAL_ACCESS_KEY_ID also matches identity.accessKeyIdPattern; requests with it are always treated as global access.")
+	}
 }
 
 // logEncryptionStartup says what upstream encryption does and, as importantly,
@@ -432,7 +468,7 @@ func logListFallbackStartup(opts config.Options) {
 // reportReload is the store's window onto the operator. A rejected reload is
 // logged at error level with the reason — it is the only signal that the file
 // on disk is not the policy being enforced.
-func reportReload(store *policy.Store) func(policy.ReloadOutcome, error) {
+func reportReload(store *policy.Store, opts config.Options) func(policy.ReloadOutcome, error) {
 	return func(outcome policy.ReloadOutcome, err error) {
 		observability.RecordPolicyReload(string(outcome))
 		switch outcome {
@@ -444,6 +480,7 @@ func reportReload(store *policy.Store) func(policy.ReloadOutcome, error) {
 				"levels": current.Levels(),
 				"rules":  len(current.Rules()),
 			}).Infof("reloaded policy from %s", store.Path())
+			warnGlobalAccessCollision(opts, current)
 		}
 	}
 }
