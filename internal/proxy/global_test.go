@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"testing"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -191,4 +192,39 @@ func TestGlobalAccessIsValidatedAtStartup(t *testing.T) {
 		_, err := New(cfg)
 		assert.Error(t, err, "%+v", g)
 	}
+}
+
+// A legacy plaintext object read through the global credential is rewritten
+// under the key when that credential may write — wherever it lies, since no
+// rule speaks to upstream keys — and left alone when it may only read.
+func TestGlobalAccessRepairsPlaintextOnlyWithFullPermission(t *testing.T) {
+	t.Run("full", func(t *testing.T) {
+		store := newSSEStore(t)
+		h := newEncryptingProxy(t, store, withGlobalAccess(policy.PermissionFull))
+		key := tenantA + "/workspaces/w1/inbox/legacy.csv" // no level may write it
+		store.put(key, []byte("old"), "", nil)
+
+		get := do(t, h, globalRequest(http.MethodGet, "/bucket/"+key, nil)).Result()
+		require.Equal(t, http.StatusOK, get.StatusCode)
+		assert.Equal(t, "old", readBody(t, get))
+		waitForRepair(t, store, key)
+	})
+
+	t.Run("read", func(t *testing.T) {
+		hook := captureLogs(t)
+		store := newSSEStore(t)
+		h := newEncryptingProxy(t, store, withGlobalAccess(policy.PermissionRead))
+		key := upstreamKey("datasets/legacy.csv")
+		store.put(key, []byte("old"), "", nil)
+
+		get := do(t, h, globalRequest(http.MethodGet, "/bucket/"+key, nil)).Result()
+		require.Equal(t, http.StatusOK, get.StatusCode)
+		assert.Equal(t, "old", readBody(t, get))
+		waitFor(t, "the skip", func() bool {
+			return logged(hook, log.WarnLevel, "the global access credential may not write")
+		})
+		h.Close()
+		assert.Equal(t, "", store.object(key).keyMD5)
+		assert.Empty(t, store.requestsWhere(func(r recordedRequest) bool { return r.method == http.MethodPost || r.method == http.MethodPut }))
+	})
 }
