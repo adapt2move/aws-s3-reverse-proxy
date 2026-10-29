@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"testing"
@@ -466,13 +467,14 @@ func TestUnsupportedOperationsAreRefused(t *testing.T) {
 	env := setup(t)
 	client := env.Client(t, env.TenantA, env.WriteLevel)
 
-	t.Run("copy object", func(t *testing.T) {
+	t.Run("copy replacing metadata", func(t *testing.T) {
 		_, err := client.CopyObject(&s3.CopyObjectInput{
-			Bucket:     aws.String(env.Bucket),
-			Key:        aws.String("datasets/copy/dst.csv"),
-			CopySource: aws.String(env.Bucket + "/datasets/copy/src.csv"),
+			Bucket:            aws.String(env.Bucket),
+			Key:               aws.String("datasets/copy/dst.csv"),
+			CopySource:        aws.String(env.Bucket + "/datasets/copy/src.csv"),
+			MetadataDirective: aws.String(s3.MetadataDirectiveReplace),
 		})
-		requireDenied(t, err, "copy object")
+		requireDenied(t, err, "copy replacing metadata")
 	})
 
 	t.Run("bucket administration", func(t *testing.T) {
@@ -508,6 +510,66 @@ func TestUnsupportedOperationsAreRefused(t *testing.T) {
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("an unsigned request returned %d, want 403", resp.StatusCode)
+		}
+	})
+}
+
+// A copy is a read of the source and a write of the destination, both inside
+// the caller's prefix, and keeps the source's content headers and metadata.
+func TestCopyObject(t *testing.T) {
+	env := setup(t)
+	if env.ReadOnly {
+		t.Skip("this deployment runs with the mutation kill switch on")
+	}
+	writer := env.Client(t, env.TenantA, env.WriteLevel)
+	src, dst := "datasets/copy/source file.csv", "datasets/copy/destination.csv"
+	copySource := aws.String(env.Bucket + "/" + url.PathEscape(src))
+	payload := []byte("a,b\n1,2\n")
+	_, err := writer.PutObject(&s3.PutObjectInput{
+		Bucket: aws.String(env.Bucket), Key: aws.String(src), Body: bytes.NewReader(payload),
+		ContentType: aws.String("text/csv"), Metadata: aws.StringMap(map[string]string{"origin": "copy-test"}),
+	})
+	requireNoError(t, err, "put source")
+
+	out, err := writer.CopyObject(&s3.CopyObjectInput{
+		Bucket:     aws.String(env.Bucket),
+		Key:        aws.String(dst),
+		CopySource: copySource,
+	})
+	requireNoError(t, err, "copy")
+	if out.CopyObjectResult == nil || aws.StringValue(out.CopyObjectResult.ETag) == "" {
+		t.Fatalf("the copy answered no ETag: %v", out)
+	}
+
+	got, err := writer.GetObject(&s3.GetObjectInput{Bucket: aws.String(env.Bucket), Key: aws.String(dst)})
+	requireNoError(t, err, "get copy")
+	defer got.Body.Close()
+	body, _ := io.ReadAll(got.Body)
+	if !bytes.Equal(body, payload) {
+		t.Fatalf("the copy holds %q", body)
+	}
+	if aws.StringValue(got.ContentType) != "text/csv" || aws.StringValue(got.Metadata["Origin"]) != "copy-test" {
+		t.Fatalf("content type %q and metadata %v were not copied", aws.StringValue(got.ContentType), aws.StringValueMap(got.Metadata))
+	}
+	if want := env.UpstreamKey(env.TenantA, dst); !contains(upstreamKeys(t, env, env.TenantA), want) {
+		t.Fatalf("the copy did not land at %q", want)
+	}
+
+	t.Run("a read level may not copy", func(t *testing.T) {
+		_, err := env.Client(t, env.TenantA, env.ReadLevel).CopyObject(&s3.CopyObjectInput{
+			Bucket: aws.String(env.Bucket), Key: aws.String("datasets/copy/denied.csv"),
+			CopySource: copySource,
+		})
+		requireDenied(t, err, "copy with a read level")
+	})
+
+	t.Run("another tenant cannot copy from it", func(t *testing.T) {
+		_, err := env.Client(t, env.TenantB, env.WriteLevel).CopyObject(&s3.CopyObjectInput{
+			Bucket: aws.String(env.Bucket), Key: aws.String("datasets/copy/stolen.csv"),
+			CopySource: copySource,
+		})
+		if statusOf(err) != http.StatusNotFound {
+			t.Fatalf("tenant B copying tenant A's key answered %v, want 404: it names B's own key", err)
 		}
 	})
 }

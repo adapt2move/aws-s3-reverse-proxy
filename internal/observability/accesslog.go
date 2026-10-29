@@ -31,6 +31,9 @@ type AccessLog struct {
 	Rule      string
 	Key       string
 
+	// SourceKey is the key a CopyObject reads; Key is the one it writes.
+	SourceKey string
+
 	Allowed bool
 	Reason  string
 
@@ -90,6 +93,9 @@ func (r *Recorder) Finish(e *AccessLog, status int, duration time.Duration) {
 		"rule":        e.matchedRule(),
 		"status":      status,
 		"duration_ms": float64(duration.Nanoseconds()) / float64(time.Millisecond),
+	}
+	if e.SourceKey != "" {
+		fields["source_key"] = e.SourceKey
 	}
 	if e.DeniedKeys > 0 {
 		fields["denied_keys"] = e.DeniedKeys

@@ -31,6 +31,7 @@ const (
 	GetObject               Kind = "GetObject"
 	HeadObject              Kind = "HeadObject"
 	PutObject               Kind = "PutObject"
+	CopyObject              Kind = "CopyObject"
 	DeleteObject            Kind = "DeleteObject"
 	ListObjects             Kind = "ListObjects"
 	DeleteObjects           Kind = "DeleteObjects"
@@ -55,6 +56,10 @@ type Operation struct {
 	// Both are empty for bucket-level operations.
 	Key        string
 	EscapedKey string
+
+	// SourceKey is the client-facing key a CopyObject reads, decoded and
+	// validated like Key. It is in the same bucket.
+	SourceKey string
 
 	// ListPrefix is the client-facing `prefix` parameter of a listing.
 	ListPrefix string
@@ -147,27 +152,24 @@ func Classify(req *http.Request) (*Operation, error) {
 	// else is wrong with the request: it is the one refusal a client can do
 	// something about, and it must never reach the object store or the cache.
 	// Stripping the headers and carrying on would be worse than refusing —
-	// the client would believe its object is encrypted under its own key. The
-	// copy-source variants are included even though CopyObject itself is
-	// refused below, so the message does not depend on which header was seen
-	// first.
+	// the client would believe its object is encrypted under its own key.
 	if ssec.HasCustomerHeader(req.Header) {
 		return nil, ErrCustomerKey
-	}
-
-	// A copy names a *second* object key — the source — that no other check
-	// on the request path ever sees, so it would travel upstream
-	// unauthorized and unprefixed. Refuse the header outright rather than
-	// grow a second authorization path for it.
-	if req.Header.Get("X-Amz-Copy-Source") != "" {
-		return nil, fmt.Errorf("%w: x-amz-copy-source", ErrUnsupportedOperation)
 	}
 
 	// Every other `x-amz-` header is checked against the same kind of
 	// whitelist, for the same reason: one this proxy does not understand is
 	// one it cannot authorize, and forwarding it would hand the object store
-	// an instruction no policy rule ever saw.
-	if err := CheckRequestHeaders(req.Header); err != nil {
+	// an instruction no policy rule ever saw. The two headers a CopyObject
+	// consists of are taken out first and checked by classifyCopy.
+	header := req.Header
+	copying := len(req.Header.Values("X-Amz-Copy-Source")) > 0
+	if copying {
+		header = req.Header.Clone()
+		header.Del("X-Amz-Copy-Source")
+		header.Del("X-Amz-Metadata-Directive")
+	}
+	if err := CheckRequestHeaders(header); err != nil {
 		return nil, err
 	}
 
@@ -193,6 +195,13 @@ func Classify(req *http.Request) (*Operation, error) {
 	bucket, key, escapedKey, bucketLevel, err := splitBucketKey(req.URL)
 	if err != nil {
 		return nil, err
+	}
+
+	if copying {
+		if bucketLevel || req.Method != http.MethodPut || len(query) != 0 {
+			return nil, fmt.Errorf("%w: x-amz-copy-source on %s %s", ErrUnsupportedOperation, req.Method, req.URL.Path)
+		}
+		return classifyCopy(req, Operation{Bucket: bucket, Key: key, EscapedKey: escapedKey})
 	}
 
 	if bucketLevel {
@@ -273,6 +282,67 @@ func Classify(req *http.Request) (*Operation, error) {
 		}
 	}
 	return nil, fmt.Errorf("%w: %s object request", ErrUnsupportedOperation, req.Method)
+}
+
+// classifyCopy accepts a CopyObject only in the one shape the proxy carries
+// out itself (see proxy.serveCopy): a whole-object copy within the bucket that
+// keeps the source's metadata, with no condition, range or body. The source is
+// a second key that authorization has to see, so it gets the same validation
+// as the request key.
+func classifyCopy(req *http.Request, op Operation) (*Operation, error) {
+	if directive := req.Header.Values("X-Amz-Metadata-Directive"); len(directive) > 1 ||
+		(len(directive) == 1 && directive[0] != "COPY") {
+		return nil, fmt.Errorf("%w: x-amz-metadata-directive other than COPY", ErrUnsupportedOperation)
+	}
+	for _, name := range []string{"Range", "If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range"} {
+		if req.Header.Get(name) != "" {
+			return nil, fmt.Errorf("%w: %s on a copy", ErrUnsupportedOperation, name)
+		}
+	}
+	if req.ContentLength != 0 {
+		return nil, fmt.Errorf("%w: a copy with a request body", ErrUnsupportedOperation)
+	}
+	sourceKey, err := copySource(req.Header.Values("X-Amz-Copy-Source"), op.Bucket)
+	if err != nil {
+		return nil, err
+	}
+	if sourceKey == op.Key {
+		// S3 refuses this too unless something about the object changes,
+		// and with COPY semantics nothing can.
+		return nil, fmt.Errorf("%w: a copy onto its own source", ErrUnsupportedOperation)
+	}
+	op.Kind = CopyObject
+	op.SourceKey = sourceKey
+	return &op, nil
+}
+
+// copySource parses `x-amz-copy-source` — `[/]bucket/key`, URL-encoded once —
+// into the decoded source key, and refuses anything else: another bucket, a
+// version, an access-point ARN, or a key splitBucketKey would refuse.
+func copySource(values []string, bucket string) (string, error) {
+	if len(values) != 1 {
+		return "", fmt.Errorf("%w: x-amz-copy-source given %d times", ErrUnsupportedOperation, len(values))
+	}
+	raw := strings.TrimPrefix(values[0], "/")
+	if strings.Contains(raw, "?") {
+		return "", fmt.Errorf("%w: x-amz-copy-source with a query", ErrUnsupportedOperation)
+	}
+	escapedBucket, escapedKey := splitFirstSegment(raw)
+	sourceBucket, err := url.PathUnescape(escapedBucket)
+	if err != nil || sourceBucket != bucket {
+		return "", fmt.Errorf("%w: x-amz-copy-source names another bucket", ErrUnsupportedOperation)
+	}
+	key, err := url.PathUnescape(escapedKey)
+	if err != nil {
+		return "", fmt.Errorf("%w: x-amz-copy-source is not URL-encoded", ErrInvalidKey)
+	}
+	if err := ValidateObjectKey(key); err != nil {
+		return "", err
+	}
+	if strings.Contains(escapedKey, "..") {
+		return "", fmt.Errorf("%w: copy source key contains %q", ErrInvalidKey, "..")
+	}
+	return key, nil
 }
 
 // splitBucketKey pulls the bucket and the object key out of a path-style

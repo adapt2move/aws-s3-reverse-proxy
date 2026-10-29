@@ -123,7 +123,7 @@ func TestGlobalAccessKeepsTheDeploymentsLimits(t *testing.T) {
 	t.Run("the operation whitelist", func(t *testing.T) {
 		h, upstream := newTestProxy(t, withGlobalAccess(policy.PermissionFull))
 		req := globalRequest(http.MethodPut, "/bucket/copy.txt", nil)
-		req.headers = http.Header{"X-Amz-Copy-Source": {"/bucket/" + tenantA + "/datasets/a.csv"}}
+		req.headers = http.Header{"X-Amz-Copy-Source": {"/bucket/" + tenantA + "/datasets/a.csv"}, "X-Amz-Metadata-Directive": {"REPLACE"}}
 		assert.Equal(t, http.StatusForbidden, do(t, h, req).Code)
 		assert.Equal(t, 0, upstream.count())
 	})

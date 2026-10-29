@@ -69,6 +69,8 @@ var forwardedHeaders = map[string]bool{
 //     does, and the operator's key is applied upstream without the client
 //     ever seeing it
 //   - x-amz-tagging                   billing and lifecycle input
+//   - x-amz-copy-source, x-amz-metadata-directive: accepted only as the
+//     CopyObject Classify checks itself (see classifyCopy), never forwarded
 //   - x-amz-security-token            this proxy derives credentials, so a
 //     session token means nothing to it
 //   - x-amz-expected-bucket-owner     an assertion about the account, which is

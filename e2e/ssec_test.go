@@ -317,6 +317,35 @@ func TestSSECAPlaintextObjectIsEncryptedOnRead(t *testing.T) {
 	}
 }
 
+// A copy is never a native one: the source is read decrypted — or, for a
+// legacy object, in plaintext — and the copy is written under the key.
+func TestSSECCopyObject(t *testing.T) {
+	env := ssecSetup(t)
+	if env.ReadOnly {
+		t.Skip("this deployment runs with the mutation kill switch on")
+	}
+	writer := env.Client(t, env.TenantA, env.WriteLevel)
+	payload := []byte("copied,under\nthe,key\n")
+	requireNoError(t, putObject(t, writer, env.Bucket, "datasets/ssec/copy-encrypted.csv", payload), "put an encrypted source")
+	putPlaintext(t, env, "datasets/ssec/copy-plaintext.csv", payload, "text/csv", map[string]string{"origin": "legacy"})
+
+	for _, src := range []string{"datasets/ssec/copy-encrypted.csv", "datasets/ssec/copy-plaintext.csv"} {
+		dst := src + ".copy"
+		_, err := writer.CopyObject(&s3.CopyObjectInput{
+			Bucket: aws.String(env.Bucket), Key: aws.String(dst), CopySource: aws.String(env.Bucket + "/" + src),
+		})
+		requireNoError(t, err, "copying "+src)
+		if !encryptedAtRest(t, env, dst) {
+			t.Fatalf("the copy of %s is not encrypted at rest", src)
+		}
+		got, err := getObject(t, writer, env.Bucket, dst)
+		requireNoError(t, err, "reading the copy of "+src)
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("the copy of %s holds %q", src, got)
+		}
+	}
+}
+
 // A ranged read of a plaintext object is answered with the range — and the
 // object is still repaired from the whole of it.
 func TestSSECARangedReadRepairsTheWholeObject(t *testing.T) {

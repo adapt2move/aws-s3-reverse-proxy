@@ -80,13 +80,14 @@ func carriesCustomerKey(kind s3.Kind) bool {
 // one the object store confirms SSE-C on — and so one where a missing
 // confirmation means something.
 //
-// PutObject and UploadPart are, on AWS S3 and MinIO alike. A multipart
-// upload's encryption is confirmed by its parts: MinIO does not echo the
-// customer-key headers on CreateMultipartUpload, and no store does on
-// CompleteMultipartUpload, so their absence there says nothing.
+// PutObject and UploadPart are, on AWS S3 and MinIO alike, and so is a
+// CopyObject, whose write is a PutObject. A multipart upload's encryption is
+// confirmed by its parts: MinIO does not echo the customer-key headers on
+// CreateMultipartUpload, and no store does on CompleteMultipartUpload, so
+// their absence there says nothing.
 func confirmsEncryption(kind s3.Kind) bool {
 	switch kind {
-	case s3.PutObject, s3.UploadPart:
+	case s3.PutObject, s3.CopyObject, s3.UploadPart:
 		return true
 	}
 	return false
