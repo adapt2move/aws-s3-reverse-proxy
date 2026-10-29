@@ -14,8 +14,9 @@ import (
 // as preconditions, and for all three it needs one canonical form: the value
 // with every wrapper an object store put around it taken off. The wrappers
 // themselves are serialization, and each place an ETag leaves the proxy adds
-// its own — the standard double quotes in an HTTP header, nothing at all in a
-// multipart completion.
+// its own — standard double quotes in responses and local cache validators,
+// nothing in a multipart part list. Write If-Match conditions preserve a
+// client's bare values for stores that require them.
 //
 // Doing it once, here, is not tidiness. At least one object store answers
 // `ETag: "'abcef123'"` — a single-quoted value inside the double quotes — and
@@ -82,16 +83,34 @@ func SameETag(a, b string) bool {
 // NormalizeETagList rewrites the value of an If-Match or If-None-Match
 // header: `*`, or a comma-separated list of entity tags. Each tag is put into
 // standard syntax and keeps its weakness, so the condition means what the
-// client asked for — just spelled the way the object store accepts.
+// client asked for when evaluated by the local HTTP cache.
 //
 // A comma inside a quoted value is part of the value, not a separator.
 func NormalizeETagList(raw string) string {
+	return rewriteETagList(raw, NormalizeETag)
+}
+
+// NormalizeWriteIfMatch removes malformed quote wrappers but keeps bare
+// client values bare. Ceph RGW compares a write's If-Match literally with the
+// stored ETag; adding double quotes would reject a matching condition. Quoted
+// and weak validators retain their standard syntax.
+func NormalizeWriteIfMatch(raw string) string {
+	return rewriteETagList(raw, func(item string) string {
+		value, weak := CanonicalETag(item)
+		if !weak && value == strings.TrimSpace(item) {
+			return value
+		}
+		return FormatETag(value, weak)
+	})
+}
+
+func rewriteETagList(raw string, rewrite func(string) string) string {
 	if strings.TrimSpace(raw) == "*" {
 		return "*"
 	}
 	var out []string
 	for _, item := range splitETagList(raw) {
-		if normalized := NormalizeETag(item); normalized != "" {
+		if normalized := rewrite(item); normalized != "" {
 			out = append(out, normalized)
 		}
 	}

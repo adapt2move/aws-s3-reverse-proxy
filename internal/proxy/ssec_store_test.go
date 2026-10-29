@@ -61,6 +61,10 @@ type sseStore struct {
 	// loud 400 — any validator or part list that sends a single quote back.
 	quirkyETags bool
 
+	// literalWriteIfMatch models Ceph RGW's comparison of a write's
+	// If-Match against the bare stored ETag, without removing double quotes.
+	literalWriteIfMatch bool
+
 	// noConditionalComplete answers 501 to a completion carrying If-Match,
 	// like a store that cannot replace an object conditionally.
 	noConditionalComplete bool
@@ -351,7 +355,11 @@ func (s *sseStore) precondition(r *http.Request, obj *sseObject) (int, bool) {
 		if obj == nil {
 			return http.StatusNotFound, false
 		}
-		if v != "*" && strings.Trim(v, `"`) != obj.etag {
+		match := v
+		if !s.literalWriteIfMatch || r.Method == http.MethodGet || r.Method == http.MethodHead {
+			match = strings.Trim(v, `"`)
+		}
+		if v != "*" && match != obj.etag {
 			return http.StatusPreconditionFailed, false
 		}
 	}

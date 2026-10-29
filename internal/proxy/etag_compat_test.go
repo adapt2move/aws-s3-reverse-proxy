@@ -51,8 +51,8 @@ func TestQuirkyETagsThroughTheCache(t *testing.T) {
 	require.Equal(t, "HIT", hit.Header.Get("X-Cache"))
 	assert.Equal(t, etag, hit.Header.Get("Etag"), "the cache stores and replays the normalized ETag")
 
-	// A replayed validator matches the cached entry, in either spelling.
-	for _, validator := range []string{etag, `"'` + value + `'"`} {
+	// A replayed validator matches the cached entry in each spelling.
+	for _, validator := range []string{etag, value, `"'` + value + `'"`} {
 		notModified := clientGet(t, h, "datasets/a.csv", http.Header{"If-None-Match": {validator}})
 		assert.Equal(t, http.StatusNotModified, notModified.StatusCode, validator)
 	}
@@ -73,6 +73,69 @@ func TestQuirkyETagsThroughTheCache(t *testing.T) {
 	assert.Equal(t, `"`+value+`"`, forwarded[len(forwarded)-1].header.Get("If-Match"))
 
 	noSingleQuotes(t, store)
+}
+
+// Clients of Ceph RGW deliberately send bare If-Match values for writes.
+// Quoting one in the proxy makes every update fail although HEAD agrees.
+func TestBareETagsThroughConditionalWrites(t *testing.T) {
+	for _, caching := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cache=%t", caching), func(t *testing.T) {
+			store := newSSEStore(t)
+			store.literalWriteIfMatch = true
+			tweaks := []func(*Config){func(cfg *Config) {
+				cfg.UpstreamSSECKey = nil
+				cfg.RepairPlaintext = false
+			}}
+			if caching {
+				var cached *cache.Cache
+				tweaks = append(tweaks, withTestCache(t, &cached, time.Minute))
+			}
+			h := newEncryptingProxy(t, store, tweaks...)
+			const key = "datasets/chat.jsonl"
+			first := conditionalPut(t, h, key, "first\n", http.Header{"If-None-Match": {"*"}})
+			require.Equal(t, http.StatusOK, first.StatusCode)
+			etag := strings.Trim(first.Header.Get("Etag"), `"`)
+			head := do(t, h, clientRequest{
+				method: http.MethodHead, target: "/bucket/" + key, tenant: tenantA, level: "rw",
+			}).Result()
+			require.Equal(t, http.StatusOK, head.StatusCode)
+			require.Equal(t, etag, strings.Trim(head.Header.Get("Etag"), `"`))
+
+			updated := conditionalPut(t, h, key, "first\nsecond\n", http.Header{"If-Match": {etag}})
+			require.Equal(t, http.StatusOK, updated.StatusCode, readBody(t, updated))
+			writes := store.requestsWhere(func(r recordedRequest) bool { return r.method == http.MethodPut })
+			require.Len(t, writes, 2)
+			assert.Equal(t, etag, writes[1].header.Get("If-Match"))
+
+			stale := conditionalPut(t, h, key, "must not overwrite", http.Header{"If-Match": {etag}})
+			require.Equal(t, http.StatusPreconditionFailed, stale.StatusCode)
+			exists := conditionalPut(t, h, key, "must not recreate", http.Header{"If-None-Match": {"*"}})
+			require.Equal(t, http.StatusPreconditionFailed, exists.StatusCode)
+			assert.Equal(t, "first\nsecond\n", string(store.object(upstreamKey(key)).data))
+			read := clientGet(t, h, key, nil)
+			require.Equal(t, http.StatusOK, read.StatusCode)
+			assert.Equal(t, "first\nsecond\n", readBody(t, read))
+		})
+	}
+}
+
+// Reads still use standard validators, including on a cache miss: a store
+// using HTTP precondition parsing cannot compare a bare If-Match value.
+func TestBareReadConditionsUseHTTPValidators(t *testing.T) {
+	h, upstream := newTestProxy(t)
+	servesObject(upstream, "hello", nil)
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		for _, condition := range []struct {
+			name   string
+			status int
+		}{{"If-Match", http.StatusOK}, {"If-None-Match", http.StatusNotModified}} {
+			resp := do(t, h, clientRequest{
+				method: method, target: "/bucket/datasets/a.csv", tenant: tenantA, level: "rw",
+				headers: http.Header{condition.name: {"upstream-etag"}},
+			})
+			assert.Equal(t, condition.status, resp.Code, "%s %s", method, condition.name)
+		}
+	}
 }
 
 func TestQuirkyETagsThroughAMultipartUpload(t *testing.T) {
