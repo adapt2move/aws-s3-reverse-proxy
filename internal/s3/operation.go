@@ -339,9 +339,6 @@ func copySource(values []string, bucket string) (string, error) {
 	if err := ValidateObjectKey(key); err != nil {
 		return "", err
 	}
-	if strings.Contains(escapedKey, "..") {
-		return "", fmt.Errorf("%w: copy source key contains %q", ErrInvalidKey, "..")
-	}
 	return key, nil
 }
 
@@ -375,14 +372,8 @@ func splitBucketKey(u *url.URL) (bucket, key, escapedKey string, bucketLevel boo
 	if err := ValidateObjectKey(key); err != nil {
 		return "", "", "", false, err
 	}
-	// The as-written form is checked too: a client that percent-encodes a
-	// traversal (`%2e%2e`) is caught by the decoded check above, and one
-	// that double-encodes it (`%252e%252e`) never decodes to `..` at all —
-	// but a literal `..` surviving in the escaped path would still reach
-	// the upstream, so refuse it here as well.
-	if strings.Contains(escapedKey, "..") {
-		return "", "", "", false, fmt.Errorf("%w: key contains %q", ErrInvalidKey, "..")
-	}
+	// ValidateObjectKey checks decoded dot segments and double-encoded
+	// traversal. Dots inside a segment (report..csv) do not change its path.
 	return bucket, key, escapedKey, false, nil
 }
 
