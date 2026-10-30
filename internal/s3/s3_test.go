@@ -79,6 +79,11 @@ func TestClassify(t *testing.T) {
 		want    Kind
 		wantErr error
 	}{
+		{name: "embedded dots", method: http.MethodGet, target: "/b/a/report..csv", want: GetObject},
+		{name: "dotted mailbox ID", method: http.MethodPut, target: "/b/tmp/mails/dedup/pending/mail..id", want: PutObject},
+		{name: "encoded embedded dots", method: http.MethodHead, target: "/b/a/report%2e%2ecsv", want: HeadObject},
+		{name: "encoded traversal", method: http.MethodGet, target: "/b/a/%2e%2e/x", wantErr: ErrInvalidKey},
+		{name: "double encoded traversal", method: http.MethodGet, target: "/b/a/%252e%252e/x", wantErr: ErrInvalidKey},
 		{name: "get object", method: http.MethodGet, target: "/b/a/x.csv", want: GetObject},
 		{name: "head object", method: http.MethodHead, target: "/b/a/x.csv", want: HeadObject},
 		{name: "put object", method: http.MethodPut, target: "/b/a/x.csv", want: PutObject},
@@ -372,6 +377,8 @@ func TestClassifyCopy(t *testing.T) {
 		{name: "no leading slash", source: "b/a/y.csv", wantKey: "a/y.csv"},
 		{name: "encoded slashes", source: "/b/a%2Fy.csv", wantKey: "a/y.csv"},
 		{name: "encoded space and unicode", source: "b/a/my%20f%C3%BCle.csv", wantKey: "a/my füle.csv"},
+		{name: "embedded dots", source: "b/a/report..csv", wantKey: "a/report..csv"},
+		{name: "encoded embedded dots", source: "b/a/report%2e%2ecsv", wantKey: "a/report..csv"},
 		{name: "plus is literal", source: "b/a/x+y.csv", wantKey: "a/x+y.csv"},
 		{name: "explicit COPY directive", source: "b/a/y.csv", wantKey: "a/y.csv",
 			headers: http.Header{"X-Amz-Metadata-Directive": {"COPY"}}},

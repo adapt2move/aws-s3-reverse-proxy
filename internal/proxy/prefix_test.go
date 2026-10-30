@@ -18,6 +18,7 @@ func TestKeyPrefixInjection(t *testing.T) {
 		target   string
 		wantPath string
 	}{
+		{"embedded dots", "/bucket/datasets/report..csv", "/bucket/" + tenantA + "/datasets/report..csv"},
 		{"plain key", "/bucket/datasets/a.csv", "/bucket/" + tenantA + "/datasets/a.csv"},
 		{"nested key", "/bucket/workspaces/w1/out/deep/a.csv", "/bucket/" + tenantA + "/workspaces/w1/out/deep/a.csv"},
 		{"directory marker", "/bucket/workspaces/w1/out/", "/bucket/" + tenantA + "/workspaces/w1/out/"},
