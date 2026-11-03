@@ -29,6 +29,11 @@ jobs:
       - name: Check out source code
         uses: actions/checkout@v4
 
+      # cgo build needs the target's own gcc, so arm64 compiles under
+      # emulation rather than cross-compiling.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -47,7 +52,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64
+          # arm64 for local dev on Apple Silicon (kind node is arm64 there).
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ env.IMAGE }}:${{ github.sha }}
 
