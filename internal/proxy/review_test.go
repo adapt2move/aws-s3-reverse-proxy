@@ -175,6 +175,15 @@ func TestAnUnconfirmedReadStaysEligibleThroughTheCache(t *testing.T) {
 
 	require.Equal(t, "MISS", clientGet(t, h, "datasets/a.csv", nil).Header.Get("X-Cache"))
 	waitFor(t, "the first attempt to give up", func() bool { return store.openUploads() == 0 && len(store.requestsWhere(isPartUpload)) == 1 })
+	// Aborting the upload happens before the repairer records its suspension
+	// and clears the running job. Advance the clock only after both, or the
+	// first job can suspend against the advanced clock (or reject the next
+	// read because it is still running).
+	waitFor(t, "the first repair to finish and suspend", func() bool {
+		h.repairs.mu.Lock()
+		defer h.repairs.mu.Unlock()
+		return len(h.repairs.running) == 0 && h.repairs.suspended.After(h.repairs.now())
+	})
 
 	store.mu.Lock()
 	store.ignoreSSEC = false
