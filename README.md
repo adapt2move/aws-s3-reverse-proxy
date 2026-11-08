@@ -1000,7 +1000,7 @@ All build dependencies and steps are contained in the `Dockerfile`:
 docker build -t aws-s3-reverse-proxy .
 ```
 
-Or directly, with a Go toolchain:
+Or directly, with Go 1.27.3 or newer:
 
 ```
 go build ./cmd/aws-s3-reverse-proxy
