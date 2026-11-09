@@ -1,4 +1,4 @@
-FROM golang:1.25-alpine as build
+FROM golang:1.27.3-alpine AS build
 
 # build-base (gcc + musl-dev) for cgo. No --platform=$BUILDPLATFORM: this stage
 # runs natively per target platform (emulated under QEMU for arm64), so cgo
